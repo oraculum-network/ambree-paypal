@@ -92,7 +92,7 @@ Weather feed      Agent                      Booking service                 Gui
   |                               |                           | ledger: refund.completed; later webhook PAYMENT.CAPTURE.REFUNDED
 ```
 
-**Refund policy** (`src/booking/policy.ts`). A refund is allowed when the booking is captured and one of these holds:
+**Refund policy** (`BookingService.refundReason` in `src/booking/service.ts`). A refund is allowed when the booking is captured and one of these holds:
 (a) there is an active cyclone alert for the booking date, (b) the guide declined a reschedule, or (c) the guide
 offered the refund on the operator page. The amount must be at most the captured amount minus earlier refunds.
 Partial refunds are allowed. The agent cannot refund for any other reason; it can only explain.
@@ -200,9 +200,10 @@ only on network errors or 5xx, and only for calls that carry a `PayPal-Request-I
 
 **PayPal Agent Toolkit plug-in point.**
 - `src/paypal/api.ts` defines `PaymentsApi`: `createOrder`, `getOrder`, `captureOrder`, `refundCapture`, `getRefund`, `verifyWebhookSignature`.
-- Today two classes implement it: `PayPalRestClient` (sandbox) and `FakePayPal`.
+- Today one class implements it: `PayPalRestClient` (sandbox). `FakePayPal` is a `fetch` stand-in underneath
+  that client, so tests and the offline demo run the real client code.
 - `@paypal/agent-toolkit` (Apache-2.0; can't be installed here) has `create_order`, `get_order`, `pay_order` and
-  refund tools. It plugs in as a third `PaymentsApi` adapter that calls the toolkit's functions. Our booking service
+  refund tools. It plugs in as a second `PaymentsApi` adapter that calls the toolkit's functions. Our booking service
   stays the only caller, so the mandate check still runs first. **We do not hand the toolkit's tools straight to the
   model**: that would let the model create orders with no mandate. **UNVERIFIED:** whether the toolkit lets you
   set `purchase_units[].payee` (its `create_order` parameters are not documented in what I could read).
