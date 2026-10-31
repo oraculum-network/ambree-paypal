@@ -19,7 +19,7 @@ const QUOTE: Quote = {
   party_size: 2,
   total: { currency_code: "EUR", value: "80.00" },
   deposit: { currency_code: "EUR", value: "30.00" },
-  payee: { email_address: "tamarin-trails@business.sandbox.example" },
+  payee: { merchant_id: "TAMARINTRAIL1" },
   guide_note: "Start 06:30 at the car park.",
   priced_at: "2026-11-04T10:00:00.000Z",
 };
@@ -179,8 +179,9 @@ describe("mandate", () => {
     mandates.approve(mandate.id, code);
     expect(mandates.consume(mandate.id, pay({ ...QUOTE, guide_note: "changed" }))).toMatchObject({ ok: false, reason: "quote_changed" });
     expect(mandates.consume(mandate.id, { ...pay(), amount: { currency_code: "EUR", value: "300.00" } })).toMatchObject({ ok: false, reason: "amount_mismatch" });
-    expect(mandates.consume(mandate.id, { ...pay(), payee: { email_address: "attacker@example.com" } })).toMatchObject({ ok: false, reason: "payee_mismatch" });
-    expect(mandates.consume(mandate.id, { ...pay(), payee: { email_address: QUOTE.payee.email_address!.toUpperCase() } }).ok).toBe(true);
+    expect(mandates.consume(mandate.id, { ...pay(), payee: { merchant_id: "ATTACKER00001" } })).toMatchObject({ ok: false, reason: "payee_mismatch" });
+    expect(mandates.consume(mandate.id, { ...pay(), payee: { email_address: "tamarin-trails@business.sandbox.example" } })).toMatchObject({ ok: false, reason: "payee_mismatch" });
+    expect(mandates.consume(mandate.id, pay()).ok).toBe(true);
   });
 
   it("an unknown mandate is not_found", () => {

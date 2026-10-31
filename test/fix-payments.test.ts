@@ -54,18 +54,17 @@ function orderBody(id: string, orderId: string, capture: { id: string; status: s
 describe("finding 2: the operator is never the payee", () => {
   const SANDBOX = { PAYPAL_CLIENT_ID: "a", PAYPAL_CLIENT_SECRET: "b" };
   it("sandbox mode needs the operator's identity", () => {
-    expect(() => loadConfig({ ...SANDBOX, PAYPAL_GUIDE_PAYEE_EMAIL: "guide@business.example.com" })).toThrow(/PAYPAL_OPERATOR_(EMAIL|MERCHANT_ID)/);
+    expect(() => loadConfig({ ...SANDBOX, PAYPAL_GUIDE_PAYEE_MERCHANT_ID: "GUIDEACCOUNT1" })).toThrow(/PAYPAL_OPERATOR_MERCHANT_ID/);
   });
 
-  it("refuses a guide payee equal to the operator (email, any case)", () => {
-    expect(() => loadConfig({ ...SANDBOX, PAYPAL_GUIDE_PAYEE_EMAIL: "Owner@Business.Example.com", PAYPAL_OPERATOR_EMAIL: "owner@business.example.com" })).toThrow(ConfigError);
+  it("refuses a guide payee equal to the operator (merchant id)", () => {
     expect(() => loadConfig({ ...SANDBOX, PAYPAL_GUIDE_PAYEE_MERCHANT_ID: "ABCDEFGH12345", PAYPAL_OPERATOR_MERCHANT_ID: "ABCDEFGH12345" })).toThrow(ConfigError);
-    const ok = loadConfig({ ...SANDBOX, PAYPAL_GUIDE_PAYEE_EMAIL: "guide@business.example.com", PAYPAL_OPERATOR_EMAIL: "owner@business.example.com" });
-    expect(ok.operatorPayees).toEqual([{ email_address: "owner@business.example.com" }]);
+    const ok = loadConfig({ ...SANDBOX, PAYPAL_GUIDE_PAYEE_MERCHANT_ID: "GUIDEACCOUNT1", PAYPAL_OPERATOR_MERCHANT_ID: "OPERATORACCT1" });
+    expect(ok.operatorPayees).toEqual([{ merchant_id: "OPERATORACCT1" }]);
   });
 
   it("the app refuses to start when a seed guide pays the operator", () => {
-    const config = loadConfig({ PAYPAL_OPERATOR_EMAIL: GUIDE.email_address!.toUpperCase() });
+    const config = loadConfig({ PAYPAL_OPERATOR_MERCHANT_ID: GUIDE.merchant_id! });
     expect(() => createApp({ config })).toThrow(/operator/);
   });
 
@@ -80,7 +79,7 @@ describe("finding 2: the operator is never the payee", () => {
 describe("finding 3: the fetched order is checked before capture, the capture after", () => {
   it("an order changed out of band is not captured", async () => {
     const { w, id, orderId } = await ordered();
-    const other = { email_address: "someone-else@business.example.com" };
+    const other = { merchant_id: "SOMEONEELSE01" };
     w.fake.mutateOrder(orderId, (o) => {
       o.purchase_units![0]!.amount = { currency_code: "USD", value: "40.00" };
       o.purchase_units![0]!.payee = other;

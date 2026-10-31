@@ -41,8 +41,25 @@ export class Browser {
     return res;
   }
 
+  /** This "tab's" conversation, as the page keeps it in sessionStorage. */
+  conv: string | undefined;
+
+  /**
+   * JSON call like the page makes: the tab's conversation id is added to /api/* calls that don't name
+   * one (a conversation is started first if the tab has none).
+   */
   async json(path: string, body?: unknown): Promise<Record<string, any>> {
-    const res = await this.fetch(path, body === undefined ? {} : { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-    return (await res.json()) as Record<string, any>;
+    let p = path;
+    let b = body;
+    const scoped = (path === "/api/chat" || path.startsWith("/api/state") || path === "/api/demo/cyclone") && !path.includes("conversation_id=");
+    if (scoped && !(b && typeof b === "object" && "conversation_id" in b)) {
+      if (!this.conv) await this.json("/api/conversations", {});
+      if (b === undefined) p += `${p.includes("?") ? "&" : "?"}conversation_id=${this.conv}`;
+      else b = { ...(b as object), conversation_id: this.conv };
+    }
+    const res = await this.fetch(p, b === undefined ? {} : { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(b) });
+    const out = (await res.json()) as Record<string, any>;
+    if (path === "/api/conversations" && typeof out.conversation_id === "string") this.conv = out.conversation_id;
+    return out;
   }
 }

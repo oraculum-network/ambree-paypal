@@ -1,12 +1,21 @@
 // The chat page: talks to /api/chat and /api/state, renders the approval card, pay button, guide's
 // phone, inbox and ledger. Polls state so guide answers and webhooks show up without a reload.
-"use strict";
+import { paymentLine } from "/labels.js";
 
-// The conversation belongs to this browser's session cookie (HttpOnly); the page never handles its id.
+// The session cookie (HttpOnly) is the traveller's authority. Each tab keeps its own conversation id in
+// sessionStorage and sends it with every request; the server checks the session owns it.
 const $ = (id) => document.getElementById(id);
 
 let busy = false;
 let last = null;
+let conv = sessionStorage.getItem("ambree_conv");
+
+async function newConversation() {
+  const s = await api("/api/conversations", {}, false);
+  conv = s.conversation_id;
+  sessionStorage.setItem("ambree_conv", conv);
+  return s;
+}
 
 function el(tag, attrs = {}, ...children) {
   const e = document.createElement(tag);
@@ -20,8 +29,16 @@ function el(tag, attrs = {}, ...children) {
 }
 const money = (m) => (m ? `${m.currency_code} ${m.value}` : "");
 
-async function api(path, body) {
-  const res = await fetch(path, body ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {});
+async function api(path, body, withConv = true) {
+  let url = path;
+  if (withConv && !body) url += `${path.includes("?") ? "&" : "?"}conversation_id=${encodeURIComponent(conv)}`;
+  const payload = body && withConv ? { ...body, conversation_id: conv } : body;
+  const res = await fetch(url, payload ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) } : {});
+  if (res.status === 404 && withConv && (path.startsWith("/api/state") || path === "/api/chat")) {
+    // This tab's conversation isn't in the session (new cookie, or another browser): start a fresh one.
+    await newConversation();
+    return api(path, body, withConv);
+  }
   return res.json();
 }
 
@@ -64,7 +81,8 @@ function render(s) {
           code, btn, msg));
     }
     if (b.order && b.order.approve_url && b.status === "order_created") c.append(el("a", { class: "button pay", href: b.order.approve_url, "data-testid": "pay" }, "Pay the guide in PayPal"));
-    if (b.capture) c.append(el("p", { "data-testid": "paid" }, `Paid ${money(b.capture.amount)} to ${b.guide.name} (capture ${b.capture.id}).`));
+    const pay = paymentLine(b);
+    if (pay) c.append(el("p", { "data-testid": pay.testid }, pay.text));
     if (b.refunded && b.refunded.value !== "0.00") c.append(el("p", { "data-testid": "refunded" }, `Refunded ${money(b.refunded)}.`));
     if (b.reschedule) c.append(el("p", { class: "small" }, `Reschedule to ${b.reschedule.new_date}: ${b.reschedule.status}`));
     if (b.guide_balance !== null) c.append(el("p", { class: "small", "data-testid": "guide-balance" }, `Guide's sandbox balance (fake): ${(b.guide_balance / 100).toFixed(2)}`));
@@ -105,8 +123,9 @@ $("raise-cyclone").onclick = async () => {
   void tick(true);
 };
 $("new-conv").onclick = async () => {
-  render(await api("/api/conversations", {}));
+  render(await newConversation());
 };
 
+if (!conv) await newConversation();
 void tick(false);
 setInterval(() => void tick(false), 1500);

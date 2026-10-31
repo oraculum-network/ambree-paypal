@@ -1,6 +1,7 @@
 // Made-up independent guides on the south-west coast of Mauritius. Every name is invented and ends in
-// "(demo)"; none is a real business or person. Payees are placeholder sandbox addresses: on the hosted
-// sandbox, PAYPAL_GUIDE_PAYEE_EMAIL (or _MERCHANT_ID) points every guide at one sandbox business account.
+// "(demo)"; none is a real business or person. Accounts are identified by PayPal merchant id only (an
+// email can be an alias of another account); the ids here are invented placeholders for the fake. On the
+// hosted sandbox, PAYPAL_GUIDE_PAYEE_MERCHANT_ID points every guide at one sandbox business account.
 
 import type { CurrencyCode, Payee } from "../paypal/types.ts";
 
@@ -15,8 +16,11 @@ export interface Guide {
   /** What the guide usually charges per person, for the agent's expectations only; the guide sets the real price. */
   typical_price_per_person: number;
   currency: CurrencyCode;
-  payee: Payee;
+  payee: MerchantPayee;
 }
+
+/** A payee named by merchant id, never by email. */
+export type MerchantPayee = Extract<Payee, { merchant_id: string }>;
 
 export const SEED_GUIDES: readonly Guide[] = [
   {
@@ -28,7 +32,7 @@ export const SEED_GUIDES: readonly Guide[] = [
     bio: "Small-group sunrise climbs of Le Morne Brabant, starting at the trailhead car park.",
     typical_price_per_person: 40,
     currency: "EUR",
-    payee: { email_address: "lantern-ridge@business.sandbox.example" },
+    payee: { merchant_id: "LANTERNRIDGE1" },
   },
   {
     id: "g_quillfeather",
@@ -39,7 +43,7 @@ export const SEED_GUIDES: readonly Guide[] = [
     bio: "Slow hikes with stops for endemic birds; binoculars provided.",
     typical_price_per_person: 35,
     currency: "EUR",
-    payee: { email_address: "quillfeather@business.sandbox.example" },
+    payee: { merchant_id: "QUILLFEATHER1" },
   },
   {
     id: "g_saltpan",
@@ -50,7 +54,7 @@ export const SEED_GUIDES: readonly Guide[] = [
     bio: "Gorge hikes and beginner canyoning, helmets and harnesses included.",
     typical_price_per_person: 55,
     currency: "EUR",
-    payee: { email_address: "saltpan-summit@business.sandbox.example" },
+    payee: { merchant_id: "SALTPANSUMMT1" },
   },
   {
     id: "g_tidecount",
@@ -61,7 +65,7 @@ export const SEED_GUIDES: readonly Guide[] = [
     bio: "Lagoon kayak mornings with a snorkel stop when the tide allows.",
     typical_price_per_person: 45,
     currency: "EUR",
-    payee: { email_address: "tidecount-kayak@business.sandbox.example" },
+    payee: { merchant_id: "TIDECOUNTKYK1" },
   },
   {
     id: "g_ebonyleaf",
@@ -72,12 +76,12 @@ export const SEED_GUIDES: readonly Guide[] = [
     bio: "Native-forest walks about ebony, tambalacoque and medicinal plants.",
     typical_price_per_person: 30,
     currency: "EUR",
-    payee: { email_address: "ebonyleaf@business.sandbox.example" },
+    payee: { merchant_id: "EBONYLEAFWLK1" },
   },
 ];
 
 /** The seed with every payee replaced, when one sandbox business account plays all the guides. */
-export function guidesWithPayee(override: Payee | undefined, seed: readonly Guide[] = SEED_GUIDES): Guide[] {
+export function guidesWithPayee(override: MerchantPayee | undefined, seed: readonly Guide[] = SEED_GUIDES): Guide[] {
   return seed.map((g) => (override ? { ...g, payee: override } : { ...g }));
 }
 

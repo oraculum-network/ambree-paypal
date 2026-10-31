@@ -5,8 +5,28 @@ import { DatabaseSync } from "node:sqlite";
 
 export type Db = DatabaseSync;
 
+/**
+ * The schema this build writes, kept in SQLite's `PRAGMA user_version`. 1 was build-1 (never stamped,
+ * so it reads as 0); 2 added webhook processing states, refund operations and sessions. There are no
+ * migrations (nothing is deployed yet): a database of any other version is refused, never half-used.
+ */
+export const SCHEMA_VERSION = 2;
+
+export class SchemaError extends Error {
+  override name = "SchemaError";
+}
+
 export function openDb(path = ":memory:"): Db {
   const db = new DatabaseSync(path);
+  const version = (db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version;
+  const tables = (db.prepare("SELECT count(*) AS n FROM sqlite_master WHERE type = 'table'").get() as { n: number }).n;
+  if (version !== SCHEMA_VERSION && (version !== 0 || tables > 0)) {
+    db.close();
+    const which = version > SCHEMA_VERSION ? "newer" : "older";
+    throw new SchemaError(
+      `The database has schema version ${version}, ${which} than this build's ${SCHEMA_VERSION}. There is no migration; move the file away or set a new DB_PATH (this refuses rather than run on a schema it doesn't know).`,
+    );
+  }
   db.exec(`
     PRAGMA journal_mode = ${path === ":memory:" ? "MEMORY" : "WAL"};
     CREATE TABLE IF NOT EXISTS ledger (
@@ -35,6 +55,7 @@ export function openDb(path = ":memory:"): Db {
       updated_at TEXT
     );
   `);
+  if (version === 0) db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
   return db;
 }
 

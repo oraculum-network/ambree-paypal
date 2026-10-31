@@ -26,7 +26,7 @@ async function requestAndPay(page: Page) {
 
   // The agent creates the order; the traveller pays the guide (fake checkout stands in for PayPal's).
   await page.getByTestId("pay").click();
-  await expect(page.getByTestId("fake-payee")).toHaveText("lantern-ridge@business.sandbox.example");
+  await expect(page.getByTestId("fake-payee")).toHaveText("LANTERNRIDGE1");
   await page.getByRole("button", { name: "Approve as the sandbox traveller" }).click();
   await expect(page.getByTestId("booking-status")).toHaveText("captured");
   await expect(page.getByTestId("paid")).toContainText("Paid EUR 30.00 to Lantern Ridge Walks (demo)");

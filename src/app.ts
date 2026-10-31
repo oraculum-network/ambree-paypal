@@ -65,12 +65,15 @@ const STATIC: Record<string, { file: string; type: string }> = {
   "/": { file: "index.html", type: "text/html; charset=utf-8" },
   "/app.js": { file: "app.js", type: "text/javascript; charset=utf-8" },
   "/style.css": { file: "style.css", type: "text/css; charset=utf-8" },
+  "/labels.js": { file: "labels.js", type: "text/javascript; charset=utf-8" },
 };
 
 function securityHeaders(res: ServerResponse): void {
   res.setHeader("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; form-action 'self' https://www.sandbox.paypal.com; frame-ancestors 'none'; base-uri 'none'");
   res.setHeader("X-Content-Type-Options", "nosniff");
-  res.setHeader("Referrer-Policy", "no-referrer");
+  // same-origin, not no-referrer: an operator URL (a capability) still never leaves our origin, and
+  // browsers keep sending a real Origin on form POSTs (no-referrer makes it "null", which the Origin check refuses).
+  res.setHeader("Referrer-Policy", "same-origin");
   res.setHeader("Cache-Control", "no-store");
 }
 
@@ -147,15 +150,35 @@ export function createApp(opts: AppOptions): App {
   const secureCookie = config.publicUrl.startsWith("https://");
   const newConversationId = () => `cv_${randomBytes(12).toString("hex")}`;
   const sidHash = (sid: string) => createHash("sha256").update(`session:${sid}`).digest("hex");
-  function session(req: IncomingMessage, res: ServerResponse): { id: string; conversations: string[]; current: string } {
+  function session(req: IncomingMessage, res: ServerResponse): { id: string; conversations: string[] } {
     const sid = parseCookies(req.headers.cookie)[SESSION_COOKIE];
     let rec = sid && /^[A-Za-z0-9_-]{43}$/.test(sid) ? sessions.get(sidHash(sid)) : undefined;
     if (!rec) {
       const fresh = randomBytes(32).toString("base64url");
-      rec = sessions.put({ id: sidHash(fresh), conversations: [newConversationId()] });
+      rec = sessions.put({ id: sidHash(fresh), conversations: [] });
       res.setHeader("Set-Cookie", `${SESSION_COOKIE}=${fresh}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000${secureCookie ? "; Secure" : ""}`);
     }
-    return { ...rec, current: rec.conversations.at(-1)! };
+    return rec;
+  }
+  /**
+   * The conversation a tab names, if this session owns it. There is no session-wide "current"
+   * conversation: each tab sends its own id, and an id the session doesn't own is refused (404).
+   */
+  function ownedConversation(req: IncomingMessage, res: ServerResponse, requested: unknown): string | undefined {
+    if (typeof requested !== "string" || !/^cv_[0-9a-f]{24}$/.test(requested)) return undefined;
+    return session(req, res).conversations.includes(requested) ? requested : undefined;
+  }
+  const publicOrigin = new URL(config.publicUrl).origin;
+  /**
+   * Checks for a state-changing browser request, run BEFORE any session work so a refused request never
+   * creates or replaces a session: the body must be JSON (an HTML form can't send that cross-site without
+   * a CORS preflight, which this server never grants), and an Origin header, when present, must be ours.
+   */
+  function refuseMutation(req: IncomingMessage, opts: { json: boolean }): { status: number; error: string } | undefined {
+    const origin = req.headers.origin;
+    if (origin !== undefined && origin !== publicOrigin) return { status: 403, error: "cross-origin request refused" };
+    if (opts.json && (req.headers["content-type"] ?? "").split(";")[0]!.trim().toLowerCase() !== "application/json") return { status: 415, error: "Content-Type must be application/json" };
+    return undefined;
   }
   const mcpConfigured = config.mcpPasscode ? Buffer.from(config.mcpPasscode) : undefined;
   function mcpAllowed(req: IncomingMessage): boolean {
@@ -181,6 +204,7 @@ export function createApp(opts: AppOptions): App {
     const bookings = service.forConversation(conv);
     const ids = new Set(bookings.map((b) => b.id));
     return {
+      conversation_id: conv,
       mode: { paypal: config.paypal.mode, model: agent.modelLabel },
       transcript: agent.transcript(conv),
       pending_events: channels.pending(conv),
@@ -203,16 +227,27 @@ export function createApp(opts: AppOptions): App {
     if (method === "GET" && path === "/healthz") return sendJson(res, 200, { ok: true, version: VERSION, paypal: config.paypal.mode, model: config.llm.mode });
     if (method === "GET" && path === "/api/ledger/head") return sendJson(res, 200, { ...checkpoint, verify: ledger.verify(checkpoint) });
 
-    // Every traveller route acts on the caller's own session; a conversation_id sent by a client is ignored.
+    // State-changing browser routes: refused before any session is looked up, created or replaced.
+    if (method === "POST") {
+      const refused = path.startsWith("/api/") ? refuseMutation(req, { json: true }) : path.startsWith("/o/") || path.startsWith("/fake-paypal/") ? refuseMutation(req, { json: false }) : undefined;
+      if (refused) return sendJson(res, refused.status, { error: refused.error });
+    }
+
+    // Every traveller route acts on a conversation the caller's session owns, named by the tab.
+    const noConversation = () => sendJson(res, 404, { error: "unknown conversation" });
     if (path === "/api/chat" && method === "POST") {
       const body = await readJson(req);
       if (!body) return sendJson(res, 400, { error: "JSON body required" });
-      const conv = session(req, res).current;
+      const conv = ownedConversation(req, res, body.conversation_id);
+      if (!conv) return noConversation();
       const replies = await runEvents(conv);
       if (typeof body.message === "string" && body.message.trim()) replies.push((await agent.turn(conv, body.message.trim())).reply);
       return sendJson(res, 200, { replies, ...state(conv) });
     }
-    if (path === "/api/state" && method === "GET") return sendJson(res, 200, state(session(req, res).current));
+    if (path === "/api/state" && method === "GET") {
+      const conv = ownedConversation(req, res, url.searchParams.get("conversation_id"));
+      return conv ? sendJson(res, 200, state(conv)) : noConversation();
+    }
     if (path === "/api/conversations" && method === "POST") {
       const s = session(req, res);
       const conv = newConversationId();
@@ -236,7 +271,8 @@ export function createApp(opts: AppOptions): App {
     }
     if (path === "/api/demo/cyclone" && method === "POST") {
       if (!fake) return sendJson(res, 404, { error: "demo controls run only with the fake PayPal" });
-      const conv = session(req, res).current;
+      const conv = ownedConversation(req, res, (await readJson(req))?.conversation_id);
+      if (!conv) return noConversation();
       const dates = service.forConversation(conv).map((b) => b.date).sort();
       if (!dates.length) return sendJson(res, 400, { error: "no booking to warn about" });
       weather.raise({ id: `TC-DEMO-${Date.now()}`, name: "Cyclone Demo-1 (demo)", level: "orange", from: addDays(dates[0]!, -1), to: addDays(dates.at(-1)!, 1), summary: "Demo warning raised from the page." });

@@ -38,7 +38,8 @@ export interface RefundOp {
   /** An empty body (full refund) rather than an amount. */
   full: boolean;
   reason: string;
-  status: "sending" | "pending" | "completed" | "failed";
+  /** `needs_review`: PayPal's reply didn't match this operation; it stays reserved. */
+  status: "sending" | "pending" | "completed" | "failed" | "needs_review";
   refund_id?: string;
 }
 
@@ -318,6 +319,8 @@ export class BookingService {
     if (units.length !== 1) return `expected 1 purchase unit, got ${units.length}`;
     const u = units[0]!;
     if (!u.payee) return "no payee (the funds would go to the operator)";
+    // UNVERIFIED (spike S6): that PayPal's order replies echo payee.merchant_id. If they don't, this fails closed.
+    if (!u.payee.merchant_id) return "the payee has no merchant_id, so the account can't be verified";
     if (this.#isOperator(u.payee)) return "the payee is the operator's own account";
     if (!samePayee(u.payee, m.payee)) return "the payee differs from the mandate";
     if (!u.amount || !sameMoney(u.amount, m.amount)) return "the amount or currency differs from the mandate";
@@ -518,10 +521,13 @@ export class BookingService {
       markWebhookLogged(this.#d.db, event.id);
     }
     try {
-      if (event.event_type === "CHECKOUT.ORDER.APPROVED" || event.event_type.startsWith("PAYMENT.CAPTURE.") && event.event_type !== "PAYMENT.CAPTURE.REFUNDED") {
-        if (b.order_id) await this.captureIfApproved(b.id);
-      } else if (event.event_type === "PAYMENT.CAPTURE.REFUNDED") {
+      // Refund events (PAYMENT.CAPTURE.REFUNDED and PAYMENT.REFUND.*, e.g. PAYMENT.REFUND.FAILED) refresh
+      // every pending refund by GET, so a failed one releases its reservation; capture events refresh the capture.
+      const refundEvent = event.event_type === "PAYMENT.CAPTURE.REFUNDED" || event.event_type.startsWith("PAYMENT.REFUND.");
+      if (refundEvent) {
         await this.refreshRefunds(b.id);
+      } else if (event.event_type === "CHECKOUT.ORDER.APPROVED" || event.event_type.startsWith("PAYMENT.CAPTURE.")) {
+        if (b.order_id) await this.captureIfApproved(b.id);
       }
       finishWebhook(this.#d.db, event.id, "completed", this.#now().toISOString());
       return { status: 200, result: "logged" };
@@ -667,12 +673,21 @@ export class BookingService {
   #applyRefund(b: Booking, n: number, refund: Refund): Booking {
     const op = b.refund_ops.find((o) => o.n === n)!;
     const cur = b.captured!.currency_code;
-    let actual = op.amount_minor;
-    if (refund.amount) {
-      const got = refund.amount.currency_code === cur ? toMinor(refund.amount.value) : -1;
+    const actual = op.amount_minor;
+    if (refund.status === "COMPLETED" || refund.status === "PENDING") {
+      // Fail closed: PayPal's reply must carry exactly the persisted operation's currency and amount.
+      // Anything else stops the booking for review: nothing is counted as refunded, nothing is announced,
+      // and the operation stays reserved so no further refund can be stacked on an unknown state.
+      let got = -1;
+      try {
+        got = refund.amount && refund.amount.currency_code === cur ? toMinor(refund.amount.value) : -1;
+      } catch {
+        got = -1;
+      }
       if (got !== op.amount_minor) {
-        this.#log(b, "refund.reconcile_failed", { n, refund_id: refund.id, expected: { currency_code: cur, value: fromMinor(op.amount_minor) }, got: refund.amount });
-        if (got >= 0) actual = got;
+        const next = this.#setOp({ ...b, status: "needs_review" }, n, { status: "needs_review", refund_id: refund.id });
+        this.#log(next, "refund.reconcile_failed", { n, refund_id: refund.id, status: refund.status, expected: { currency_code: cur, value: fromMinor(op.amount_minor) }, got: refund.amount ?? null });
+        return next;
       }
     }
     if (refund.status === "COMPLETED") {
@@ -688,6 +703,7 @@ export class BookingService {
       if (op.status !== "pending") this.#log(next, "refund.pending", { n, refund_id: refund.id, amount: { currency_code: cur, value: fromMinor(actual) } });
       return next;
     }
+    // FAILED, CANCELLED or any other terminal status: the money didn't move, so the reservation is released.
     const next = this.#setOp(b, n, { status: "failed", refund_id: refund.id });
     this.#log(next, "refund.failed", { n, refund_id: refund.id, status: refund.status });
     return next;

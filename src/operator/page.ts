@@ -12,7 +12,7 @@ export function esc(s: unknown): string {
 
 function shell(title: string, body: string): string {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="referrer" content="no-referrer"><title>${esc(title)}</title><link rel="stylesheet" href="/style.css"></head>
+<meta name="referrer" content="same-origin"><title>${esc(title)}</title><link rel="stylesheet" href="/style.css"></head>
 <body class="operator"><main><p class="tag">Ambree · guide's page (sandbox demo)</p>${body}</main></body></html>`;
 }
 

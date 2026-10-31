@@ -31,7 +31,7 @@ describe("guides", () => {
     expect(SEED_GUIDES).toHaveLength(5);
     for (const g of SEED_GUIDES) {
       expect(g.name).toMatch(/\(demo\)$/);
-      expect(g.payee.email_address).toMatch(/@business\.sandbox\.example$/);
+      expect(g.payee.merchant_id).toMatch(/^[A-Z0-9]{13}$/);
     }
     expect(new Set(SEED_GUIDES.map((g) => g.id)).size).toBe(5);
   });
@@ -44,7 +44,7 @@ describe("guides", () => {
   });
 
   it("one sandbox account can play every guide", () => {
-    const p = { email_address: "guide@business.example.com" };
+    const p = { merchant_id: "GUIDEACCOUNT1" };
     expect(guidesWithPayee(p).every((g) => g.payee === p)).toBe(true);
     expect(guidesWithPayee(undefined)[0]!.payee).toEqual(SEED_GUIDES[0]!.payee);
   });
@@ -172,7 +172,7 @@ describe("mandate → order → capture → webhooks → ledger", () => {
     w.service.proposeMandate(id);
     const { code, mandate_id } = w.channels.inbox(CONV).at(-1)!;
     w.service.approveMandate(mandate_id, code);
-    (w.service.guides as unknown as Array<{ id: string; payee: unknown }>).find((g) => g.id === "g_lantern")!.payee = { email_address: "someone-else@example.com" };
+    (w.service.guides as unknown as Array<{ id: string; payee: unknown }>).find((g) => g.id === "g_lantern")!.payee = { merchant_id: "SOMEONEELSE01" };
     await expect(w.service.createOrder(id)).rejects.toMatchObject({ code: "payee_mismatch" });
   });
 

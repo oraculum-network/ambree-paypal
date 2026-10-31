@@ -364,6 +364,11 @@ export class FakePayPal {
     return createHmac("sha256", this.#signingKey).update(`${transmissionId}|${time}|${this.webhookId}|${JSON.stringify(event)}`).digest("base64");
   }
 
+  /** Sends a signed webhook of any type (e.g. PAYMENT.REFUND.FAILED), as PayPal would on its own. */
+  emitWebhook(eventType: string, resourceType: string, resource: object): void {
+    this.#emit(eventType, resourceType, structuredClone(resource), `${eventType} (fake)`);
+  }
+
   #emit(eventType: string, resourceType: string, resource: object, summary: string): void {
     const event: WebhookEvent = {
       id: `WH-${newId()}`,

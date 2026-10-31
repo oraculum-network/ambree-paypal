@@ -54,7 +54,7 @@ describe("the whole flow over HTTP (fake PayPal, scripted model)", () => {
 
     const opPage = await fetch(link);
     expect(opPage.status).toBe(200);
-    expect(opPage.headers.get("referrer-policy")).toBe("no-referrer");
+    expect(opPage.headers.get("referrer-policy")).toBe("same-origin");
     expect(await opPage.text()).toContain("Your price");
     expect((await operator(link, { action: "price", total: "80", deposit: "30", note: "06:30 car park" })).status).toBe(200);
 
@@ -75,7 +75,7 @@ describe("the whole flow over HTTP (fake PayPal, scripted model)", () => {
     const pay = s.bookings[0].order.approve_url as string;
     expect(pay).toContain("/fake-paypal/checkout?token=");
     const checkout = await fetch(pay);
-    expect(await checkout.text()).toContain("lantern-ridge@business.sandbox.example");
+    expect(await checkout.text()).toContain("LANTERNRIDGE1");
     const approved = await fetch(pay, { method: "POST", redirect: "manual" });
     expect(approved.status).toBe(303);
     const ret = await traveller.fetch(approved.headers.get("location")!);
@@ -111,7 +111,7 @@ describe("the whole flow over HTTP (fake PayPal, scripted model)", () => {
   });
 
   it("refuses bad chat input and unsigned webhooks", async () => {
-    expect((await fetch(`${base}/api/chat`, { method: "POST", headers: { "Content-Type": "text/plain" }, body: "hi" })).status).toBe(400);
+    expect((await fetch(`${base}/api/chat`, { method: "POST", headers: { "Content-Type": "text/plain" }, body: "hi" })).status).toBe(415);
     const wh = await fetch(`${base}/webhooks/paypal`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: "WH-1", event_type: "PAYMENT.CAPTURE.COMPLETED", resource: {} }) });
     expect(wh.status).toBe(400);
   });
@@ -146,10 +146,10 @@ describe("config", () => {
 
   it("needs both PayPal credentials and a guide payee for sandbox", () => {
     expect(() => loadConfig({ PAYPAL_CLIENT_ID: "a" })).toThrow(ConfigError);
-    expect(() => loadConfig({ PAYPAL_CLIENT_ID: "a", PAYPAL_CLIENT_SECRET: "b" })).toThrow(/PAYPAL_GUIDE_PAYEE_EMAIL/);
-    const c = loadConfig({ PAYPAL_CLIENT_ID: "a", PAYPAL_CLIENT_SECRET: "secret-b", PAYPAL_GUIDE_PAYEE_EMAIL: "g@business.example.com", PAYPAL_OPERATOR_EMAIL: "owner@business.example.com" });
+    expect(() => loadConfig({ PAYPAL_CLIENT_ID: "a", PAYPAL_CLIENT_SECRET: "b" })).toThrow(/PAYPAL_GUIDE_PAYEE_MERCHANT_ID/);
+    const c = loadConfig({ PAYPAL_CLIENT_ID: "a", PAYPAL_CLIENT_SECRET: "secret-b", PAYPAL_GUIDE_PAYEE_MERCHANT_ID: "GUIDEACCOUNT1", PAYPAL_OPERATOR_MERCHANT_ID: "OPERATORACCT1" });
     expect(c.paypal).toMatchObject({ mode: "sandbox", baseUrl: "https://api-m.sandbox.paypal.com" });
-    expect(c.guidePayee).toEqual({ email_address: "g@business.example.com" });
+    expect(c.guidePayee).toEqual({ merchant_id: "GUIDEACCOUNT1" });
   });
 
   it("errors name variables, never values", () => {

@@ -15,30 +15,31 @@ afterAll(async () => {
   await s?.app.close();
 });
 
-// Old clients sent their own conversation id; the server must now ignore it.
-const A_CONV = "cv_traveller_a01";
 
 async function travellerWithMandate() {
   const a = new Browser(s.base);
-  await a.json(`/api/state?conversation_id=${A_CONV}`);
-  const first = await a.json("/api/chat", { conversation_id: A_CONV, message: "Find me a hiking guide for Le Morne on Thursday" });
+  const first = await a.json("/api/chat", { message: "Find me a hiking guide for Le Morne on Thursday" });
   const link = first.guide_phone[0].url as string;
   await fetch(link, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ action: "price", total: "80", deposit: "30" }) });
   let st: Record<string, any> = {};
   for (let i = 0; i < 50; i++) {
-    st = await a.json("/api/chat", { conversation_id: A_CONV });
+    st = await a.json("/api/chat", {});
     if (st.bookings?.[0]?.status === "mandate_proposed") break;
   }
   const bookingId = st.bookings[0].booking_id as string;
   const mandateId = st.bookings[0].mandate.id as string;
   const code = (st.inbox.at(-1).text as string).match(/\b(\d{6})\b/)![1]!;
-  return { a, bookingId, mandateId, code };
+  return { a, bookingId, mandateId, code, conv: a.conv! };
+}
+
+async function newSessionCookie(base: string): Promise<string | undefined> {
+  const res = await fetch(`${base}/api/conversations`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+  return res.headers.getSetCookie().find((c) => c.startsWith("amb_sid="));
 }
 
 describe("finding 1: traveller authority", () => {
   it("the session cookie is HttpOnly and SameSite=Lax", async () => {
-    const res = await fetch(`${s.base}/api/state`);
-    const cookie = res.headers.getSetCookie().find((c) => c.startsWith("amb_sid="));
+    const cookie = await newSessionCookie(s.base);
     expect(cookie).toBeDefined();
     expect(cookie).toMatch(/HttpOnly/);
     expect(cookie).toMatch(/SameSite=Lax/);
@@ -47,15 +48,15 @@ describe("finding 1: traveller authority", () => {
   it("the cookie is Secure on an https PUBLIC_URL", async () => {
     const t = await startApp({ PUBLIC_URL: "https://paypal.ambree.ai" });
     try {
-      const res = await fetch(`${t.base}/api/state`);
-      expect(res.headers.getSetCookie().find((c) => c.startsWith("amb_sid="))).toMatch(/; Secure/);
+      // The Origin check compares with PUBLIC_URL; this request sends no Origin, as a non-browser client.
+      expect(await newSessionCookie(t.base)).toMatch(/; Secure/);
     } finally {
       await t.app.close();
     }
   });
 
   it("another session can't read, approve or learn the conversation", async () => {
-    const { bookingId, mandateId, code } = await travellerWithMandate();
+    const { bookingId, mandateId, code, conv: A_CONV } = await travellerWithMandate();
     const b = new Browser(s.base);
     const cancel = await b.fetch(`/paypal/cancel?booking=${bookingId}`);
     expect(cancel.headers.get("location")).toBe("/");
