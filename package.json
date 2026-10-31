@@ -1,0 +1,34 @@
+{
+  "name": "ambree-paypal",
+  "version": "0.1.0",
+  "description": "Ambree Book the guide: an AI concierge books an independent guide in Mauritius and the traveller pays the guide's own PayPal account under a step-up mandate. PayPal sandbox only.",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "homepage": "https://paypal.ambree.ai",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "start": "node src/server.ts",
+    "dev": "node --watch src/server.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:e2e": "playwright test",
+    "spike": "node scripts/spike.ts",
+    "check": "npm run typecheck && npm test"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.63.0",
+    "@types/node": "22.20.5",
+    "typescript": "5.9.3",
+    "vitest": "4.1.11"
+  },
+  "overrides": {
+    "vite": "7.3.7"
+  }
+}
