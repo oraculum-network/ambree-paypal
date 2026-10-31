@@ -17,8 +17,10 @@ The CTO writes and runs the infra. This file lists what the repo provides and wh
 
 **Safe default.** Every env var comes from the Secrets `paypal-sandbox` and `llm`, all with `optional: true`.
 With no Secret, the pod runs the fake PayPal and the scripted model, which the page labels. With
-`PAYPAL_CLIENT_ID` and `PAYPAL_CLIENT_SECRET` set but no `PAYPAL_GUIDE_PAYEE_EMAIL`, the app **refuses to
-start**: this fails closed, so it never pays the app owner by mistake.
+`PAYPAL_CLIENT_ID` and `PAYPAL_CLIENT_SECRET` set but no `PAYPAL_GUIDE_PAYEE_MERCHANT_ID` or no
+`PAYPAL_OPERATOR_MERCHANT_ID`, or with any `*_EMAIL` payee variable, the app **refuses to start**: this fails
+closed. It also refuses a sqlite file of another schema version, so a fresh `DB_PATH` is needed after an
+upgrade that changes the schema.
 
 ## Checks before the first deploy
 
@@ -42,9 +44,9 @@ start**: this fails closed, so it never pays the app owner by mistake.
 ## Secrets (values typed by hand, never in git or chat)
 
 - `paypal/paypal-sandbox`: `PAYPAL_CLIENT_ID`, `PAYPAL_CLIENT_SECRET`, `PAYPAL_WEBHOOK_ID`,
-  `PAYPAL_GUIDE_PAYEE_EMAIL` (the sandbox business account that plays every guide).
-  - Also `PAYPAL_OPERATOR_EMAIL` and `PAYPAL_OPERATOR_MERCHANT_ID`: the REST app owner's own sandbox
-    account. At least one is required. Set both, because an email can't be matched against a merchant id.
+  `PAYPAL_GUIDE_PAYEE_MERCHANT_ID` (the merchant id of the sandbox business account that plays every guide).
+  - Also `PAYPAL_OPERATOR_MERCHANT_ID`: the REST app owner's own sandbox merchant id, required. Accounts
+    are compared by merchant id only; email variables are refused.
   - Optionally `MCP_DEMO_PASSCODE`; without it, `/mcp` answers 401.
   - TODO-CHECK: the operator's merchant id, from the sandbox account's profile.
 - `paypal/llm`: `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL` (OpenRouter with a spend cap until 15 Dec;
@@ -58,7 +60,9 @@ start**: this fails closed, so it never pays the app owner by mistake.
    - 1 business account, every guide;
    - optionally a second business account for the spike.
 3. Run the spike from a laptop with the env set, and paste the table into the CTO's notes:
-   `node scripts/spike.ts --payee-email <guide business sandbox email>`. Do it again with `--with-payment-source`.
+   `node scripts/spike.ts --payee-merchant-id <guide business merchant id>`. Do it again with
+   `--with-payment-source`, and check that the order replies echo `payee.merchant_id` (S6; the app refuses
+   to capture without it).
 4. After the first deploy, add a webhook in the sandbox app:
    - URL: `https://paypal.ambree.ai/webhooks/paypal`.
    - Events: `CHECKOUT.ORDER.APPROVED`, `PAYMENT.CAPTURE.COMPLETED`, `PAYMENT.CAPTURE.REFUNDED`,

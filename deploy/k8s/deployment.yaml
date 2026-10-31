@@ -51,18 +51,17 @@ spec:
             - name: DB_PATH
               value: /data/ambree.sqlite
             # No Secret (or no keys in it) means the fake PayPal and the scripted model, so the pod still boots.
-            # With PAYPAL_CLIENT_ID + SECRET set, PAYPAL_GUIDE_PAYEE_EMAIL is required (the app refuses to start without it).
+            # With PAYPAL_CLIENT_ID + SECRET set, PAYPAL_GUIDE_PAYEE_MERCHANT_ID and PAYPAL_OPERATOR_MERCHANT_ID are
+            # required (merchant ids only; any *_EMAIL variable makes the app refuse to start).
             - name: PAYPAL_CLIENT_ID
               valueFrom: { secretKeyRef: { name: paypal-sandbox, key: PAYPAL_CLIENT_ID, optional: true } }
             - name: PAYPAL_CLIENT_SECRET
               valueFrom: { secretKeyRef: { name: paypal-sandbox, key: PAYPAL_CLIENT_SECRET, optional: true } }
             - name: PAYPAL_WEBHOOK_ID
               valueFrom: { secretKeyRef: { name: paypal-sandbox, key: PAYPAL_WEBHOOK_ID, optional: true } }
-            - name: PAYPAL_GUIDE_PAYEE_EMAIL
-              valueFrom: { secretKeyRef: { name: paypal-sandbox, key: PAYPAL_GUIDE_PAYEE_EMAIL, optional: true } }
-            # The REST app owner's own account: the app refuses to start in sandbox mode without one, or if a guide payee equals it.
-            - name: PAYPAL_OPERATOR_EMAIL
-              valueFrom: { secretKeyRef: { name: paypal-sandbox, key: PAYPAL_OPERATOR_EMAIL, optional: true } }
+            - name: PAYPAL_GUIDE_PAYEE_MERCHANT_ID
+              valueFrom: { secretKeyRef: { name: paypal-sandbox, key: PAYPAL_GUIDE_PAYEE_MERCHANT_ID, optional: true } }
+            # The REST app owner's own merchant id: never a payee; the app refuses to start if a guide's equals it.
             - name: PAYPAL_OPERATOR_MERCHANT_ID
               valueFrom: { secretKeyRef: { name: paypal-sandbox, key: PAYPAL_OPERATOR_MERCHANT_ID, optional: true } }
             # MCP is off unless this is set (clients send it as a Bearer token).

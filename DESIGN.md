@@ -331,3 +331,44 @@ that changed:
     append, and served at `/api/ledger/head`.
   - After a pod restart, the in-memory checkpoint starts from the database. Comparing it with the last
     logged `ledger_head` is the operator's check.
+
+## 12. After the re-check (fix round 2, 31 Oct). This supersedes §11 where they differ
+
+- **Merchant ids only.** This replaces §11's email comparison.
+  - `samePayee` and `isOperator` compare `merchant_id` only; a payee with no merchant id never matches, and
+    counts as possibly the operator.
+  - Config requires `PAYPAL_OPERATOR_MERCHANT_ID` and `PAYPAL_GUIDE_PAYEE_MERCHANT_ID` in sandbox mode and
+    refuses the `*_EMAIL` variables.
+  - Seed guides carry invented 13-character merchant ids.
+  - The app sends orders with `payee.merchant_id`. Before capture, the order's `payee.merchant_id` must
+    equal the guide's and must not be the operator's.
+  - **UNVERIFIED (spike S6):** whether order replies echo `payee.merchant_id`; without it, capture is refused.
+  - Also **UNVERIFIED:** that merchant ids are 13 capitals and digits (the code allows 8-20).
+- **The page's payment line** (`public/labels.js` `paymentLine`):
+  - "Paid" only for captured, partially refunded or refunded bookings;
+  - "Payment pending" for `capture_pending`;
+  - "Payment failed" for `capture_failed`;
+  - "Payment needs review" otherwise.
+- **Refund events.** `PAYMENT.CAPTURE.REFUNDED` and any `PAYMENT.REFUND.*` (e.g. `PAYMENT.REFUND.FAILED`;
+  the exact names are **UNVERIFIED**) call `refreshRefunds`. A terminal status other than COMPLETED/PENDING
+  marks the op `failed`, which releases the reservation.
+- **Refund reconciliation fails closed.** For a COMPLETED or PENDING reply, the amount must exist and equal
+  the op's currency and minor units. Otherwise the op and the booking go to `needs_review`: the op stays
+  reserved, nothing is counted, and nothing is announced.
+- **Mutation checks** (`refuseMutation`, run before any session lookup or creation):
+  - every `/api/*` POST needs `Content-Type: application/json`;
+  - `/api/*`, `/o/{token}` and `/fake-paypal/*` POSTs carrying an `Origin` need it to equal
+    `new URL(PUBLIC_URL).origin`.
+  - The operator page stays a form POST: it is a no-cookie capability URL, so a forged form can't act
+    without the token. The Origin check still applies.
+  - The webhook (PayPal server to server, signature-verified) and `/mcp` (Bearer passcode) are outside
+    these browser checks.
+  - `Referrer-Policy` is `same-origin`: `no-referrer` makes Chrome send `Origin: null` on form POSTs.
+- **Per-tab conversations.**
+  - Sessions start with no conversation; `POST /api/conversations` adds one and returns its id.
+  - The page keeps the id in `sessionStorage` and sends it on every call (`?conversation_id=` on GET, in
+    the JSON body on POST). The server serves it only if the session owns it, else 404.
+- **Schema version.** `PRAGMA user_version = 2` (`SCHEMA_VERSION` in `src/store/db.ts`). Opening a file of
+  any other version (an unstamped build-1 file reads as 0) throws `SchemaError`. There are no migrations
+  until something is deployed. This also covers the re-check's legacy-records point: records without
+  `refund_ops` can't be loaded at all.

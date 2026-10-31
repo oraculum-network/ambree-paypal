@@ -15,7 +15,7 @@ describe("repo hygiene", () => {
   it("the README names every tool, the spike command and the built-during note", () => {
     const readme = read("README.md");
     for (const t of TOOL_NAMES) expect(readme).toContain(`\`${t}\``);
-    expect(readme).toContain("node scripts/spike.ts --payee-email");
+    expect(readme).toContain("node scripts/spike.ts --payee-merchant-id");
     expect(readme).toContain("Built during the hackathon");
   });
 

@@ -48,27 +48,42 @@ Ambree never holds your money. PayPal sandbox only.
   - Before capturing, it re-reads the order from PayPal. The order must have exactly one purchase unit with the
     mandate's payee, amount and currency, and must reference the booking. After capture, the capture's amount
     must match too. Otherwise the booking goes to `needs_review` and is not marked paid.
-  - "Paid" and "refunded" mean PayPal said `COMPLETED`; a `PENDING` capture or refund is shown as pending.
+  - "Paid" and "refunded" mean PayPal said `COMPLETED`. The page shows "Payment pending", "Payment failed"
+    or "Payment needs review" otherwise.
   - It refunds only when there is a cyclone warning, a declined reschedule or the guide's offer. Each refund
     is saved (amount and PayPal-Request-Id) before it is sent, and retried unchanged.
+  - PayPal's refund reply must carry exactly that currency and amount. A missing or different amount puts
+    the booking in `needs_review`: nothing is counted as refunded and no success is announced.
+  - A refund that ends `FAILED` or `CANCELLED` (seen by GET after a `PAYMENT.REFUND.*` or
+    `PAYMENT.CAPTURE.REFUNDED` webhook) releases its reserved amount.
 - **Traveller authority is a session, not an id.**
   - Each browser gets an HttpOnly, SameSite=Lax session cookie (Secure on https).
-  - The server maps the cookie to the conversations it started. Reading state, approving a mandate and
-    every tool call work only on the caller's own bookings.
+  - Each tab names its own conversation on every request, and the server checks that the session owns it.
+    Reading state, approving a mandate and every tool call work only on the caller's own bookings.
+  - Every state-changing `/api/*` POST needs `Content-Type: application/json`. If the request carries an
+    `Origin`, it must be the configured public origin. The guide's page and the fake checkout check the
+    Origin too.
+  - These checks run before any session is looked up, so a cross-site request can't create or replace a
+    session.
   - MCP is off unless `MCP_DEMO_PASSCODE` is set. MCP calls run in their own scope and can't see web
     bookings.
 
 **Never custody, and exactly what is enforced.** The guide's account receives the deposit, and refunds
-come out of the guide's capture. In sandbox mode the app needs the REST app owner's own identity
-(`PAYPAL_OPERATOR_EMAIL` and/or `PAYPAL_OPERATOR_MERCHANT_ID`):
-- **At startup,** it refuses to start if any guide's payee matches one of those identities. Emails match
-  case-insensitively; merchant ids match exactly.
-- **When creating an order,** it refuses if the guide's payee matches.
-- **Before capture,** it refuses an order with no payee or with an operator payee.
+come out of the guide's capture. Accounts are identified by **PayPal merchant id only**, because one account
+can have several email addresses (aliases), so an email can't prove two payees are different accounts. In
+sandbox mode:
+- **Configuration:** `PAYPAL_OPERATOR_MERCHANT_ID` (the REST app owner's account) and
+  `PAYPAL_GUIDE_PAYEE_MERCHANT_ID` are required, and the `*_EMAIL` variables are refused.
+- **At startup,** the app refuses to start if any guide's merchant id equals the operator's.
+- **Orders are sent with `payee.merchant_id`,** never an email. When creating an order, the app refuses an
+  operator payee.
+- **Before capture,** it re-reads the order and compares its `payee.merchant_id` with the guide's. It
+  refuses one that is the operator's, and one that has no merchant id.
 
-The limit: an email can only be compared with an email and a merchant id with a merchant id. So if the guide
-is given by email and the operator only by merchant id (or the other way round), an alias of the operator's
-account is not detected. Configure both identities for full coverage.
+**What this does not prove:** that the merchant id configured as the operator's really is the REST app
+owner's. It is a configured value, so check it in the sandbox dashboard. Also **UNVERIFIED:** that PayPal's
+order replies echo `payee.merchant_id`. If they don't, every capture is refused (it fails closed), and the
+spike checks this (DESIGN.md §5 S6).
 
 ## Run it locally (no keys needed)
 
@@ -96,12 +111,12 @@ other than `https://api-m.sandbox.paypal.com`.
 |---|---|
 | `PAYPAL_CLIENT_ID`, `PAYPAL_CLIENT_SECRET` | The sandbox REST app (developer.paypal.com → Apps & Credentials → Sandbox) |
 | `PAYPAL_WEBHOOK_ID` | The id of the sandbox webhook pointing at `{PUBLIC_URL}/webhooks/paypal` |
-| `PAYPAL_GUIDE_PAYEE_EMAIL` (or `_MERCHANT_ID`) | The sandbox **business** account that plays every guide |
+| `PAYPAL_GUIDE_PAYEE_MERCHANT_ID` | The merchant id of the sandbox **business** account that plays every guide (emails are refused) |
 | `PUBLIC_URL` | Where PayPal sends the buyer back to (`/paypal/return`) |
 | `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL` | Any OpenAI-compatible `/chat/completions` endpoint with tool calling |
-| `PAYPAL_OPERATOR_EMAIL` and/or `PAYPAL_OPERATOR_MERCHANT_ID` | The REST app owner's own account, which must never be a payee (required in sandbox mode) |
+| `PAYPAL_OPERATOR_MERCHANT_ID` | The REST app owner's own merchant id, which must never be a payee (required in sandbox mode) |
 | `MCP_DEMO_PASSCODE` | Turns on `POST /mcp`; clients send it as `Authorization: Bearer …` |
-| `DB_PATH` | The sqlite file for bookings and the ledger (default `:memory:`) |
+| `DB_PATH` | The sqlite file for bookings and the ledger (default `:memory:`). It carries a schema version, and a file of any other version is refused (no migrations yet) |
 
 ### Check PayPal itself: the spike
 
@@ -110,7 +125,7 @@ approval in a browser, capture, full refund. It prints a table of HTTP statuses 
 secret.
 
 ```bash
-PAYPAL_CLIENT_ID=... PAYPAL_CLIENT_SECRET=... node scripts/spike.ts --payee-email guide-business@example.com
+PAYPAL_CLIENT_ID=... PAYPAL_CLIENT_SECRET=... node scripts/spike.ts --payee-merchant-id GUIDEMERCHANT1
 ```
 
 ## For judges
