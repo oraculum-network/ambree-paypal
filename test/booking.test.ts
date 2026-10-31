@@ -184,13 +184,14 @@ describe("mandate → order → capture → webhooks → ledger", () => {
     expect(() => w.service.approveMandate(first.mandate_id, first.code)).toThrow(/newer mandate/);
   });
 
-  it("a failed create keeps the mandate and retries with the same nonce", async () => {
+  it("an ambiguous create failure keeps the mandate and retries with the same nonce", async () => {
     const { w, id } = await priced();
     w.service.proposeMandate(id);
     const { code, mandate_id } = w.channels.inbox(CONV).at(-1)!;
     w.service.approveMandate(mandate_id, code);
-    w.fake.failNext({ path: /^\/v2\/checkout\/orders$/, status: 422, body: { name: "UNPROCESSABLE_ENTITY", details: [{ issue: "PAYEE_ACCOUNT_RESTRICTED" }] } });
-    await expect(w.service.createOrder(id)).rejects.toMatchObject({ issue: "PAYEE_ACCOUNT_RESTRICTED" });
+    w.fake.failNext({ path: /^\/v2\/checkout\/orders$/, status: 503, body: { name: "SERVICE_UNAVAILABLE" } });
+    w.fake.failNext({ path: /^\/v2\/checkout\/orders$/, status: 503, body: { name: "SERVICE_UNAVAILABLE" } });
+    await expect(w.service.createOrder(id)).rejects.toMatchObject({ status: 503 });
     const b = await w.service.createOrder(id);
     expect(b.status).toBe("order_created");
     const ids = w.fake.calls.filter((c) => c.path === "/v2/checkout/orders").map((c) => c.requestId);

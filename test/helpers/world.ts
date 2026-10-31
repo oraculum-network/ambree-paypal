@@ -8,10 +8,11 @@ import { Ledger } from "../../src/ledger/ledger.ts";
 import { Mandates } from "../../src/mandate/mandate.ts";
 import { PayPalRestClient } from "../../src/paypal/client.ts";
 import { FakePayPal } from "../../src/paypal/fake.ts";
+import type { Payee } from "../../src/paypal/types.ts";
 import { openDb } from "../../src/store/db.ts";
 import { DemoCycloneFeed } from "../../src/weather/cyclones.ts";
 
-export function makeWorld(opts: { start?: string } = {}) {
+export function makeWorld(opts: { start?: string; operatorPayees?: Payee[] } = {}) {
   let t = Date.parse(opts.start ?? "2026-11-03T08:00:00Z");
   const now = () => new Date(t);
   const db = openDb();
@@ -21,7 +22,7 @@ export function makeWorld(opts: { start?: string } = {}) {
   const mandates = new Mandates(db, now);
   const channels = new Channels();
   const weather = new DemoCycloneFeed();
-  const service = new BookingService({ db, ledger, mandates, payments, guides: guidesWithPayee(undefined), weather, channels, publicUrl: "http://127.0.0.1:3999", now });
+  const service = new BookingService({ db, ledger, mandates, payments, guides: guidesWithPayee(undefined), weather, channels, publicUrl: "http://127.0.0.1:3999", now, operatorPayees: opts.operatorPayees ?? [] });
   const webhookResults: Array<{ status: number; result: string }> = [];
   fake.deliver = async (raw, headers) => {
     webhookResults.push(await service.handleWebhook(raw, headers));

@@ -1,6 +1,7 @@
 // The HTTP app: chat page and API, the guide's operator page, PayPal's return URL and webhook, MCP, and
 // (fake mode only) a stand-in PayPal checkout page and the demo cyclone control. No framework.
 
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { type IncomingMessage, type Server, type ServerResponse, createServer } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -20,12 +21,23 @@ import type { PaymentsApi } from "./paypal/api.ts";
 import { PayPalRestClient } from "./paypal/client.ts";
 import { FakePayPal } from "./paypal/fake.ts";
 import { formatMoney } from "./paypal/money.ts";
-import { openDb } from "./store/db.ts";
+import { redactPath } from "./http/redact.ts";
+import { isOperator } from "./mandate/mandate.ts";
+import { Records, openDb } from "./store/db.ts";
 import { addDays } from "./agent/scripted.ts";
 import { DemoCycloneFeed } from "./weather/cyclones.ts";
 
 export const VERSION = "0.1.0";
-const CONV_RE = /^cv_[A-Za-z0-9_-]{8,40}$/;
+export const SESSION_COOKIE = "amb_sid";
+
+function parseCookies(header: string | undefined): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const part of (header ?? "").split(";")) {
+    const i = part.indexOf("=");
+    if (i > 0) out[part.slice(0, i).trim()] = part.slice(i + 1).trim();
+  }
+  return out;
+}
 const JSON_LIMIT = 16 * 1024;
 const WEBHOOK_LIMIT = 256 * 1024;
 const MCP_LIMIT = 64 * 1024;
@@ -98,6 +110,13 @@ export function createApp(opts: AppOptions): App {
   const today = opts.today ?? (() => new Date().toISOString().slice(0, 10));
   const db = openDb(config.dbPath);
   const ledger = new Ledger(db);
+  // The ledger head kept outside the database: logged on every append and served at /api/ledger/head,
+  // so a deleted tail or a rolled-back file is caught by verify(checkpoint).
+  let checkpoint = ledger.head();
+  ledger.onAppend = (c) => {
+    checkpoint = c;
+    log({ event: "ledger_head", count: c.count, head: c.head });
+  };
   const mandates = new Mandates(db);
   const channels = new Channels();
   const weather = new DemoCycloneFeed();
@@ -117,7 +136,34 @@ export function createApp(opts: AppOptions): App {
   }
 
   const guides = guidesWithPayee(config.guidePayee);
-  const service = new BookingService({ db, ledger, mandates, payments, guides, weather, channels, publicUrl: config.publicUrl });
+  for (const g of guides) {
+    if (isOperator(g.payee, config.operatorPayees)) throw new Error(`Guide ${g.id}'s payee is the operator's own account; Ambree must never be the payee`);
+  }
+  const service = new BookingService({ db, ledger, mandates, payments, guides, weather, channels, publicUrl: config.publicUrl, operatorPayees: config.operatorPayees });
+
+  // Traveller sessions: an HttpOnly cookie holds a random id; the server maps it (stored hashed) to the
+  // conversations it created. A conversation id is never accepted from the client.
+  const sessions = new Records<{ id: string; conversations: string[] }>(db, "session");
+  const secureCookie = config.publicUrl.startsWith("https://");
+  const newConversationId = () => `cv_${randomBytes(12).toString("hex")}`;
+  const sidHash = (sid: string) => createHash("sha256").update(`session:${sid}`).digest("hex");
+  function session(req: IncomingMessage, res: ServerResponse): { id: string; conversations: string[]; current: string } {
+    const sid = parseCookies(req.headers.cookie)[SESSION_COOKIE];
+    let rec = sid && /^[A-Za-z0-9_-]{43}$/.test(sid) ? sessions.get(sidHash(sid)) : undefined;
+    if (!rec) {
+      const fresh = randomBytes(32).toString("base64url");
+      rec = sessions.put({ id: sidHash(fresh), conversations: [newConversationId()] });
+      res.setHeader("Set-Cookie", `${SESSION_COOKIE}=${fresh}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000${secureCookie ? "; Secure" : ""}`);
+    }
+    return { ...rec, current: rec.conversations.at(-1)! };
+  }
+  const mcpConfigured = config.mcpPasscode ? Buffer.from(config.mcpPasscode) : undefined;
+  function mcpAllowed(req: IncomingMessage): boolean {
+    const auth = req.headers.authorization ?? "";
+    if (!mcpConfigured || !auth.startsWith("Bearer ")) return false;
+    const given = Buffer.from(auth.slice(7));
+    return given.length === mcpConfigured.length && timingSafeEqual(given, mcpConfigured);
+  }
   const model: ChatModel =
     opts.model ?? (config.llm.mode === "openai" ? new OpenAICompatModel({ baseUrl: config.llm.baseUrl, apiKey: config.llm.apiKey, model: config.llm.model }) : new ScriptedModel(today));
   const toolCtx = { service, channels, sendOperatorLink: channels.sendOperatorLink.bind(channels) };
@@ -142,7 +188,7 @@ export function createApp(opts: AppOptions): App {
       inbox: channels.inbox(conv).map(({ text, at, mandate_id }) => ({ text, at, mandate_id })),
       guide_phone: channels.operatorLinks(conv),
       ledger: ledger.list().filter((e) => ids.has(e.booking_id)),
-      chain: ledger.verify(),
+      chain: ledger.verify(checkpoint),
     };
   }
 
@@ -150,32 +196,39 @@ export function createApp(opts: AppOptions): App {
     const method = req.method ?? "GET";
     const path = url.pathname;
 
-    if (method === "GET" && statics[path]) return send(res, 200, statics[path]!.body.toString("utf8"), statics[path]!.type);
+    if (method === "GET" && statics[path]) {
+      if (path === "/") session(req, res);
+      return send(res, 200, statics[path]!.body.toString("utf8"), statics[path]!.type);
+    }
     if (method === "GET" && path === "/healthz") return sendJson(res, 200, { ok: true, version: VERSION, paypal: config.paypal.mode, model: config.llm.mode });
+    if (method === "GET" && path === "/api/ledger/head") return sendJson(res, 200, { ...checkpoint, verify: ledger.verify(checkpoint) });
 
+    // Every traveller route acts on the caller's own session; a conversation_id sent by a client is ignored.
     if (path === "/api/chat" && method === "POST") {
       const body = await readJson(req);
-      const conv = body?.conversation_id;
-      if (typeof conv !== "string" || !CONV_RE.test(conv)) return sendJson(res, 400, { error: "conversation_id required" });
+      if (!body) return sendJson(res, 400, { error: "JSON body required" });
+      const conv = session(req, res).current;
       const replies = await runEvents(conv);
-      if (typeof body!.message === "string" && body!.message.trim()) replies.push((await agent.turn(conv, body!.message.trim())).reply);
+      if (typeof body.message === "string" && body.message.trim()) replies.push((await agent.turn(conv, body.message.trim())).reply);
       return sendJson(res, 200, { replies, ...state(conv) });
     }
-    if (path === "/api/state" && method === "GET") {
-      const conv = url.searchParams.get("conversation_id") ?? "";
-      if (!CONV_RE.test(conv)) return sendJson(res, 400, { error: "conversation_id required" });
+    if (path === "/api/state" && method === "GET") return sendJson(res, 200, state(session(req, res).current));
+    if (path === "/api/conversations" && method === "POST") {
+      const s = session(req, res);
+      const conv = newConversationId();
+      sessions.put({ id: s.id, conversations: [...s.conversations, conv].slice(-20) });
       return sendJson(res, 200, state(conv));
     }
     let m = path.match(/^\/api\/mandates\/(md_[0-9a-f]{16})\/approve$/);
     if (m && method === "POST") {
       const body = await readJson(req);
-      const conv = String(body?.conversation_id ?? "");
+      const s = session(req, res);
       const mandate = mandates.get(m[1]!);
       const booking = mandate ? service.get(mandate.booking_id) : undefined;
-      if (!booking || booking.conversation_id !== conv) return sendJson(res, 404, { error: "No such mandate." });
+      if (!booking || !s.conversations.includes(booking.conversation_id)) return sendJson(res, 404, { error: "No such mandate." });
       try {
         service.approveMandate(m[1]!, String(body?.code ?? ""));
-        return sendJson(res, 200, { ok: true, ...state(conv) });
+        return sendJson(res, 200, { ok: true, ...state(booking.conversation_id) });
       } catch (e) {
         if (e instanceof ServiceError) return sendJson(res, 422, { ok: false, error: e.message, reason: e.code });
         throw e;
@@ -183,10 +236,9 @@ export function createApp(opts: AppOptions): App {
     }
     if (path === "/api/demo/cyclone" && method === "POST") {
       if (!fake) return sendJson(res, 404, { error: "demo controls run only with the fake PayPal" });
-      const body = await readJson(req);
-      const conv = String(body?.conversation_id ?? "");
+      const conv = session(req, res).current;
       const dates = service.forConversation(conv).map((b) => b.date).sort();
-      if (!CONV_RE.test(conv) || !dates.length) return sendJson(res, 400, { error: "no booking to warn about" });
+      if (!dates.length) return sendJson(res, 400, { error: "no booking to warn about" });
       weather.raise({ id: `TC-DEMO-${Date.now()}`, name: "Cyclone Demo-1 (demo)", level: "orange", from: addDays(dates[0]!, -1), to: addDays(dates.at(-1)!, 1), summary: "Demo warning raised from the page." });
       const n = await service.announceCyclone(conv);
       return sendJson(res, 200, { ok: true, bookings_warned: n });
@@ -207,21 +259,22 @@ export function createApp(opts: AppOptions): App {
     if (path.startsWith("/o/")) return send(res, 404, renderInvalidLink(), "text/html; charset=utf-8");
 
     if (path === "/paypal/return" && method === "GET") {
+      // Captures only for the session that owns the booking (the traveller's browser carries the cookie on
+      // this top-level redirect). Anyone else just lands on "/"; the webhook still captures. Never a
+      // conversation id in the URL.
       const id = url.searchParams.get("booking") ?? "";
       const b = service.get(id);
-      if (!b) return redirect(res, "/");
-      try {
-        const r = await service.captureIfApproved(id);
-        log({ event: "return", booking: id, captured: r.captured, order_status: r.order_status });
-      } catch (e) {
-        log({ event: "return_failed", booking: id, error: e instanceof Error ? e.name : "unknown" });
+      if (b && session(req, res).conversations.includes(b.conversation_id)) {
+        try {
+          const r = await service.captureIfApproved(id);
+          log({ event: "return", booking: id, captured: r.captured, order_status: r.order_status });
+        } catch (e) {
+          log({ event: "return_failed", booking: id, error: e instanceof Error ? e.name : "unknown" });
+        }
       }
-      return redirect(res, `/?c=${encodeURIComponent(b.conversation_id)}`);
+      return redirect(res, "/");
     }
-    if (path === "/paypal/cancel" && method === "GET") {
-      const b = service.get(url.searchParams.get("booking") ?? "");
-      return redirect(res, b ? `/?c=${encodeURIComponent(b.conversation_id)}` : "/");
-    }
+    if (path === "/paypal/cancel" && method === "GET") return redirect(res, "/");
 
     if (path === "/webhooks/paypal" && method === "POST") {
       const raw = await readBody(req, WEBHOOK_LIMIT);
@@ -232,6 +285,9 @@ export function createApp(opts: AppOptions): App {
     }
 
     if (path === "/mcp") {
+      // MCP clients share the "mcp" conversation, which no web session owns, so they can't reach a
+      // traveller's bookings; and MCP is off unless MCP_DEMO_PASSCODE is set and sent as a Bearer token.
+      if (!mcpAllowed(req)) return sendJson(res, 401, { jsonrpc: "2.0", error: { code: -32001, message: config.mcpPasscode ? "Unauthorized: send the demo passcode as a Bearer token" : "MCP is disabled on this instance" }, id: null });
       if (method !== "POST") return sendJson(res, 405, { jsonrpc: "2.0", error: { code: -32000, message: "Method not allowed: stateless server, POST only" }, id: null });
       const raw = await readBody(req, MCP_LIMIT);
       let body: unknown;
@@ -277,10 +333,10 @@ export function createApp(opts: AppOptions): App {
     }
     route(req, res, url)
       .catch((e: unknown) => {
-        log({ event: "error", path: url.pathname, error: e instanceof Error ? e.name : "unknown" });
+        log({ event: "error", path: redactPath(url.pathname), error: e instanceof Error ? e.name : "unknown" });
         if (!res.headersSent) sendJson(res, e instanceof ServiceError ? 422 : 500, { error: e instanceof ServiceError ? e.message : "internal error" });
       })
-      .finally(() => log({ event: "request", method: req.method, path: url.pathname.startsWith("/o/") ? "/o/{token}" : url.pathname, status: res.statusCode, ms: Date.now() - started }));
+      .finally(() => log({ event: "request", method: req.method, path: redactPath(url.pathname), status: res.statusCode, ms: Date.now() - started }));
   });
 
   return {

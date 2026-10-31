@@ -1,7 +1,8 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { type App, createApp } from "../src/app.ts";
+import type { App } from "../src/app.ts";
+import { Browser, startApp } from "./helpers/server.ts";
 import { OpenAICompatModel } from "../src/agent/model.ts";
 import { ScriptedModel, parseRequest } from "../src/agent/scripted.ts";
 import { ConfigError, loadConfig } from "../src/config.ts";
@@ -10,35 +11,30 @@ import { TOOL_NAMES, openAiTools } from "../src/tools/registry.ts";
 
 let app: App;
 let base: string;
+let traveller: Browser;
 
 beforeAll(async () => {
-  // Port 0: the OS picks one; PUBLIC_URL is fixed after listen via a second app would be awkward,
-  // so pick a port first with a throwaway listen.
-  const probe = createApp({ config: loadConfig({ PORT: "0", HOST: "127.0.0.1" }) });
-  const port = await probe.listen();
-  await probe.close();
-  app = createApp({ config: loadConfig({ PORT: String(port), HOST: "127.0.0.1", PUBLIC_URL: `http://127.0.0.1:${port}` }), today: () => "2026-11-03" });
-  await app.listen();
-  base = `http://127.0.0.1:${port}`;
+  const s = await startApp({ MCP_DEMO_PASSCODE: "test-passcode" });
+  app = s.app;
+  base = s.base;
+  traveller = new Browser(base);
 });
 afterAll(async () => {
   await app?.close();
 });
 
-const CONV = "cv_apptest0001";
 type State = Record<string, any>;
 
 async function post(path: string, body: unknown): Promise<State> {
-  const r = await fetch(`${base}${path}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-  return (await r.json()) as State;
+  return traveller.json(path, body);
 }
 async function state(): Promise<State> {
-  return (await (await fetch(`${base}/api/state?conversation_id=${CONV}`)).json()) as State;
+  return traveller.json("/api/state");
 }
 async function until(pred: (s: State) => boolean, label: string): Promise<State> {
   for (let i = 0; i < 100; i++) {
     const s = await state();
-    if (s.pending_events > 0) await post("/api/chat", { conversation_id: CONV });
+    if (s.pending_events > 0) await post("/api/chat", {});
     else if (pred(s)) return s;
     await new Promise((r) => setTimeout(r, 30));
   }
@@ -50,7 +46,7 @@ async function operator(url: string, form: Record<string, string>): Promise<Resp
 
 describe("the whole flow over HTTP (fake PayPal, scripted model)", () => {
   it("request → guide price → mandate → order → checkout → capture → webhooks → cyclone → refund", async () => {
-    const first = await post("/api/chat", { conversation_id: CONV, message: "Find me a hiking guide for Le Morne on Thursday and hold the spot" });
+    const first = await post("/api/chat", { message: "Find me a hiking guide for Le Morne on Thursday and hold the spot" });
     expect(first.replies.at(-1)).toMatch(/Lantern Ridge Walks \(demo\).*2026-11-05/);
     const link = first.guide_phone[0].url as string;
     expect(link).toMatch(/\/o\/[A-Za-z0-9_-]{43}$/);
@@ -69,11 +65,11 @@ describe("the whole flow over HTTP (fake PayPal, scripted model)", () => {
     // The agent never saw the code.
     expect(JSON.stringify(s.transcript)).not.toContain(code);
 
-    const wrong = await post(`/api/mandates/${mandateId}/approve`, { conversation_id: CONV, code: code === "000000" ? "111111" : "000000" });
+    const wrong = await post(`/api/mandates/${mandateId}/approve`, { code: code === "000000" ? "111111" : "000000" });
     expect(wrong.ok).toBe(false);
-    const otherConv = await post(`/api/mandates/${mandateId}/approve`, { conversation_id: "cv_someoneelse1", code });
-    expect(otherConv.error).toBe("No such mandate.");
-    expect((await post(`/api/mandates/${mandateId}/approve`, { conversation_id: CONV, code })).ok).toBe(true);
+    const otherSession = await new Browser(base).json(`/api/mandates/${mandateId}/approve`, { code });
+    expect(otherSession.error).toBe("No such mandate.");
+    expect((await post(`/api/mandates/${mandateId}/approve`, { code })).ok).toBe(true);
 
     s = await until((x) => x.bookings[0]?.status === "order_created", "order");
     const pay = s.bookings[0].order.approve_url as string;
@@ -82,15 +78,15 @@ describe("the whole flow over HTTP (fake PayPal, scripted model)", () => {
     expect(await checkout.text()).toContain("lantern-ridge@business.sandbox.example");
     const approved = await fetch(pay, { method: "POST", redirect: "manual" });
     expect(approved.status).toBe(303);
-    const ret = await fetch(approved.headers.get("location")!, { redirect: "manual" });
+    const ret = await traveller.fetch(approved.headers.get("location")!);
     expect(ret.status).toBe(303);
-    expect(ret.headers.get("location")).toBe(`/?c=${CONV}`);
+    expect(ret.headers.get("location")).toBe("/");
 
     s = await until((x) => x.ledger.some((e: State) => e.kind === "webhook.PAYMENT.CAPTURE.COMPLETED") && x.transcript.at(-1).text.startsWith("Paid"), "capture webhook");
     expect(s.bookings[0]).toMatchObject({ status: "captured", guide_balance: 3000 });
     expect(s.chain.ok).toBe(true);
 
-    expect((await post("/api/demo/cyclone", { conversation_id: CONV })).bookings_warned).toBe(1);
+    expect((await post("/api/demo/cyclone", {})).bookings_warned).toBe(1);
     s = await until((x) => x.bookings[0]?.reschedule?.status === "proposed", "reschedule");
     expect(s.transcript.at(-1).text).toMatch(/move the trip to 2026-11-08/);
     expect(await (await fetch(link)).text()).toContain("Move the trip?");
@@ -115,7 +111,7 @@ describe("the whole flow over HTTP (fake PayPal, scripted model)", () => {
   });
 
   it("refuses bad chat input and unsigned webhooks", async () => {
-    expect((await fetch(`${base}/api/chat`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ conversation_id: "x" }) })).status).toBe(400);
+    expect((await fetch(`${base}/api/chat`, { method: "POST", headers: { "Content-Type": "text/plain" }, body: "hi" })).status).toBe(400);
     const wh = await fetch(`${base}/webhooks/paypal`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: "WH-1", event_type: "PAYMENT.CAPTURE.COMPLETED", resource: {} }) });
     expect(wh.status).toBe(400);
   });
@@ -124,7 +120,7 @@ describe("the whole flow over HTTP (fake PayPal, scripted model)", () => {
 describe("MCP", () => {
   it("lists the 10 tools (none approves a mandate) and runs search_guides", async () => {
     const client = new Client({ name: "test", version: "1" });
-    await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/mcp`)));
+    await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/mcp`), { requestInit: { headers: { Authorization: "Bearer test-passcode" } } }));
     const { tools } = await client.listTools();
     expect(tools.map((t) => t.name).sort()).toEqual([...TOOL_NAMES].sort());
     expect(tools.some((t) => /approve_mandate/.test(t.name))).toBe(false);
@@ -151,7 +147,7 @@ describe("config", () => {
   it("needs both PayPal credentials and a guide payee for sandbox", () => {
     expect(() => loadConfig({ PAYPAL_CLIENT_ID: "a" })).toThrow(ConfigError);
     expect(() => loadConfig({ PAYPAL_CLIENT_ID: "a", PAYPAL_CLIENT_SECRET: "b" })).toThrow(/PAYPAL_GUIDE_PAYEE_EMAIL/);
-    const c = loadConfig({ PAYPAL_CLIENT_ID: "a", PAYPAL_CLIENT_SECRET: "secret-b", PAYPAL_GUIDE_PAYEE_EMAIL: "g@business.example.com" });
+    const c = loadConfig({ PAYPAL_CLIENT_ID: "a", PAYPAL_CLIENT_SECRET: "secret-b", PAYPAL_GUIDE_PAYEE_EMAIL: "g@business.example.com", PAYPAL_OPERATOR_EMAIL: "owner@business.example.com" });
     expect(c.paypal).toMatchObject({ mode: "sandbox", baseUrl: "https://api-m.sandbox.paypal.com" });
     expect(c.guidePayee).toEqual({ email_address: "g@business.example.com" });
   });

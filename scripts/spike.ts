@@ -7,6 +7,7 @@
 // HTTP statuses and ids. It never prints a secret or a token, and refuses any base URL but the sandbox.
 // It answers DESIGN.md §5 S1-S6 and S9. PAYPAL_WEBHOOK_ID is not needed here.
 
+import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { PayPalRestClient } from "../src/paypal/client.ts";
 import { PayPalError } from "../src/paypal/errors.ts";
@@ -216,6 +217,15 @@ export async function runSpike(d: SpikeDeps): Promise<{ rows: Row[]; ok: boolean
   return { rows, ok: true };
 }
 
+/**
+ * One random id per independent run: it seeds every PayPal-Request-Id and the invoice id, so two runs
+ * (even in the same second) never replay each other's orders. Only a deliberate retry of the same
+ * operation should reuse it.
+ */
+export function newRunId(): string {
+  return randomUUID();
+}
+
 async function main(): Promise<number> {
   let args: SpikeArgs;
   let env: ReturnType<typeof readEnv>;
@@ -228,7 +238,7 @@ async function main(): Promise<number> {
   }
   let last = 0;
   const client = new PayPalRestClient({ ...env, onCall: (c) => (last = c.status) });
-  const runId = new Date().toISOString().replace(/\D/g, "").slice(0, 14);
+  const runId = newRunId();
   process.stdout.write(`Ambree PayPal spike ${runId} against ${client.baseUrl} (sandbox), payee ${JSON.stringify(args.payee)}, ${args.currency} ${args.value}\n`);
 
   // (a) the token, on its own so a credential problem is reported as such.

@@ -55,9 +55,25 @@ export function quoteHash(q: Quote): string {
   return hashOf(q);
 }
 
+/**
+ * Same account: equal emails (case-insensitive) when both carry one, else equal merchant ids when both
+ * carry one. PayPal may echo both fields on an order (UNVERIFIED), so either may be present.
+ */
 export function samePayee(a: Payee, b: Payee): boolean {
-  if (a.email_address !== undefined || b.email_address !== undefined) return (a.email_address ?? "").toLowerCase() === (b.email_address ?? "").toLowerCase();
-  return a.merchant_id === b.merchant_id;
+  if (a.email_address && b.email_address) return a.email_address.toLowerCase() === b.email_address.toLowerCase();
+  if (a.merchant_id && b.merchant_id) return a.merchant_id === b.merchant_id;
+  return false;
+}
+
+/**
+ * True if `p` names one of the operator's own accounts: same email (case-insensitive) or same merchant id.
+ * An email and a merchant id can't be compared with each other, which is why the README says the check
+ * covers only the identities configured.
+ */
+export function isOperator(p: Payee, operators: readonly Payee[]): boolean {
+  return operators.some((o) =>
+    o.email_address !== undefined ? p.email_address !== undefined && p.email_address.toLowerCase() === o.email_address.toLowerCase() : p.merchant_id !== undefined && p.merchant_id === o.merchant_id,
+  );
 }
 
 function codeHash(mandateId: string, code: string): string {

@@ -38,6 +38,8 @@ interface Failure {
   hang?: boolean;
   /** Throw like a dropped connection. */
   network?: boolean;
+  /** Process the request normally, then lose the reply (the client sees a network error). */
+  dropResponse?: boolean;
 }
 
 export const FAKE_CLIENT_ID = "fake-client-id";
@@ -119,6 +121,14 @@ export class FakePayPal {
     return structuredClone(stored.order);
   }
 
+  /** Changes a stored order out of band (as a PATCH by someone else would). */
+  mutateOrder(orderId: string, fn: (o: Order) => void): void {
+    const stored = this.#orders.get(orderId);
+    if (!stored) throw new Error(`fake: no order ${orderId}`);
+    fn(stored.order);
+    stored.payeeKey = payeeKey(stored.order.purchase_units?.[0]?.payee);
+  }
+
   order(orderId: string): Order | undefined {
     const o = this.#orders.get(orderId)?.order;
     return o ? structuredClone(o) : undefined;
@@ -161,6 +171,11 @@ export class FakePayPal {
         });
       }
       if (f.network) throw new TypeError("fetch failed");
+      if (f.dropResponse) {
+        const lost = await this.#route(method, url.pathname, headers, typeof init?.body === "string" ? init.body : undefined, requestId);
+        this.calls.push({ method, path: url.pathname, status: lost.status, requestId });
+        throw new TypeError("fetch failed");
+      }
       this.calls.push({ method, path: url.pathname, status: f.status, requestId });
       return json(f.status, f.body);
     }

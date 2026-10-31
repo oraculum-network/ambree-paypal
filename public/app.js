@@ -2,14 +2,8 @@
 // phone, inbox and ledger. Polls state so guide answers and webhooks show up without a reload.
 "use strict";
 
+// The conversation belongs to this browser's session cookie (HttpOnly); the page never handles its id.
 const $ = (id) => document.getElementById(id);
-const params = new URLSearchParams(location.search);
-let conv = params.get("c") || localStorage.getItem("ambree_conv");
-if (!conv || !/^cv_[A-Za-z0-9_-]{8,40}$/.test(conv)) {
-  conv = "cv_" + Array.from(crypto.getRandomValues(new Uint8Array(12)), (b) => b.toString(16).padStart(2, "0")).join("");
-}
-localStorage.setItem("ambree_conv", conv);
-if (params.has("c")) history.replaceState(null, "", "/");
 
 let busy = false;
 let last = null;
@@ -57,7 +51,7 @@ function render(s) {
       const msg = el("p", { class: "small", "data-testid": "approve-msg" });
       const btn = el("button", { type: "button", "data-testid": "approve" }, `Approve ${money(b.mandate.amount)} to the guide`);
       btn.onclick = async () => {
-        const r = await api(`/api/mandates/${b.mandate.id}/approve`, { conversation_id: conv, code: code.value.trim() });
+        const r = await api(`/api/mandates/${b.mandate.id}/approve`, { code: code.value.trim() });
         if (r.ok) {
           render(r);
           void tick(true);
@@ -81,11 +75,11 @@ function render(s) {
 
 async function tick(force) {
   if (busy) return;
-  const s = await api(`/api/state?conversation_id=${conv}`);
+  const s = await api("/api/state");
   if (s.pending_events > 0 || force) {
     busy = true;
     try {
-      render(await api("/api/chat", { conversation_id: conv }));
+      render(await api("/api/chat", {}));
     } finally {
       busy = false;
     }
@@ -100,19 +94,18 @@ $("chat-form").onsubmit = async (e) => {
   $("send").disabled = true;
   $("message").value = "";
   try {
-    render(await api("/api/chat", { conversation_id: conv, message: text }));
+    render(await api("/api/chat", { message: text }));
   } finally {
     busy = false;
     $("send").disabled = false;
   }
 };
 $("raise-cyclone").onclick = async () => {
-  await api("/api/demo/cyclone", { conversation_id: conv });
+  await api("/api/demo/cyclone", {});
   void tick(true);
 };
-$("new-conv").onclick = () => {
-  localStorage.removeItem("ambree_conv");
-  location.href = "/";
+$("new-conv").onclick = async () => {
+  render(await api("/api/conversations", {}));
 };
 
 void tick(false);

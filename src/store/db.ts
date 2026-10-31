@@ -28,7 +28,11 @@ export function openDb(path = ":memory:"): Db {
     CREATE TABLE IF NOT EXISTS webhook_events (
       event_id TEXT PRIMARY KEY,
       event_type TEXT NOT NULL,
-      received_at TEXT NOT NULL
+      received_at TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'received',
+      attempts INTEGER NOT NULL DEFAULT 0,
+      logged INTEGER NOT NULL DEFAULT 0,
+      updated_at TEXT
     );
   `);
   return db;
@@ -58,6 +62,29 @@ export class Records<T extends { id: string }> {
     const rows = this.#db.prepare("SELECT json FROM records WHERE kind = ? ORDER BY rowid").all(this.#kind) as Array<{ json: string }>;
     return rows.map((r) => JSON.parse(r.json) as T);
   }
+}
+
+export type WebhookStatus = "received" | "processing" | "completed" | "failed";
+
+/**
+ * Starts processing a verified webhook event. Only a `completed` event is a duplicate: a `failed` (or
+ * interrupted `processing`) one is processed again on redelivery. `logged` says whether its ledger row
+ * was already written, so a retry never writes it twice.
+ */
+export function beginWebhook(db: Db, eventId: string, eventType: string, at: string): { duplicate: true } | { duplicate: false; logged: boolean; attempts: number } {
+  db.prepare("INSERT OR IGNORE INTO webhook_events (event_id, event_type, received_at, status, attempts, logged, updated_at) VALUES (?, ?, ?, 'received', 0, 0, ?)").run(eventId, eventType, at, at);
+  const row = db.prepare("SELECT status, attempts, logged FROM webhook_events WHERE event_id = ?").get(eventId) as { status: WebhookStatus; attempts: number; logged: number };
+  if (row.status === "completed") return { duplicate: true };
+  db.prepare("UPDATE webhook_events SET status = 'processing', attempts = attempts + 1, updated_at = ? WHERE event_id = ?").run(at, eventId);
+  return { duplicate: false, logged: row.logged === 1, attempts: row.attempts + 1 };
+}
+
+export function finishWebhook(db: Db, eventId: string, status: "completed" | "failed", at: string): void {
+  db.prepare("UPDATE webhook_events SET status = ?, updated_at = ? WHERE event_id = ?").run(status, at, eventId);
+}
+
+export function markWebhookLogged(db: Db, eventId: string): void {
+  db.prepare("UPDATE webhook_events SET logged = 1 WHERE event_id = ?").run(eventId);
 }
 
 /** Records a webhook event id; false if it was already seen (a redelivery). */

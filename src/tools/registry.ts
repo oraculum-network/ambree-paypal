@@ -35,6 +35,11 @@ function define<S extends z.ZodObject>(t: Tool<S>): Tool<S> {
   return t;
 }
 
+/** Every booking tool starts here: a booking from another conversation is "not found". */
+function own(ctx: ToolContext, bookingId: string) {
+  return ctx.service.owned(bookingId, ctx.conversationId);
+}
+
 export const TOOLS = [
   define({
     name: "search_guides",
@@ -65,7 +70,7 @@ export const TOOLS = [
     description: "The booking's status, the guide's quote, the mandate, the PayPal order, the capture and any refund or reschedule.",
     input: z.object({ booking_id: bookingId }),
     moneyMoving: false,
-    run: async (a, ctx) => ctx.service.summary(ctx.service.must(a.booking_id)),
+    run: async (a, ctx) => ctx.service.summary(own(ctx, a.booking_id)),
   }),
   define({
     name: "propose_mandate",
@@ -75,6 +80,7 @@ export const TOOLS = [
     input: z.object({ booking_id: bookingId }),
     moneyMoving: false,
     run: async (a, ctx) => {
+      own(ctx, a.booking_id);
       const m = ctx.service.proposeMandate(a.booking_id);
       return { mandate_id: m.id, status: m.status, amount: m.amount, payee: m.payee_name, quote_hash: m.quote_hash, expires_at: m.expires_at, next: "Wait for the traveller to approve with their code." };
     },
@@ -86,6 +92,7 @@ export const TOOLS = [
     input: z.object({ booking_id: bookingId }),
     moneyMoving: true,
     run: async (a, ctx) => {
+      own(ctx, a.booking_id);
       const b = await ctx.service.createOrder(a.booking_id);
       return { booking_id: b.id, order_id: b.order_id, approve_url: b.approve_url, amount: b.quote?.deposit, payee: b.guide_name, status: b.status };
     },
@@ -97,6 +104,7 @@ export const TOOLS = [
     input: z.object({ booking_id: bookingId }),
     moneyMoving: false,
     run: async (a, ctx) => {
+      own(ctx, a.booking_id);
       const o = await ctx.service.getOrder(a.booking_id);
       return { order_id: o.id, status: o.status, payee: o.purchase_units?.[0]?.payee ?? null, capture: firstCapture(o) ? { id: firstCapture(o)!.id, status: firstCapture(o)!.status } : null };
     },
@@ -108,8 +116,9 @@ export const TOOLS = [
     input: z.object({ booking_id: bookingId }),
     moneyMoving: true,
     run: async (a, ctx) => {
+      own(ctx, a.booking_id);
       const r = await ctx.service.captureIfApproved(a.booking_id);
-      return { captured: r.captured, order_status: r.order_status, status: r.booking.status, capture_id: r.booking.capture_id ?? null };
+      return { captured: r.captured, order_status: r.order_status, capture_status: r.capture_status ?? null, status: r.booking.status, capture_id: r.booking.capture_id ?? null };
     },
   }),
   define({
@@ -119,6 +128,7 @@ export const TOOLS = [
     input: z.object({ booking_id: bookingId }),
     moneyMoving: false,
     run: async (a, ctx) => {
+      own(ctx, a.booking_id);
       const w = await ctx.service.weatherFor(a.booking_id);
       return { alerts: w.alerts.map((x) => ({ name: x.name, level: x.level, from: x.from, to: x.to, source: x.source })), explanation: w.explanation, refund_allowed: Boolean(await ctx.service.refundReason(ctx.service.must(a.booking_id))) };
     },
@@ -130,6 +140,7 @@ export const TOOLS = [
     input: z.object({ booking_id: bookingId, new_date: isoDate }),
     moneyMoving: false,
     run: async (a, ctx) => {
+      own(ctx, a.booking_id);
       const b = ctx.service.proposeReschedule(a.booking_id, a.new_date);
       return { booking_id: b.id, reschedule: b.reschedule, sent: "The guide was asked on their page." };
     },
@@ -141,8 +152,10 @@ export const TOOLS = [
     input: z.object({ booking_id: bookingId, amount: z.string().regex(/^\d{1,4}(\.\d{1,2})?$/).optional() }),
     moneyMoving: true,
     run: async (a, ctx) => {
+      own(ctx, a.booking_id);
       const b = await ctx.service.refund(a.booking_id, a.amount);
-      return { booking_id: b.id, status: b.status, refunded: ctx.service.summary(b).refunded, refund_ids: b.refund_ids };
+      const s = ctx.service.summary(b);
+      return { booking_id: b.id, status: b.status, refunded: s.refunded, refund_pending: s.refund_pending, refund_ids: b.refund_ids };
     },
   }),
 ] as const;
