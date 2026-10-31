@@ -614,6 +614,11 @@ export class BookingService {
   async refund(bookingId: string, amount?: string): Promise<Booking> {
     return this.#serial(bookingId, async () => {
       let b = this.must(bookingId);
+      // A refund whose PayPal reply didn't match stops every further refund and retry for this booking
+      // until a person has reconciled it.
+      if (b.refund_ops.some((o) => o.status === "needs_review")) {
+        throw new ServiceError("refund_under_review", "A refund on this booking needs review (PayPal's reply didn't match what was sent); no further refunds or retries until it is reconciled.");
+      }
       let op = b.refund_ops.find((o) => o.status === "sending");
       if (op) {
         this.#log(b, "refund.retry", { n: op.n, request_id: op.request_id, amount_minor: op.amount_minor, requested: amount ?? null });
@@ -693,7 +698,10 @@ export class BookingService {
     if (refund.status === "COMPLETED") {
       const capturedMinor = toMinor(b.captured!.value);
       const refunded = b.refunded_minor + actual;
-      const next = this.#setOp({ ...b, refunded_minor: refunded, refund_ids: [...b.refund_ids, refund.id], status: refunded >= capturedMinor ? "refunded" : "partially_refunded" }, n, { status: "completed", refund_id: refund.id, amount_minor: actual });
+      // Another operation in review keeps the whole booking in review: a later success never clears it.
+      const inReview = b.refund_ops.some((o) => o.n !== n && o.status === "needs_review");
+      const status: BookingStatus = inReview ? "needs_review" : refunded >= capturedMinor ? "refunded" : "partially_refunded";
+      const next = this.#setOp({ ...b, refunded_minor: refunded, refund_ids: [...b.refund_ids, refund.id], status }, n, { status: "completed", refund_id: refund.id, amount_minor: actual });
       this.#log(next, "refund.completed", { n, refund_id: refund.id, status: refund.status, amount: { currency_code: cur, value: fromMinor(actual) }, reason: op.reason });
       this.#d.channels.emit(b.conversation_id, { type: "refunded", booking_id: b.id, text: `Refunded ${cur} ${fromMinor(actual)} from ${b.guide_name} to the traveller (${op.reason}).` });
       return next;

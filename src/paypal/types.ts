@@ -97,6 +97,20 @@ export interface WebhookEvent {
   links?: Link[];
 }
 
+/**
+ * Who PayPal says owns the REST app, from GET /v1/identity/openidconnect/userinfo with the app's own token.
+ * UNVERIFIED (spike S11): that this call accepts a client-credentials token and describes the app owner,
+ * and that `payer_id` is the owner's merchant id. The docs' sample shows user_id/sub but no payer_id.
+ */
+export interface OperatorIdentity {
+  /** `payer_id` from the reply, when it looks like a merchant id; undefined otherwise. */
+  merchant_id?: string;
+  /** The reply's top-level field names (for the spike's report; no values). */
+  fields: string[];
+  user_id?: string;
+  account_type?: string;
+}
+
 /** The 5 PAYPAL-* transmission headers, lower-cased as Node gives them. */
 export interface WebhookTransmission {
   auth_algo: string;

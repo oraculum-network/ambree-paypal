@@ -52,6 +52,6 @@ describe("round 2 #6: refund reconciliation fails closed", () => {
     expect(b.refunded_minor).toBe(0);
     expect(w.channels.drain(CONV).some((e) => e.type === "refunded")).toBe(false);
     expect(w.ledger.list(id).some((e) => e.kind === "refund.reconcile_failed")).toBe(true);
-    await expect(w.service.refund(id, "5.00")).rejects.toMatchObject({ code: "refund_not_allowed" });
+    await expect(w.service.refund(id, "5.00")).rejects.toMatchObject({ code: "refund_under_review" });
   });
 });

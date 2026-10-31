@@ -16,6 +16,8 @@ export interface FakePayPalOptions {
   webhookId?: string;
   /** Where the approve link points. The demo server serves its own stand-in checkout page there. */
   checkoutUrl?: string;
+  /** The merchant id that "owns" the fake REST app (userinfo's payer_id). Default AMBREEOPER001. */
+  ownerMerchantId?: string;
   /** If set, only these payee emails / merchant ids are accepted. */
   knownPayees?: string[];
   tokenTtlSeconds?: number;
@@ -245,6 +247,11 @@ export class FakePayPal {
       return r ? json(200, r) : ppError(404, "RESOURCE_NOT_FOUND", "INVALID_RESOURCE_ID", "Specified resource ID does not exist.");
     }
     if (method === "POST" && path === "/v1/notifications/verify-webhook-signature") return this.#verify(body);
+    if (method === "GET" && path === "/v1/identity/openidconnect/userinfo") {
+      // The shape the real reply is assumed to have (UNVERIFIED, spike S11): payer_id = the app owner's merchant id.
+      const owner = this.#opts.ownerMerchantId ?? "AMBREEOPER001";
+      return json(200, { user_id: `https://www.paypal.com/webapps/auth/identity/user/FAKE${owner}`, sub: `fake-${owner.toLowerCase()}`, payer_id: owner, verified_account: "true", account_type: "BUSINESS" });
+    }
     return ppError(404, "NOT_FOUND", "INVALID_RESOURCE_ID", "The specified resource does not exist.");
   }
 

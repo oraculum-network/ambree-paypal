@@ -19,6 +19,7 @@ import { handleMcp } from "./mcp/server.ts";
 import { applyOperatorAction, esc, renderInvalidLink, renderOperatorPage } from "./operator/page.ts";
 import type { PaymentsApi } from "./paypal/api.ts";
 import { PayPalRestClient } from "./paypal/client.ts";
+import { PayPalError } from "./paypal/errors.ts";
 import { FakePayPal } from "./paypal/fake.ts";
 import { formatMoney } from "./paypal/money.ts";
 import { redactPath } from "./http/redact.ts";
@@ -50,6 +51,8 @@ export interface AppOptions {
   /** Tests inject a model; otherwise it follows config.llm. */
   model?: ChatModel;
   today?: () => string;
+  /** Fake mode only: the merchant id the fake PayPal reports as the REST app's owner (tests). */
+  fakeOwnerMerchantId?: string;
 }
 
 export interface App {
@@ -128,7 +131,7 @@ export function createApp(opts: AppOptions): App {
   let fake: FakePayPal | undefined;
   let payments: PaymentsApi;
   if (config.paypal.mode === "fake") {
-    fake = new FakePayPal({ checkoutUrl: `${config.publicUrl}/fake-paypal/checkout` });
+    fake = new FakePayPal({ checkoutUrl: `${config.publicUrl}/fake-paypal/checkout`, ownerMerchantId: opts.fakeOwnerMerchantId });
     // Deliver the fake's webhooks over real HTTP to our own endpoint, as PayPal would.
     fake.deliver = async (raw, headers) => {
       await fetch(`http://127.0.0.1:${port}/webhooks/paypal`, { method: "POST", headers, body: raw, signal: AbortSignal.timeout(10_000) });
@@ -143,6 +146,36 @@ export function createApp(opts: AppOptions): App {
     if (isOperator(g.payee, config.operatorPayees)) throw new Error(`Guide ${g.id}'s payee is the operator's own account; Ambree must never be the payee`);
   }
   const service = new BookingService({ db, ledger, mandates, payments, guides, weather, channels, publicUrl: config.publicUrl, operatorPayees: config.operatorPayees });
+
+  /**
+   * Confirms the operator's merchant id with PayPal before serving: PAYPAL_OPERATOR_MERCHANT_ID must be
+   * the merchant PayPal says owns the REST app, and no guide may be paid to it. No documented PayPal call
+   * returns the app owner's merchant id for a client-credentials token (DESIGN.md §13), so this uses
+   * userinfo's payer_id and fails closed when it is absent; the spike checks it (S11).
+   */
+  let operatorIdentity: "pending" | "confirmed" | "config-only (unconfirmed)" = "pending";
+  async function confirmOperator(): Promise<void> {
+    if (config.operatorIdentityCheck === "config-only") {
+      operatorIdentity = "config-only (unconfirmed)";
+      log({ event: "operator_identity", status: operatorIdentity, warning: "PAYPAL_OPERATOR_MERCHANT_ID is trusted from config, not confirmed with PayPal" });
+      return;
+    }
+    const optOut = "Set PAYPAL_OPERATOR_IDENTITY=config-only to run on the configured id alone (unconfirmed).";
+    let owner: string | undefined;
+    try {
+      owner = (await payments.getOperatorIdentity()).merchant_id;
+    } catch (e) {
+      throw new Error(`Could not confirm the operator's merchant id with PayPal (${e instanceof PayPalError ? e.summary() : "error"}); refusing to start. ${optOut}`);
+    }
+    if (!owner) throw new Error(`PayPal's identity reply carries no merchant id (payer_id) for the operator; refusing to start. ${optOut}`);
+    if (!config.operatorPayees.some((p) => p.merchant_id === owner)) {
+      throw new Error(`PayPal says the REST app's operator is merchant ${owner}, which is not PAYPAL_OPERATOR_MERCHANT_ID; refusing to start`);
+    }
+    const guide = guides.find((g) => g.payee.merchant_id === owner);
+    if (guide) throw new Error(`Guide ${guide.id}'s payee is the operator's own account (confirmed with PayPal); refusing to start`);
+    operatorIdentity = "confirmed";
+    log({ event: "operator_identity", status: operatorIdentity, merchant_id: owner });
+  }
 
   // Traveller sessions: an HttpOnly cookie holds a random id; the server maps it (stored hashed) to the
   // conversations it created. A conversation id is never accepted from the client.
@@ -224,7 +257,7 @@ export function createApp(opts: AppOptions): App {
       if (path === "/") session(req, res);
       return send(res, 200, statics[path]!.body.toString("utf8"), statics[path]!.type);
     }
-    if (method === "GET" && path === "/healthz") return sendJson(res, 200, { ok: true, version: VERSION, paypal: config.paypal.mode, model: config.llm.mode });
+    if (method === "GET" && path === "/healthz") return sendJson(res, 200, { ok: true, version: VERSION, paypal: config.paypal.mode, model: config.llm.mode, operator_identity: operatorIdentity });
     if (method === "GET" && path === "/api/ledger/head") return sendJson(res, 200, { ...checkpoint, verify: ledger.verify(checkpoint) });
 
     // State-changing browser routes: refused before any session is looked up, created or replaced.
@@ -379,13 +412,15 @@ export function createApp(opts: AppOptions): App {
     server,
     service,
     fake,
-    listen: () =>
-      new Promise((resolve) => {
+    listen: async () => {
+      await confirmOperator();
+      return new Promise<number>((resolve) => {
         server.listen(config.port, config.host, () => {
           port = (server.address() as AddressInfo).port;
           resolve(port);
         });
-      }),
+      });
+    },
     close: () =>
       new Promise((resolve) => {
         server.close(() => {

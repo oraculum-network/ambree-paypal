@@ -226,6 +226,22 @@ export function newRunId(): string {
   return randomUUID();
 }
 
+/**
+ * DESIGN.md S11: asks GET /v1/identity/openidconnect/userinfo with the app's token and reports the identity
+ * fields PayPal returns (payer_id, user_id, account_type, and the field names). It never prints a token.
+ * The app refuses to start unless payer_id equals PAYPAL_OPERATOR_MERCHANT_ID; this row shows whether it can.
+ */
+export async function identityRow(api: Pick<PaymentsApi, "getOperatorIdentity">): Promise<Row> {
+  const call = "GET /v1/identity/openidconnect/userinfo";
+  try {
+    const who = await api.getOperatorIdentity();
+    const note = `payer_id ${who.merchant_id ?? "(absent or not a merchant id)"}; user_id ${who.user_id ?? "(absent)"}; account_type ${who.account_type ?? "(absent)"}; fields ${who.fields.join(",") || "(none)"}`;
+    return { step: "a2 identity", call, status: "200", id: who.merchant_id ?? "", note: scrub(note) };
+  } catch (e) {
+    return { step: "a2 identity", call, status: e instanceof PayPalError ? String(e.status || e.kind) : "-", id: "", note: scrub(`${describeError(e)} (S11: this call can't confirm the operator)`) };
+  }
+}
+
 async function main(): Promise<number> {
   let args: SpikeArgs;
   let env: ReturnType<typeof readEnv>;
@@ -254,6 +270,8 @@ async function main(): Promise<number> {
     process.stdout.write(`\n${formatTable(rows)}\n`);
     return 1;
   }
+  // (a2) S11: who does PayPal say owns this REST app? Informational: a failure here doesn't stop the run.
+  rows.push(await identityRow(client));
 
   const result = await runSpike({ api: client, args, runId, print: (l) => process.stdout.write(`${scrub(l)}\n`), sleep: (ms) => new Promise((r) => setTimeout(r, ms)), lastStatus: () => last });
   process.stdout.write(`\n${formatTable([...rows, ...result.rows])}\n\n${result.ok ? "SPIKE OK" : "SPIKE FAILED"}: paste this table into the CTO's notes.\n`);

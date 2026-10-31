@@ -5,7 +5,7 @@
 import type { PaymentsApi } from "./api.ts";
 import { PayPalError, errorFromBody } from "./errors.ts";
 import { assertSandboxBase } from "./sandbox.ts";
-import type { CreateOrderRequest, Order, Refund, RefundRequest, WebhookEvent, WebhookTransmission } from "./types.ts";
+import type { CreateOrderRequest, OperatorIdentity, Order, Refund, RefundRequest, WebhookEvent, WebhookTransmission } from "./types.ts";
 
 export interface PayPalCredentials {
   clientId: string;
@@ -99,6 +99,15 @@ export class PayPalRestClient implements PaymentsApi {
       webhook_event: event,
     });
     return reply.verification_status === "SUCCESS";
+  }
+
+  async getOperatorIdentity(): Promise<OperatorIdentity> {
+    const call = "GET /v1/identity/openidconnect/userinfo";
+    const r = await this.#api<Record<string, unknown>>("GET", "/v1/identity/openidconnect/userinfo?schema=openid", call);
+    const body = r && typeof r === "object" ? r : {};
+    const str = (k: string) => (typeof body[k] === "string" ? (body[k] as string).slice(0, 200) : undefined);
+    const payer = str("payer_id");
+    return { merchant_id: payer && /^[A-Z0-9]{8,20}$/.test(payer) ? payer : undefined, fields: Object.keys(body).slice(0, 40), user_id: str("user_id"), account_type: str("account_type") };
   }
 
   /** Drops the cached token (the next call fetches a new one). */

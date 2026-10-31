@@ -18,6 +18,12 @@ export interface Config {
   guidePayee?: MerchantPayee;
   /** The REST app owner's own account(s): never a payee. From PAYPAL_OPERATOR_EMAIL / PAYPAL_OPERATOR_MERCHANT_ID. */
   operatorPayees: Payee[];
+  /**
+   * "paypal" (default): at startup, ask PayPal which merchant owns the REST app and refuse to start unless it
+   * is PAYPAL_OPERATOR_MERCHANT_ID and no guide's. "config-only" (PAYPAL_OPERATOR_IDENTITY=config-only): an
+   * explicit, logged opt-out while that call is unconfirmed (spike S11); /healthz then says "config-only".
+   */
+  operatorIdentityCheck: "paypal" | "config-only";
   /** MCP is off unless MCP_DEMO_PASSCODE is set; callers send it as a Bearer token. */
   mcpPasscode?: string;
 }
@@ -72,5 +78,8 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
   const operatorPayees: Payee[] = [operator ?? FAKE_OPERATOR];
   if (guidePayee && isOperator(guidePayee, operatorPayees)) throw new ConfigError("The guide payee is the operator's own account; Ambree must never be the payee");
 
-  return { port, host, publicUrl, dbPath: env.DB_PATH ?? ":memory:", paypal, llm, guidePayee, operatorPayees, mcpPasscode: env.MCP_DEMO_PASSCODE || undefined };
+  const idCheck = env.PAYPAL_OPERATOR_IDENTITY ?? "paypal";
+  if (idCheck !== "paypal" && idCheck !== "config-only") throw new ConfigError("PAYPAL_OPERATOR_IDENTITY must be paypal (default) or config-only");
+
+  return { port, host, publicUrl, dbPath: env.DB_PATH ?? ":memory:", paypal, llm, guidePayee, operatorPayees, operatorIdentityCheck: idCheck, mcpPasscode: env.MCP_DEMO_PASSCODE || undefined };
 }
