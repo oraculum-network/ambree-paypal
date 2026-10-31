@@ -65,7 +65,7 @@ Traveller        Agent (tools)          Booking service          Guide (/o/{toke
    |                  |                       | ledger: capture.completed (the API reply)
    |                  |                       |<-- webhook CHECKOUT.ORDER.APPROVED, PAYMENT.CAPTURE.COMPLETED
    |                  |                       |-- POST /v1/notifications/verify-webhook-signature --->|
-   |                  |                       | SUCCESS → ledger: webhook.<event_type> (deduped on event id)
+   |                  |                       | SUCCESS → ledger: webhook.<event_type> (once per event id; redelivered until processed)
 ```
 
 Capture can be triggered three ways: the return URL, the `CHECKOUT.ORDER.APPROVED` webhook, or the agent's
@@ -111,7 +111,9 @@ ledger(seq INTEGER PRIMARY KEY, at, booking_id, kind, data JSON, prev_hash, hash
 webhook_events(event_id PRIMARY KEY, event_type, received_at)                                            -- dedupe
 ```
 
-- **Booking status:** `requested → priced → mandate_proposed → mandate_approved → order_created → captured → (refunded | partially_refunded)`.
+- **Booking status:** `requested → priced → mandate_proposed → mandate_approved → order_created → (capture_pending →) captured → (refunded | partially_refunded)`.
+  A definitive create failure goes back to `priced`. `needs_review` (the order or capture doesn't match
+  the mandate) and `capture_failed` stop the money steps.
   `declined` (the guide said no) and `cancelled` are terminal. A reschedule keeps the status and changes `date`.
 - **Quote** (frozen once priced): `{booking_id, guide_id, guide_name, activity, area, date, party_size,
   total{currency_code,value}, deposit{currency_code,value}, payee, guide_note, priced_at}`. The **quote hash** is
@@ -221,13 +223,15 @@ only on network errors or 5xx, and only for calls that carry a `PayPal-Request-I
 | Route | What |
 |---|---|
 | `GET /` | Chat page with these panels: the conversation, the approval card, the ledger (with "verify chain"), the guide's phone (operator link), the demo inbox (step-up code), and demo controls (fake mode: approve in the fake checkout, raise a cyclone) |
-| `POST /api/chat` | `{conversation_id, message}` → the agent loop's reply plus the booking snapshot |
-| `GET /api/state?conversation_id=` | Bookings, mandates, the ledger tail, the inbox |
-| `POST /api/mandates/{id}/approve` | `{code}`. **Human only**: no tool can call it |
+| `POST /api/chat` | `{message?}` → the agent loop's reply plus the booking snapshot, for the **session's** current conversation (see §11) |
+| `GET /api/state` | The session's bookings, mandates, ledger rows, inbox; a `conversation_id` parameter is ignored |
+| `POST /api/conversations` | Starts a new conversation in this session ("Start over") |
+| `GET /api/ledger/head` | The ledger checkpoint kept outside the database `{count, head}` and the verify result against it |
+| `POST /api/mandates/{id}/approve` | `{code}`. **Human only**: no tool can call it; 404 unless the session owns the booking |
 | `GET /o/{token}`, `POST /o/{token}` | The operator page: price, accept or decline a reschedule, offer a refund. The token is 256-bit base64url and stored as sha256; there is no login |
-| `GET /paypal/return`, `GET /paypal/cancel` | The PayPal redirects. Return captures if approved |
-| `POST /webhooks/paypal` | Verify via call 7, then log to the ledger, deduped on event id |
-| `POST /mcp` | The tools over MCP (stateless) |
+| `GET /paypal/return`, `GET /paypal/cancel` | The PayPal redirects, both to `/` (never a conversation id). Return captures if the session owns the booking |
+| `POST /webhooks/paypal` | Verify via call 7, log to the ledger once, process. Only completed processing makes a redelivery a duplicate; a processing failure answers 500 |
+| `POST /mcp` | The tools over MCP (stateless). Off unless `MCP_DEMO_PASSCODE` is set (Bearer); scoped to the conversation `mcp` |
 | `GET /fake-paypal/checkout?token=` | **Fake mode only**: a stand-in buyer approval page |
 | `POST /api/demo/cyclone` | **Fake mode only**: raises a cyclone alert for a date |
 | `GET /healthz` | `{ok, mode}` |
@@ -276,3 +280,54 @@ only on network errors or 5xx, and only for calls that carry a `PayPal-Request-I
 - **Data:** the ledger must survive restarts until 15 Dec, so a PVC (**TODO-CHECK** that the host has a local-path
   provisioner) or a hostPath. If neither exists, use `emptyDir` and accept a reset on restart.
 - **Webhook:** set up in the sandbox app for `https://paypal.ambree.ai/webhooks/paypal`. Its id goes into the Secret.
+- **New env names** (added after the review): `PAYPAL_OPERATOR_EMAIL` and/or `PAYPAL_OPERATOR_MERCHANT_ID`
+  (required in sandbox mode), and `MCP_DEMO_PASSCODE` (optional; without it MCP is off).
+
+## 11. After the review (fix phase, 31 Oct)
+
+A second review found ten issues; all were fixed (`cw-out/2026-10-31/paypal-fix/SUMMARY.md`). The rules
+that changed:
+
+- **Traveller authority.**
+  - Cookie `amb_sid`: 256 random bits, HttpOnly, SameSite=Lax, Secure when `PUBLIC_URL` is https. It is
+    stored as a sha256 in the `records` table (`session`), mapped to server-issued conversation ids.
+  - Tools resolve every `booking_id` through `BookingService.owned(id, conversation)`. Another
+    conversation's booking reads as "not found".
+- **Operator payee.**
+  - Startup refuses a guide payee equal to a configured operator identity: email case-insensitive, merchant
+    id exact.
+  - `createOrder` and capture refuse an operator payee or a missing one.
+  - An email can't be matched against a merchant id; configure both.
+- **Order validation** (`orderProblem`), before capture and on the capture reply:
+  - exactly 1 purchase unit;
+  - a payee equal to the mandate's and not the operator's;
+  - the mandate's amount and currency;
+  - `custom_id` or `reference_id` = the booking id.
+  - **UNVERIFIED:** that `GET /v2/checkout/orders/{id}` echoes `purchase_units[].payee` for a third-party
+    payee. If it doesn't, validation fails closed (`needs_review`, no capture). Spike S6 must look at this.
+- **Create failures.**
+  - Definitive (400/401/403/404/422, auth or invalid request): the mandate is spent and the booking returns
+    to `priced`.
+  - Ambiguous (timeout, network, 5xx, 409/429, or a reply that isn't JSON): `order_pending` stays set. A retry
+    uses the same nonce, but only while the mandate is unexpired; after expiry the booking returns to
+    `priced` with `order.abandoned`.
+- **Captures.**
+  - `COMPLETED` is paid. `PENDING` becomes `capture_pending` and is refreshed by `GET` on the next
+    `captureIfApproved` (any `PAYMENT.CAPTURE.*` webhook calls it).
+  - `DECLINED` or `FAILED` becomes `capture_failed`. An amount mismatch becomes `needs_review`.
+- **Refunds.**
+  - Each refund is a `RefundOp` `{n, request_id, amount_minor, full, reason, status}`, persisted before it
+    is sent.
+  - The status moves `sending → pending | completed | failed`. An unresolved `sending` op is resent
+    unchanged on the next refund call.
+  - Pending and sending amounts are reserved but not counted as refunded. `PAYMENT.CAPTURE.REFUNDED`
+    triggers `refreshRefunds` (a `GET` per pending op).
+  - The returned amount is reconciled (`refund.reconcile_failed`).
+- **Webhooks.** `webhook_events` has `status` (received, processing, completed or failed), `attempts` and
+  `logged`. The ledger row is written once.
+- **Ledger.**
+  - `verify()` alone can't see a deleted tail or a rollback. `verify(checkpoint)` can, where the checkpoint
+    is the last head kept outside the database: in process memory, logged as `ledger_head` on every
+    append, and served at `/api/ledger/head`.
+  - After a pod restart, the in-memory checkpoint starts from the database. Comparing it with the last
+    logged `ledger_head` is the operator's check.

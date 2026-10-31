@@ -14,7 +14,9 @@ Ambree never holds your money. PayPal sandbox only.
 3. **Only then can the agent create a PayPal Orders v2 order.** Its `purchase_units[0].payee` is the guide's
    own account, so the money goes traveller → guide.
 4. **You approve in PayPal checkout.** Ambree captures the payment, and PayPal's webhooks (signature checked
-   with PayPal) are logged to a **hash-chained ledger** you can verify on the page.
+   with PayPal) are logged to a **hash-chained ledger** you can verify on the page. The chain catches an
+   edited, inserted or reordered row. A deleted tail or a rolled-back file is caught only against the head
+   kept outside the database (`GET /api/ledger/head`, also logged on every append).
 5. **If a cyclone warning covers the day,** Ambree explains the risk and asks the guide to move the trip. If
    the guide can't, it refunds the deposit from the guide's capture back to you.
 
@@ -40,12 +42,33 @@ Ambree never holds your money. PayPal sandbox only.
     weather risk.
 - **The rules are code, not prompt.**
   - The booking service (`src/booking/service.ts`) creates an order only by consuming an approved, unexpired,
-    unused mandate whose amount, payee and quote hash still match.
-  - It refunds only when there is a cyclone warning, a declined reschedule or the guide's offer.
-  - Whatever the model says, it cannot pay anyone else, pay more, or pay twice.
+    unused mandate whose amount, payee and quote hash still match. If PayPal refuses the create, the mandate
+    is spent and the traveller approves a new one. If the create gets no clear answer (timeout, 5xx), it is
+    retried with the same nonce (PayPal-Request-Id) only while the mandate is still valid.
+  - Before capturing, it re-reads the order from PayPal. The order must have exactly one purchase unit with the
+    mandate's payee, amount and currency, and must reference the booking. After capture, the capture's amount
+    must match too. Otherwise the booking goes to `needs_review` and is not marked paid.
+  - "Paid" and "refunded" mean PayPal said `COMPLETED`; a `PENDING` capture or refund is shown as pending.
+  - It refunds only when there is a cyclone warning, a declined reschedule or the guide's offer. Each refund
+    is saved (amount and PayPal-Request-Id) before it is sent, and retried unchanged.
+- **Traveller authority is a session, not an id.**
+  - Each browser gets an HttpOnly, SameSite=Lax session cookie (Secure on https).
+  - The server maps the cookie to the conversations it started. Reading state, approving a mandate and
+    every tool call work only on the caller's own bookings.
+  - MCP is off unless `MCP_DEMO_PASSCODE` is set. MCP calls run in their own scope and can't see web
+    bookings.
 
-**Never custody.** Ambree's PayPal app is the API caller, never the payee. The guide's account receives the
-deposit, and refunds come out of the guide's capture.
+**Never custody, and exactly what is enforced.** The guide's account receives the deposit, and refunds
+come out of the guide's capture. In sandbox mode the app needs the REST app owner's own identity
+(`PAYPAL_OPERATOR_EMAIL` and/or `PAYPAL_OPERATOR_MERCHANT_ID`):
+- **At startup,** it refuses to start if any guide's payee matches one of those identities. Emails match
+  case-insensitively; merchant ids match exactly.
+- **When creating an order,** it refuses if the guide's payee matches.
+- **Before capture,** it refuses an order with no payee or with an operator payee.
+
+The limit: an email can only be compared with an email and a merchant id with a merchant id. So if the guide
+is given by email and the operator only by merchant id (or the other way round), an alias of the operator's
+account is not detected. Configure both identities for full coverage.
 
 ## Run it locally (no keys needed)
 
@@ -76,6 +99,8 @@ other than `https://api-m.sandbox.paypal.com`.
 | `PAYPAL_GUIDE_PAYEE_EMAIL` (or `_MERCHANT_ID`) | The sandbox **business** account that plays every guide |
 | `PUBLIC_URL` | Where PayPal sends the buyer back to (`/paypal/return`) |
 | `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL` | Any OpenAI-compatible `/chat/completions` endpoint with tool calling |
+| `PAYPAL_OPERATOR_EMAIL` and/or `PAYPAL_OPERATOR_MERCHANT_ID` | The REST app owner's own account, which must never be a payee (required in sandbox mode) |
+| `MCP_DEMO_PASSCODE` | Turns on `POST /mcp`; clients send it as `Authorization: Bearer …` |
 | `DB_PATH` | The sqlite file for bookings and the ledger (default `:memory:`) |
 
 ### Check PayPal itself: the spike
@@ -99,7 +124,7 @@ PAYPAL_CLIENT_ID=... PAYPAL_CLIENT_SECRET=... node scripts/spike.ts --payee-emai
 6. Watch the ledger fill in (order, capture, verified webhooks) and the chain say **Chain OK**.
 7. Press **Raise a cyclone warning**. Then, on the guide's link, answer "No, I can't" and see the refund.
 
-## The agent's tools (also over MCP at `POST /mcp`)
+## The agent's tools (also over MCP at `POST /mcp`, with `MCP_DEMO_PASSCODE`)
 
 `search_guides`, `request_quote`, `get_booking`, `propose_mandate`, `create_order`, `get_order`,
 `capture_order`, `check_weather`, `propose_reschedule` and `refund_payment`. No tool approves a mandate.
@@ -120,9 +145,21 @@ npx playwright test
   - the spike;
   - mandates: expiry, a single-use nonce, a lock after 5 wrong codes, and pinning of the payee, amount and
     quote;
-  - ledger tampering: edits, deletes and recomputed hashes;
-  - the operator page, webhooks (unsigned, tampered and duplicate), the refund policy, MCP, and the whole
-    flow over HTTP.
+  - ledger tampering: edits and deletes in the middle and recomputed hashes, which the chain alone catches;
+    a deleted tail, which only the checkpoint catches;
+  - the operator page, webhooks (unsigned, tampered, duplicate, and redelivered after a failed processing),
+    the refund policy, MCP, and the whole flow over HTTP;
+  - the review fixes (`test/fix-*.test.ts`):
+    - one session can't read, approve or order on another's booking;
+    - payees that are the operator;
+    - an order changed after creation;
+    - a create failure versus expiry;
+    - pending captures and refunds;
+    - refund retries;
+    - webhook redelivery;
+    - log redaction;
+    - the ledger checkpoint;
+    - spike run ids.
 - **Playwright** runs the happy path and the refund path in a browser.
 
 ## Built during the hackathon

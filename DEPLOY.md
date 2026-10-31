@@ -43,6 +43,10 @@ start**: this fails closed, so it never pays the app owner by mistake.
 
 - `paypal/paypal-sandbox`: `PAYPAL_CLIENT_ID`, `PAYPAL_CLIENT_SECRET`, `PAYPAL_WEBHOOK_ID`,
   `PAYPAL_GUIDE_PAYEE_EMAIL` (the sandbox business account that plays every guide).
+  - Also `PAYPAL_OPERATOR_EMAIL` and `PAYPAL_OPERATOR_MERCHANT_ID`: the REST app owner's own sandbox
+    account. At least one is required. Set both, because an email can't be matched against a merchant id.
+  - Optionally `MCP_DEMO_PASSCODE`; without it, `/mcp` answers 401.
+  - TODO-CHECK: the operator's merchant id, from the sandbox account's profile.
 - `paypal/llm`: `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL` (OpenRouter with a spend cap until 15 Dec;
   TODO-CHECK the cap).
 
