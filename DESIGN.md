@@ -1,0 +1,277 @@
+# Ambree "Book the guide": design
+
+Ambree (an AI travel concierge) books a small independent guide in Mauritius and has the traveller pay the guide's
+deposit **straight into the guide's own PayPal account**. The agent can find, ask, quote and prepare. It can only
+create a payment order inside a **mandate** that the traveller approved with a step-up code. Every step is written
+to a hash-chained ledger. Money flows from the traveller to the guide. **Ambree never holds or receives it.**
+
+Status: design for the PayPal AI Hackathon build (submissions close Thu 12 Nov 2026, 12:00 PT). **Sandbox only.**
+Anything I could not check in PayPal's docs is marked **UNVERIFIED**. The Monday spike (`scripts/spike.ts`) checks
+the risky items.
+
+## 1. Actors and parts
+
+| Actor / part | What it is |
+|---|---|
+| Traveller | Chats with Ambree on the web page (`/`), approves the mandate, then pays in PayPal checkout (sandbox personal account) |
+| Guide | A made-up independent guide (seed data). Sees the request on a tokenised operator page `/o/{token}`, sets a price, accepts or declines a reschedule. Has a sandbox **business** account that is the order's `payee` |
+| Agent | The tool loop (`src/agent/`): an OpenAI-compatible chat model (`LLM_*` env) or the scripted model (offline, deterministic). It sees tool results only. It never sees step-up codes or PayPal credentials |
+| Booking service | `src/booking/`: the rules. The mandate check, payee pinning, refund policy and ledger writes live here, not in the prompt |
+| PayPal tier | `src/paypal/`: the `PaymentsApi` interface, the REST client (sandbox only) and an in-process fake that speaks the same JSON |
+| Ledger | `src/ledger/`: an append-only table in `node:sqlite`, where each row's `hash` = sha256 of the row + `prev_hash` |
+| Weather | `src/weather/`: the cyclone feed interface. GDACS later (**UNVERIFIED** API shape); a fake feed for tests and the demo |
+| MCP | `POST /mcp`: the same tools for any MCP client (stateless Streamable HTTP, as in ambree-qloo) |
+
+## 2. Flows
+
+### 2.1 Request → quote → mandate → order → approval → capture → webhook → ledger
+
+```
+Traveller        Agent (tools)          Booking service          Guide (/o/{token})      PayPal (sandbox)
+   | "hiking guide, Le Morne, Thursday, hold the spot"
+   |----------------->|
+   |                  | search_guides(area, activity, date)
+   |                  | request_quote(guide_id, date, party)
+   |                  |---------------------->| booking=requested; operator token minted
+   |                  |                       | ledger: quote.requested
+   |                  |                       |----- link /o/{token} ---->| (demo: "guide's phone" panel)
+   |                  |                       |                           | sees request, sets price + deposit
+   |                  |                       |<------ POST /o/{token} ---|
+   |                  |                       | quote frozen; quote_hash = sha256(canonical(quote))
+   |                  |                       | ledger: quote.priced
+   |  (event: "guide priced") --------------->|
+   |                  | propose_mandate(booking_id)
+   |                  |---------------------->| mandate{amount, payee, quote_hash, expires_at, nonce}
+   |                  |                       | step-up code sent to the traveller only (demo inbox),
+   |                  |                       | stored as a hash; ledger: mandate.proposed
+   | approval card: amount, payee, expiry, code
+   |-- POST /api/mandates/{id}/approve {code} ------------------------>| check code, expiry, attempts
+   |                  |                       | ledger: mandate.approved
+   |  (event: "mandate approved") ----------->|
+   |                  | create_order(booking_id)
+   |                  |---------------------->| re-check: approved, not expired, nonce unused,
+   |                  |                       | hash(current quote) == mandate.quote_hash,
+   |                  |                       | amount == mandate.amount, payee == mandate.payee
+   |                  |                       | nonce marked used, then:
+   |                  |                       |-- POST /v2/checkout/orders (PayPal-Request-Id = nonce) -->|
+   |                  |                       |<----------------------- 201 {id, status: CREATED, links} --|
+   |                  |                       | ledger: order.created
+   | "Pay the guide" button = approve link
+   |---------------------------------------------- PayPal checkout (buyer logs in, approves) ------->|
+   |<-------------------------------------- redirect return_url ?token={order id} -------------------|
+   |-- GET /paypal/return -------------------->| capture_if_approved:
+   |                  |                       |-- POST /v2/checkout/orders/{id}/capture -------------->|
+   |                  |                       |<------------------------- 201 {status: COMPLETED} -----|
+   |                  |                       | ledger: capture.completed (the API reply)
+   |                  |                       |<-- webhook CHECKOUT.ORDER.APPROVED, PAYMENT.CAPTURE.COMPLETED
+   |                  |                       |-- POST /v1/notifications/verify-webhook-signature --->|
+   |                  |                       | SUCCESS → ledger: webhook.<event_type> (deduped on event id)
+```
+
+Capture can be triggered three ways: the return URL, the `CHECKOUT.ORDER.APPROVED` webhook, or the agent's
+`capture_order` tool. All three go through one idempotent `captureIfApproved` (PayPal-Request-Id
+`capture-{order_id}`). The booking counts as **paid** only once the capture reply says `COMPLETED`. A verified
+`PAYMENT.CAPTURE.COMPLETED` webhook is logged as confirmation.
+
+### 2.2 Cyclone → reschedule or refund
+
+```
+Weather feed      Agent                      Booking service                 Guide             PayPal
+  | alert(TC, level, window) for the booking date
+  |  (event: "cyclone warning") ->|
+  |                               | check_weather(booking_id)  -> alert + plain risk explanation
+  |                               | propose_reschedule(booking_id, new_date)
+  |                               |-------------------------->| ledger: reschedule.proposed
+  |                               |                           |-- /o/{token} shows the new date -->|
+  |                               |                           |<- accept | decline ---------------|
+  |                               |                           | accept: booking.date = new_date; ledger: reschedule.accepted
+  |                               |                           | decline: refund now allowed;      ledger: reschedule.declined
+  |                               | refund_payment(booking_id, amount?)   (only if policy allows)
+  |                               |-------------------------->|-- POST /v2/payments/captures/{id}/refund -->|
+  |                               |                           |<------------------- 201 {id, status} -------|
+  |                               |                           | ledger: refund.completed; later webhook PAYMENT.CAPTURE.REFUNDED
+```
+
+**Refund policy** (`src/booking/policy.ts`). A refund is allowed when the booking is captured and one of these holds:
+(a) there is an active cyclone alert for the booking date, (b) the guide declined a reschedule, or (c) the guide
+offered the refund on the operator page. The amount must be at most the captured amount minus earlier refunds.
+Partial refunds are allowed. The agent cannot refund for any other reason; it can only explain.
+
+## 3. Data model (`node:sqlite`, one file, or `:memory:` in tests)
+
+```
+guides(id, name, area, activities[], languages[], bio, payee{email_address|merchant_id}, currency)      -- seed, in code
+bookings(id, conversation_id, guide_id, activity, area, date, party_size, status,
+         operator_token_hash, quote?, quote_hash?, mandate_id?, order_id?, approve_url?, capture_id?,
+         captured{currency_code,value}?, refunded_minor, reschedule?{new_date,status}, refund_offered,
+         created_at, updated_at)                                                                         -- records table, JSON
+mandates(id, booking_id, amount{currency_code,value}, payee, quote_hash, nonce, expires_at,
+         step_up_hash, attempts, status: proposed|approved|used|expired|locked)                          -- records table, JSON
+ledger(seq INTEGER PRIMARY KEY, at, booking_id, kind, data JSON, prev_hash, hash)                        -- append-only
+webhook_events(event_id PRIMARY KEY, event_type, received_at)                                            -- dedupe
+```
+
+- **Booking status:** `requested → priced → mandate_proposed → mandate_approved → order_created → captured → (refunded | partially_refunded)`.
+  `declined` (the guide said no) and `cancelled` are terminal. A reschedule keeps the status and changes `date`.
+- **Quote** (frozen once priced): `{booking_id, guide_id, guide_name, activity, area, date, party_size,
+  total{currency_code,value}, deposit{currency_code,value}, payee, guide_note, priced_at}`. The **quote hash** is
+  sha256 hex of the canonical JSON: keys sorted, no whitespace, strings NFC.
+- **Mandate:**
+  - It expires 15 minutes after it is proposed.
+  - The nonce is 128 random bits (hex) and is used once; it is also the create-order `PayPal-Request-Id`.
+  - The step-up code is 6 digits; only sha256(mandate_id + code) is stored.
+  - After 5 wrong codes the mandate is `locked`.
+  - The code goes to the traveller's channel only. In the demo that is a "demo inbox" panel; the real channel
+    would be email or SMS. It is never in a tool result.
+- **Ledger:**
+  - `hash = sha256(canonical({seq, at, booking_id, kind, data, prev_hash}))`; the first row's `prev_hash` is 64 zeros.
+  - `verify()` walks every row and reports the first bad `seq`.
+  - Rows are never updated or deleted, and the code has no API that could do so.
+  - A tamper test edits the SQLite row directly and expects `verify()` to fail at that row.
+- **Amounts:** strings on the wire (PayPal's `value`). Comparisons go through integer minor units (EUR and USD
+  have 2 decimals).
+
+## 4. PayPal REST calls (all against `https://api-m.sandbox.paypal.com`)
+
+The base URL is a constant. `src/paypal/sandbox.ts` refuses any other origin; this guard is what refuses
+`api-m.paypal.com`. Startup fails if `PAYPAL_BASE_URL` is set to anything else. Credentials are read by name only:
+`PAYPAL_CLIENT_ID`, `PAYPAL_CLIENT_SECRET`, `PAYPAL_WEBHOOK_ID`.
+
+| # | Call | Method + path | Body / headers we send | Doc read (31 Oct) |
+|---|---|---|---|---|
+| 1 | OAuth token | `POST /v1/oauth2/token` | `Authorization: Basic base64(client_id:client_secret)`, `Content-Type: application/x-www-form-urlencoded`, body `grant_type=client_credentials`. Reply: `access_token`, `token_type` (Bearer), `expires_in` (s), `app_id`, `scope`, `nonce`. Cached until 60 s before `expires_in` runs out | https://developer.paypal.com/api/rest/authentication/ |
+| 2 | Create order | `POST /v2/checkout/orders` | Headers: `Authorization: Bearer …`, `PayPal-Request-Id` (idempotency), `Prefer: return=representation`. Body: `{"intent":"CAPTURE","purchase_units":[{"reference_id":booking_id,"custom_id":booking_id,"invoice_id":"AMB-"+booking_id,"description":"Guide deposit: …","amount":{"currency_code":"EUR","value":"30.00"},"payee":{"email_address":…}|{"merchant_id":…}}],"payment_source":{"paypal":{"experience_context":{"return_url":…,"cancel_url":…,"user_action":"PAY_NOW","shipping_preference":"NO_SHIPPING","brand_name":"Ambree"}}}}` | https://developer.paypal.com/docs/api/orders/v2/orders-create (`intent`, `purchase_units[]` 1-10, `reference_id`, `description` ≤127, `custom_id`, `invoice_id` unique per merchant, `amount`, `payee{email_address,merchant_id}`, `PayPal-Request-Id`, `Prefer`). The `experience_context` fields were cut off in my fetch: **UNVERIFIED** |
+| 3 | Show order | `GET /v2/checkout/orders/{id}` | none. Reply: `status`, `links[]`, `payer{name, email_address, payer_id}` | https://developer.paypal.com/docs/api/orders/v2/orders-get (example has `status: APPROVED`, links `self`, `approve`, `edit`, `capture`). The full status enum (`CREATED, SAVED, APPROVED, VOIDED, COMPLETED, PAYER_ACTION_REQUIRED`) is **UNVERIFIED** (from memory) |
+| 4 | Capture | `POST /v2/checkout/orders/{id}/capture` | `PayPal-Request-Id: capture-{id}`, `Prefer: return=representation`, `Content-Type: application/json`, body `{}`. Reply: `purchase_units[0].payments.captures[0].{id,status,amount}`: **UNVERIFIED** shape (from memory; the get page had no captures) | https://developer.paypal.com/docs/api/orders/v2/ (path) |
+| 5 | Refund | `POST /v2/payments/captures/{capture_id}/refund` | `PayPal-Request-Id: refund-{booking}-{n}`, `Prefer: return=representation`. Body: `{}` (full) or `{"amount":{"currency_code":"EUR","value":"10.00"},"note_to_payer":…,"custom_id":booking_id}`. Reply: `id`, `status` | https://developer.paypal.com/docs/api/payments/v2/captures-refund ("omit amount for a full refund"; `PayPal-Auth-Assertion` "establishing the consent to act-on-behalf of a merchant is a prerequisite"). The status enum beyond `COMPLETED` is **UNVERIFIED** |
+| 6 | Show refund | `GET /v2/payments/refunds/{refund_id}` | none | https://developer.paypal.com/docs/api/payments/v2/ |
+| 7 | Verify webhook | `POST /v1/notifications/verify-webhook-signature` | `{"auth_algo": h[PAYPAL-AUTH-ALGO], "cert_url": h[PAYPAL-CERT-URL], "transmission_id": h[PAYPAL-TRANSMISSION-ID], "transmission_sig": h[PAYPAL-TRANSMISSION-SIG], "transmission_time": h[PAYPAL-TRANSMISSION-TIME], "webhook_id": env PAYPAL_WEBHOOK_ID, "webhook_event": <parsed body>}`. All are required. Reply `verification_status` (`SUCCESS` in the example; `FAILURE` as the other value is **UNVERIFIED**) | https://developer.paypal.com/docs/api/webhooks/v1/verify-webhook-signature-post |
+| 8 | Create webhook (setup, once) | `POST /v1/notifications/webhooks` | URL `https://paypal.ambree.ai/webhooks/paypal`, events below. Done in the dashboard by the CEO, or later by script | https://developer.paypal.com/docs/api/webhooks/v1/ |
+| 9 | Simulate event (optional) | `POST /v1/notifications/simulate-event` | for testing the endpoint once deployed | same |
+
+**Payee:** "Include the email_address or merchant_id of the account to receive the payment… Add the payee object to
+the transaction payload". Without it, the funds go to the app owner (https://developer.paypal.com/docs/checkout/standard/customize/pay-another-account/).
+That page does not say what the receiving account needs, or whether the API caller may capture or refund such an
+order: **UNVERIFIED, spike items S2 and S4.**
+
+**Webhook events we subscribe to** (https://developer.paypal.com/api/rest/webhooks/event-names/):
+`CHECKOUT.ORDER.APPROVED`, `PAYMENT.CAPTURE.COMPLETED`, `PAYMENT.CAPTURE.REFUNDED`, `PAYMENT.CAPTURE.PENDING`,
+`PAYMENT.CAPTURE.DECLINED` (the page lists v2 as `DECLINED` and v1 as `DENIED`; we accept both), and `PAYMENT.CAPTURE.REVERSED`.
+The resource each event carries is not on that page. We assume order, capture and refund objects with
+`custom_id`: **UNVERIFIED**. The handler finds the booking by `resource.custom_id`, falling back to the order,
+capture or refund id it already stored.
+
+**Errors.** The PayPal error body is `{name, message, debug_id, details[{issue, description}]}`. This is from memory:
+**UNVERIFIED**. It becomes `PayPalError{status, name, issue, debugId, message}`, which never carries headers,
+tokens or credentials. Issue names we handle (all **UNVERIFIED**): `ORDER_NOT_APPROVED`, `ORDER_ALREADY_CAPTURED`,
+`CAPTURE_FULLY_REFUNDED`, `REFUND_AMOUNT_EXCEEDED`, `PAYEE_ACCOUNT_RESTRICTED`, `PAYEE_NOT_ENABLED_FOR_CARD_PROCESSING`.
+The OAuth error body is `{error, error_description}`. Timeouts: 15 s per call (`AbortSignal.timeout`). One retry,
+only on network errors or 5xx, and only for calls that carry a `PayPal-Request-Id`.
+
+## 5. Unknown until the spike (Mon 2 Nov)
+
+| Id | Question | How the spike answers it |
+|---|---|---|
+| S1 | Does a sandbox REST app's token work for orders with a **third-party payee** (`email_address` of another sandbox business account)? | (b) the create reply's status and payee echo |
+| S2 | Can the API caller (the app owner, not the payee) **capture** that order? | (d) |
+| S3 | Does `merchant_id` work as well as `email_address`? | run with `--payee-merchant-id` |
+| S4 | Can the API caller **refund** a capture whose payee is another account, without `PayPal-Auth-Assertion`? | (e). If not, the fallbacks are (i) the guide refunds from their own PayPal (the operator page then says how) or (ii) the report's fallback, an invoice from the guide's own app |
+| S5 | Which approve link comes back with `payment_source.paypal.experience_context`: `approve` or `payer-action`? | the printed links |
+| S6 | The capture reply shape, and whether `custom_id` is echoed on the capture | the printed ids |
+| S7 | The exact webhook payloads and headers; `verification_status` values | after deploy: a sandbox webhook to `paypal.ambree.ai`, plus `simulate-event` |
+| S8 | Does a personal sandbox account work as payee (concept A's question)? Not needed for B | optional run |
+| S9 | Currency: EUR versus USD for an MU business sandbox account | run once with each |
+| S10 | JS SDK v6 buttons versus the redirect approve link for a third-party payee | not in the spike; the build uses the approve link (redirect) first |
+
+## 6. The agent's tools (one registry: `src/tools/`; served to the model and over MCP)
+
+| Tool | Input | Effect | Money? |
+|---|---|---|---|
+| `search_guides` | `area?`, `activity?`, `date?`, `language?` | Lists seed guides that match | no |
+| `request_quote` | `guide_id`, `date`, `party_size`, `activity`, `note?` | Creates a booking and an operator link; the guide is "notified" | no |
+| `get_booking` | `booking_id` | Status, quote, mandate state, order and capture ids, refunds | no |
+| `propose_mandate` | `booking_id` | Builds the mandate from the frozen quote; the step-up code goes to the traveller channel only | no |
+| `create_order` | `booking_id` | **Only** with an approved, unexpired, unused mandate whose quote hash, amount and payee match. Creates the order with payee = the guide; returns the approve link | prepares a payment |
+| `get_order` | `booking_id` | `GET /v2/checkout/orders/{id}` | no |
+| `capture_order` | `booking_id` | Idempotent capture, only once the order is APPROVED | yes (traveller → guide) |
+| `check_weather` | `booking_id` | Cyclone alerts for the booking date and a plain explanation | no |
+| `propose_reschedule` | `booking_id`, `new_date` | Asks the guide on the operator page | no |
+| `refund_payment` | `booking_id`, `amount?` | Only when the policy (§2.2) allows; partial or full | yes (guide → traveller) |
+
+**PayPal Agent Toolkit plug-in point.**
+- `src/paypal/api.ts` defines `PaymentsApi`: `createOrder`, `getOrder`, `captureOrder`, `refundCapture`, `getRefund`, `verifyWebhookSignature`.
+- Today two classes implement it: `PayPalRestClient` (sandbox) and `FakePayPal`.
+- `@paypal/agent-toolkit` (Apache-2.0; can't be installed here) has `create_order`, `get_order`, `pay_order` and
+  refund tools. It plugs in as a third `PaymentsApi` adapter that calls the toolkit's functions. Our booking service
+  stays the only caller, so the mandate check still runs first. **We do not hand the toolkit's tools straight to the
+  model**: that would let the model create orders with no mandate. **UNVERIFIED:** whether the toolkit lets you
+  set `purchase_units[].payee` (its `create_order` parameters are not documented in what I could read).
+
+**The model:**
+- `LLM_BASE_URL`, `LLM_API_KEY` and `LLM_MODEL` select an OpenAI-compatible `POST {base}/chat/completions` with
+  `tools`; OpenRouter is planned.
+- With no key, the **scripted model** runs: deterministic tool calls driven by the conversation. The tests and the
+  offline demo use it, and the page labels it "scripted model".
+- Events (the guide priced, the mandate approved, paid, a cyclone) enter the conversation as notes that start with
+  `[event]`.
+
+## 7. HTTP surface
+
+| Route | What |
+|---|---|
+| `GET /` | Chat page with these panels: the conversation, the approval card, the ledger (with "verify chain"), the guide's phone (operator link), the demo inbox (step-up code), and demo controls (fake mode: approve in the fake checkout, raise a cyclone) |
+| `POST /api/chat` | `{conversation_id, message}` → the agent loop's reply plus the booking snapshot |
+| `GET /api/state?conversation_id=` | Bookings, mandates, the ledger tail, the inbox |
+| `POST /api/mandates/{id}/approve` | `{code}`. **Human only**: no tool can call it |
+| `GET /o/{token}`, `POST /o/{token}` | The operator page: price, accept or decline a reschedule, offer a refund. The token is 256-bit base64url and stored as sha256; there is no login |
+| `GET /paypal/return`, `GET /paypal/cancel` | The PayPal redirects. Return captures if approved |
+| `POST /webhooks/paypal` | Verify via call 7, then log to the ledger, deduped on event id |
+| `POST /mcp` | The tools over MCP (stateless) |
+| `GET /fake-paypal/checkout?token=` | **Fake mode only**: a stand-in buyer approval page |
+| `POST /api/demo/cyclone` | **Fake mode only**: raises a cyclone alert for a date |
+| `GET /healthz` | `{ok, mode}` |
+
+## 8. Three-minute demo script (from the report, §6 B)
+
+- **0:00** The problem: guides are booked over WhatsApp, and deposits are awkward. Small operators aren't on
+  booking platforms.
+- **0:20** The chat request: "Find me a hiking guide for Le Morne on Thursday and hold the spot." Ambree lists 2
+  guides, picks one and asks for a price.
+- **0:50** The guide's phone: the operator link shows the request. The guide types EUR 80 total and EUR 30 deposit.
+- **1:20** The approval card: EUR 30.00 to "Tamarin Trails (sandbox)", quote hash, expiry 15:00, step-up code from
+  the inbox, Approve.
+- **1:40** The agent creates the order (payee = the guide). Then the PayPal sandbox checkout, logged in as the
+  sandbox traveller, pays the guide.
+- **2:05** The return capture lands, and the webhook is verified. The ledger rows appear with their hashes, and
+  "verify chain" shows OK. The guide's sandbox balance goes up (shown in the PayPal sandbox dashboard).
+- **2:25** A cyclone alert for Thursday. Ambree explains the risk and proposes Saturday. The guide declines, so
+  Ambree refunds the deposit (partially, if the guide keeps a fee), and the refund webhook is logged.
+- **2:50** Architecture slide: never custody. The order's payee is the guide, our account is never the payee, and
+  the mandate is enforced in code.
+
+## 9. Judge steps (README carries the final version)
+
+1. Open https://paypal.ambree.ai (or run `npm start` locally with no env: the fake PayPal and scripted model, end to end).
+2. Type the request. Open the "guide's phone" link and set a price.
+3. Read the code from the demo inbox and approve the mandate.
+4. Click "Pay the guide". On the hosted sandbox instance, log in with the sandbox buyer account listed in the
+   README (the CEO creates it; the credentials are published for judges as the rules ask). On the fake, click
+   approve.
+5. Watch the ledger, and press "verify chain".
+6. Press "raise cyclone" (demo control), follow Ambree's reschedule, decline it as the guide, and see the refund.
+
+## 10. Deploy shape (the CTO writes the infra later)
+
+- **Image:** `paypal.ambree.ai`, its own namespace `paypal` on the Oracle k3s host, as `qloo` did.
+  - Image `oraculum/ambree-paypal:<sha7>`, built on the host, `imagePullPolicy: Never`.
+  - Traefik Ingress with a Let's Encrypt certificate.
+  - Runs as user `node` with a read-only root filesystem, plus one writable `emptyDir` (or a small PVC, see below)
+    at `/data` for the SQLite file.
+- **Secret:** `paypal/paypal-sandbox` holds `PAYPAL_CLIENT_ID`, `PAYPAL_CLIENT_SECRET` and `PAYPAL_WEBHOOK_ID`.
+  Secret `paypal/llm` holds `LLM_API_KEY`. Both are `optional: true`; with no Secret the pod runs the fake and the
+  scripted model.
+- **Network:** egress on TCP 443 only; the target hosts are `api-m.sandbox.paypal.com` and the LLM host. A
+  NetworkPolicy can't name hosts, so this uses the same form as alexa/qloo.
+- **Data:** the ledger must survive restarts until 15 Dec, so a PVC (**TODO-CHECK** that the host has a local-path
+  provisioner) or a hostPath. If neither exists, use `emptyDir` and accept a reset on restart.
+- **Webhook:** set up in the sandbox app for `https://paypal.ambree.ai/webhooks/paypal`. Its id goes into the Secret.
