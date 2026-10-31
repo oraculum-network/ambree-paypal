@@ -19,9 +19,27 @@ export interface InboxMessage {
   code: string;
 }
 
+export interface OperatorLink {
+  booking_id: string;
+  guide_name: string;
+  url: string;
+}
+
 export class Channels {
   readonly #events = new Map<string, AppEvent[]>();
   readonly #inbox = new Map<string, InboxMessage[]>();
+  readonly #links = new Map<string, OperatorLink[]>();
+
+  /** The demo's stand-in for texting the guide their private link (shown in the "guide's phone" panel). */
+  sendOperatorLink(conversationId: string, link: OperatorLink): void {
+    const list = this.#links.get(conversationId) ?? [];
+    list.push(link);
+    this.#links.set(conversationId, list.slice(-10));
+  }
+
+  operatorLinks(conversationId: string): OperatorLink[] {
+    return [...(this.#links.get(conversationId) ?? [])];
+  }
 
   emit(conversationId: string, e: AppEvent): void {
     const list = this.#events.get(conversationId) ?? [];

@@ -1,0 +1,306 @@
+// The HTTP app: chat page and API, the guide's operator page, PayPal's return URL and webhook, MCP, and
+// (fake mode only) a stand-in PayPal checkout page and the demo cyclone control. No framework.
+
+import { readFileSync } from "node:fs";
+import { type IncomingMessage, type Server, type ServerResponse, createServer } from "node:http";
+import type { AddressInfo } from "node:net";
+import { join } from "node:path";
+import { Agent } from "./agent/loop.ts";
+import { type ChatModel, OpenAICompatModel } from "./agent/model.ts";
+import { ScriptedModel } from "./agent/scripted.ts";
+import { Channels } from "./booking/channels.ts";
+import { BookingService, ServiceError } from "./booking/service.ts";
+import type { Config } from "./config.ts";
+import { guidesWithPayee } from "./guides/seed.ts";
+import { Ledger } from "./ledger/ledger.ts";
+import { Mandates } from "./mandate/mandate.ts";
+import { handleMcp } from "./mcp/server.ts";
+import { applyOperatorAction, esc, renderInvalidLink, renderOperatorPage } from "./operator/page.ts";
+import type { PaymentsApi } from "./paypal/api.ts";
+import { PayPalRestClient } from "./paypal/client.ts";
+import { FakePayPal } from "./paypal/fake.ts";
+import { formatMoney } from "./paypal/money.ts";
+import { openDb } from "./store/db.ts";
+import { addDays } from "./agent/scripted.ts";
+import { DemoCycloneFeed } from "./weather/cyclones.ts";
+
+export const VERSION = "0.1.0";
+const CONV_RE = /^cv_[A-Za-z0-9_-]{8,40}$/;
+const JSON_LIMIT = 16 * 1024;
+const WEBHOOK_LIMIT = 256 * 1024;
+const MCP_LIMIT = 64 * 1024;
+
+export type Logger = (fields: Record<string, unknown>) => void;
+
+export interface AppOptions {
+  config: Config;
+  logger?: Logger;
+  /** Tests inject a model; otherwise it follows config.llm. */
+  model?: ChatModel;
+  today?: () => string;
+}
+
+export interface App {
+  server: Server;
+  service: BookingService;
+  fake?: FakePayPal;
+  listen(): Promise<number>;
+  close(): Promise<void>;
+}
+
+const PUBLIC_DIR = join(import.meta.dirname, "..", "public");
+const STATIC: Record<string, { file: string; type: string }> = {
+  "/": { file: "index.html", type: "text/html; charset=utf-8" },
+  "/app.js": { file: "app.js", type: "text/javascript; charset=utf-8" },
+  "/style.css": { file: "style.css", type: "text/css; charset=utf-8" },
+};
+
+function securityHeaders(res: ServerResponse): void {
+  res.setHeader("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; form-action 'self' https://www.sandbox.paypal.com; frame-ancestors 'none'; base-uri 'none'");
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("Cache-Control", "no-store");
+}
+
+function send(res: ServerResponse, status: number, body: string, type = "application/json; charset=utf-8", extra: Record<string, string> = {}): void {
+  res.writeHead(status, { "Content-Type": type, ...extra });
+  res.end(body);
+}
+const sendJson = (res: ServerResponse, status: number, value: unknown) => send(res, status, JSON.stringify(value));
+const redirect = (res: ServerResponse, to: string) => send(res, 303, "", "text/plain", { Location: to });
+
+async function readBody(req: IncomingMessage, limit: number): Promise<string | undefined> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += (chunk as Buffer).length;
+    if (size > limit) return undefined;
+    chunks.push(chunk as Buffer);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+async function readJson(req: IncomingMessage, limit = JSON_LIMIT): Promise<Record<string, unknown> | undefined> {
+  if ((req.headers["content-type"] ?? "").split(";")[0]!.trim() !== "application/json") return undefined;
+  const raw = await readBody(req, limit);
+  if (raw === undefined) return undefined;
+  try {
+    const v = JSON.parse(raw) as unknown;
+    return v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export function createApp(opts: AppOptions): App {
+  const { config } = opts;
+  const log: Logger = opts.logger ?? (() => {});
+  const today = opts.today ?? (() => new Date().toISOString().slice(0, 10));
+  const db = openDb(config.dbPath);
+  const ledger = new Ledger(db);
+  const mandates = new Mandates(db);
+  const channels = new Channels();
+  const weather = new DemoCycloneFeed();
+  let port = config.port;
+
+  let fake: FakePayPal | undefined;
+  let payments: PaymentsApi;
+  if (config.paypal.mode === "fake") {
+    fake = new FakePayPal({ checkoutUrl: `${config.publicUrl}/fake-paypal/checkout` });
+    // Deliver the fake's webhooks over real HTTP to our own endpoint, as PayPal would.
+    fake.deliver = async (raw, headers) => {
+      await fetch(`http://127.0.0.1:${port}/webhooks/paypal`, { method: "POST", headers, body: raw, signal: AbortSignal.timeout(10_000) });
+    };
+    payments = new PayPalRestClient({ clientId: fake.clientId, clientSecret: fake.clientSecret, webhookId: fake.webhookId, fetch: fake.fetch });
+  } else {
+    payments = new PayPalRestClient({ clientId: config.paypal.clientId, clientSecret: config.paypal.clientSecret, webhookId: config.paypal.webhookId, baseUrl: config.paypal.baseUrl, onCall: (c) => log({ event: "paypal", ...c }) });
+  }
+
+  const guides = guidesWithPayee(config.guidePayee);
+  const service = new BookingService({ db, ledger, mandates, payments, guides, weather, channels, publicUrl: config.publicUrl });
+  const model: ChatModel =
+    opts.model ?? (config.llm.mode === "openai" ? new OpenAICompatModel({ baseUrl: config.llm.baseUrl, apiKey: config.llm.apiKey, model: config.llm.model }) : new ScriptedModel(today));
+  const toolCtx = { service, channels, sendOperatorLink: channels.sendOperatorLink.bind(channels) };
+  const agent = new Agent(model, toolCtx, today);
+
+  const statics = Object.fromEntries(Object.entries(STATIC).map(([path, s]) => [path, { ...s, body: readFileSync(join(PUBLIC_DIR, s.file)) }]));
+
+  async function runEvents(conv: string): Promise<string[]> {
+    const replies: string[] = [];
+    for (const e of channels.drain(conv)) replies.push((await agent.turn(conv, `[event] ${e.type} ${e.booking_id}: ${e.text}`)).reply);
+    return replies;
+  }
+
+  function state(conv: string) {
+    const bookings = service.forConversation(conv);
+    const ids = new Set(bookings.map((b) => b.id));
+    return {
+      mode: { paypal: config.paypal.mode, model: agent.modelLabel },
+      transcript: agent.transcript(conv),
+      pending_events: channels.pending(conv),
+      bookings: bookings.map((b) => ({ ...service.summary(b), guide_balance: fake ? fake.balance(service.guide(b.guide_id)!.payee) : null })),
+      inbox: channels.inbox(conv).map(({ text, at, mandate_id }) => ({ text, at, mandate_id })),
+      guide_phone: channels.operatorLinks(conv),
+      ledger: ledger.list().filter((e) => ids.has(e.booking_id)),
+      chain: ledger.verify(),
+    };
+  }
+
+  async function route(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+    const method = req.method ?? "GET";
+    const path = url.pathname;
+
+    if (method === "GET" && statics[path]) return send(res, 200, statics[path]!.body.toString("utf8"), statics[path]!.type);
+    if (method === "GET" && path === "/healthz") return sendJson(res, 200, { ok: true, version: VERSION, paypal: config.paypal.mode, model: config.llm.mode });
+
+    if (path === "/api/chat" && method === "POST") {
+      const body = await readJson(req);
+      const conv = body?.conversation_id;
+      if (typeof conv !== "string" || !CONV_RE.test(conv)) return sendJson(res, 400, { error: "conversation_id required" });
+      const replies = await runEvents(conv);
+      if (typeof body!.message === "string" && body!.message.trim()) replies.push((await agent.turn(conv, body!.message.trim())).reply);
+      return sendJson(res, 200, { replies, ...state(conv) });
+    }
+    if (path === "/api/state" && method === "GET") {
+      const conv = url.searchParams.get("conversation_id") ?? "";
+      if (!CONV_RE.test(conv)) return sendJson(res, 400, { error: "conversation_id required" });
+      return sendJson(res, 200, state(conv));
+    }
+    let m = path.match(/^\/api\/mandates\/(md_[0-9a-f]{16})\/approve$/);
+    if (m && method === "POST") {
+      const body = await readJson(req);
+      const conv = String(body?.conversation_id ?? "");
+      const mandate = mandates.get(m[1]!);
+      const booking = mandate ? service.get(mandate.booking_id) : undefined;
+      if (!booking || booking.conversation_id !== conv) return sendJson(res, 404, { error: "No such mandate." });
+      try {
+        service.approveMandate(m[1]!, String(body?.code ?? ""));
+        return sendJson(res, 200, { ok: true, ...state(conv) });
+      } catch (e) {
+        if (e instanceof ServiceError) return sendJson(res, 422, { ok: false, error: e.message, reason: e.code });
+        throw e;
+      }
+    }
+    if (path === "/api/demo/cyclone" && method === "POST") {
+      if (!fake) return sendJson(res, 404, { error: "demo controls run only with the fake PayPal" });
+      const body = await readJson(req);
+      const conv = String(body?.conversation_id ?? "");
+      const dates = service.forConversation(conv).map((b) => b.date).sort();
+      if (!CONV_RE.test(conv) || !dates.length) return sendJson(res, 400, { error: "no booking to warn about" });
+      weather.raise({ id: `TC-DEMO-${Date.now()}`, name: "Cyclone Demo-1 (demo)", level: "orange", from: addDays(dates[0]!, -1), to: addDays(dates.at(-1)!, 1), summary: "Demo warning raised from the page." });
+      const n = await service.announceCyclone(conv);
+      return sendJson(res, 200, { ok: true, bookings_warned: n });
+    }
+
+    m = path.match(/^\/o\/([A-Za-z0-9_-]{43})$/);
+    if (m) {
+      const token = m[1]!;
+      const booking = service.byToken(token);
+      if (!booking) return send(res, 404, renderInvalidLink(), "text/html; charset=utf-8");
+      if (method === "POST") {
+        const raw = await readBody(req, JSON_LIMIT);
+        const flash = applyOperatorAction(service, token, new URLSearchParams(raw ?? ""));
+        return send(res, flash.ok ? 200 : 422, renderOperatorPage(token, service.get(booking.id)!, flash), "text/html; charset=utf-8");
+      }
+      return send(res, 200, renderOperatorPage(token, booking), "text/html; charset=utf-8");
+    }
+    if (path.startsWith("/o/")) return send(res, 404, renderInvalidLink(), "text/html; charset=utf-8");
+
+    if (path === "/paypal/return" && method === "GET") {
+      const id = url.searchParams.get("booking") ?? "";
+      const b = service.get(id);
+      if (!b) return redirect(res, "/");
+      try {
+        const r = await service.captureIfApproved(id);
+        log({ event: "return", booking: id, captured: r.captured, order_status: r.order_status });
+      } catch (e) {
+        log({ event: "return_failed", booking: id, error: e instanceof Error ? e.name : "unknown" });
+      }
+      return redirect(res, `/?c=${encodeURIComponent(b.conversation_id)}`);
+    }
+    if (path === "/paypal/cancel" && method === "GET") {
+      const b = service.get(url.searchParams.get("booking") ?? "");
+      return redirect(res, b ? `/?c=${encodeURIComponent(b.conversation_id)}` : "/");
+    }
+
+    if (path === "/webhooks/paypal" && method === "POST") {
+      const raw = await readBody(req, WEBHOOK_LIMIT);
+      if (raw === undefined) return sendJson(res, 413, { error: "too large" });
+      const r = await service.handleWebhook(raw, req.headers);
+      log({ event: "webhook", status: r.status, result: r.result });
+      return sendJson(res, r.status, { result: r.result });
+    }
+
+    if (path === "/mcp") {
+      if (method !== "POST") return sendJson(res, 405, { jsonrpc: "2.0", error: { code: -32000, message: "Method not allowed: stateless server, POST only" }, id: null });
+      const raw = await readBody(req, MCP_LIMIT);
+      let body: unknown;
+      try {
+        body = JSON.parse(raw ?? "");
+      } catch {
+        return sendJson(res, 400, { jsonrpc: "2.0", error: { code: -32700, message: "Parse error" }, id: null });
+      }
+      return handleMcp(req, res, body, toolCtx, VERSION);
+    }
+
+    if (fake && path === "/fake-paypal/checkout") {
+      const orderId = url.searchParams.get("token") ?? "";
+      const order = /^[A-Z0-9]{17}$/.test(orderId) ? fake.order(orderId) : undefined;
+      if (!order) return send(res, 404, "No such order", "text/plain");
+      const unit = order.purchase_units![0]!;
+      if (method === "POST") {
+        if (order.status === "PAYER_ACTION_REQUIRED" || order.status === "CREATED") fake.approve(orderId);
+        return redirect(res, `${config.publicUrl}/paypal/return?booking=${encodeURIComponent(unit.custom_id ?? "")}&token=${orderId}`);
+      }
+      return send(
+        res,
+        200,
+        `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Fake PayPal checkout</title><link rel="stylesheet" href="/style.css"></head>
+<body class="operator"><main><p class="tag">Stand-in for PayPal sandbox checkout (offline demo; no real PayPal call)</p><h1>Pay ${esc(formatMoney(unit.amount))}</h1>
+<section class="card"><dl><dt>To (payee)</dt><dd data-testid="fake-payee">${esc(unit.payee?.email_address ?? unit.payee?.merchant_id ?? "app owner")}</dd><dt>For</dt><dd>${esc(unit.description)}</dd><dt>Order</dt><dd class="mono">${esc(order.id)} · ${esc(order.status)}</dd></dl>
+<form method="post"><button type="submit" data-action="fake-approve">Approve as the sandbox traveller</button></form></section></main></body></html>`,
+        "text/html; charset=utf-8",
+      );
+    }
+
+    return sendJson(res, 404, { error: "not found" });
+  }
+
+  const server = createServer((req, res) => {
+    securityHeaders(res);
+    const started = Date.now();
+    let url: URL;
+    try {
+      url = new URL(req.url ?? "/", "http://localhost");
+    } catch {
+      return sendJson(res, 400, { error: "bad url" });
+    }
+    route(req, res, url)
+      .catch((e: unknown) => {
+        log({ event: "error", path: url.pathname, error: e instanceof Error ? e.name : "unknown" });
+        if (!res.headersSent) sendJson(res, e instanceof ServiceError ? 422 : 500, { error: e instanceof ServiceError ? e.message : "internal error" });
+      })
+      .finally(() => log({ event: "request", method: req.method, path: url.pathname.startsWith("/o/") ? "/o/{token}" : url.pathname, status: res.statusCode, ms: Date.now() - started }));
+  });
+
+  return {
+    server,
+    service,
+    fake,
+    listen: () =>
+      new Promise((resolve) => {
+        server.listen(config.port, config.host, () => {
+          port = (server.address() as AddressInfo).port;
+          resolve(port);
+        });
+      }),
+    close: () =>
+      new Promise((resolve) => {
+        server.close(() => {
+          db.close();
+          resolve();
+        });
+        server.closeAllConnections();
+      }),
+  };
+}
