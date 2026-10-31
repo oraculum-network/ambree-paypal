@@ -184,6 +184,7 @@ only on network errors or 5xx, and only for calls that carry a `PayPal-Request-I
 | S8 | Does a personal sandbox account work as payee (concept A's question)? Not needed for B | optional run |
 | S9 | Currency: EUR versus USD for an MU business sandbox account | run once with each |
 | S10 | JS SDK v6 buttons versus the redirect approve link for a third-party payee | not in the spike; the build uses the approve link (redirect) first |
+| S11 | Does `GET /v1/identity/openidconnect/userinfo?schema=openid`, called with the **app's client-credentials token**, describe the REST app's owner, and is its `payer_id` the owner's merchant id (equal to the id in the sandbox dashboard)? If not, which documented call returns the app owner's merchant id? | row "a2 identity": prints payer_id, user_id, account_type and the field names (never a token). Compare payer_id with the dashboard's merchant id |
 
 ## 6. The agent's tools (one registry: `src/tools/`; served to the model and over MCP)
 
@@ -372,3 +373,31 @@ that changed:
   any other version (an unstamped build-1 file reads as 0) throws `SchemaError`. There are no migrations
   until something is deployed. This also covers the re-check's legacy-records point: records without
   `refund_ops` can't be loaded at all.
+
+## 13. Fix round 3 (31 Oct)
+
+- **Review is sticky.** While any `RefundOp` is `needs_review`:
+  - the booking stays `needs_review`, even when another op completes;
+  - `refund()` refuses new refunds and retries of a `sending` op with
+    `ServiceError("refund_under_review")`;
+  - `refreshRefunds` may still record other ops' real completions (money did move), but it never clears the
+    review.
+- **Operator identity confirmed with PayPal** (`App.listen()` → `confirmOperator()`).
+  - **What the docs say (read 31 Oct):**
+    - `/v1/oauth2/token` returns `scope, access_token, token_type, app_id, expires_in, nonce`, and no
+      merchant or payer id (https://developer.paypal.com/api/rest/authentication/).
+    - `GET /v1/identity/openidconnect/userinfo` "Shows OpenID Connect user profile information". Its sample
+      reply has `user_id, sub, name, email, verified_account, account_type …` but no `payer_id`, and the
+      page says neither which token it takes nor that it describes the app owner
+      (https://developer.paypal.com/docs/api/identity/v1/userinfo-get).
+    - **No documented call is known to return the REST app owner's merchant id for an app token.**
+  - **What the code does:**
+    - `PaymentsApi.getOperatorIdentity()` calls `GET /v1/identity/openidconnect/userinfo?schema=openid`
+      with the app token and reads `payer_id` (13-character-style ids only).
+    - Startup refuses when the call fails, when `payer_id` is absent, when it isn't
+      `PAYPAL_OPERATOR_MERCHANT_ID`, or when it is a guide's merchant id.
+    - The fake answers the same call (`ownerMerchantId`, default `AMBREEOPER001`).
+  - **Opt-out:** `PAYPAL_OPERATOR_IDENTITY=config-only` is explicit and logged as a warning, and `/healthz`
+    reports `operator_identity: "config-only (unconfirmed)"`. Use it only if S11 shows the call can't
+    confirm the owner, until a documented call is found.
+  - **UNVERIFIED: S11** (the spike's "a2 identity" row).

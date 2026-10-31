@@ -80,10 +80,24 @@ sandbox mode:
 - **Before capture,** it re-reads the order and compares its `payee.merchant_id` with the guide's. It
   refuses one that is the operator's, and one that has no merchant id.
 
-**What this does not prove:** that the merchant id configured as the operator's really is the REST app
-owner's. It is a configured value, so check it in the sandbox dashboard. Also **UNVERIFIED:** that PayPal's
-order replies echo `payee.merchant_id`. If they don't, every capture is refused (it fails closed), and the
-spike checks this (DESIGN.md §5 S6).
+**Confirming the operator with PayPal.** Before serving, the app asks PayPal which merchant owns the REST
+app. It calls `GET /v1/identity/openidconnect/userinfo` with the app's own token and refuses to start unless
+the reply's `payer_id` equals `PAYPAL_OPERATOR_MERCHANT_ID` and matches no guide. It also refuses if the call
+fails or carries no `payer_id`.
+- **The limit:** PayPal's docs don't say that this call accepts an app (client-credentials) token or that it
+  describes the app owner. Its documented sample has no `payer_id`, and the token reply carries only an
+  `app_id`.
+- **So it is UNVERIFIED (DESIGN.md §5 S11),** and `node scripts/spike.ts` prints what PayPal returns.
+- **Opt-out:** if the call can't confirm the owner, `PAYPAL_OPERATOR_IDENTITY=config-only` lets the app run
+  on the configured id. `/healthz` then says `operator_identity: "config-only (unconfirmed)"` and the log
+  warns. Otherwise it says `"confirmed"`.
+
+Also **UNVERIFIED:** that PayPal's order replies echo `payee.merchant_id`. If they don't, every capture is
+refused (it fails closed); the spike checks this (DESIGN.md §5 S6).
+
+A refund whose PayPal reply doesn't match what was sent puts the booking in `needs_review`, and it stays
+there even if a later refund completes. While any refund is in review, new refunds and retries on that
+booking are refused (`refund_under_review`).
 
 ## Run it locally (no keys needed)
 

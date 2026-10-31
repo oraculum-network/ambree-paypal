@@ -47,6 +47,11 @@ upgrade that changes the schema.
   `PAYPAL_GUIDE_PAYEE_MERCHANT_ID` (the merchant id of the sandbox business account that plays every guide).
   - Also `PAYPAL_OPERATOR_MERCHANT_ID`: the REST app owner's own sandbox merchant id, required. Accounts
     are compared by merchant id only; email variables are refused.
+  - At startup the app confirms that id with PayPal (`GET /v1/identity/openidconnect/userinfo`, `payer_id`)
+    and refuses to start if it differs or can't be read.
+  - TODO-CHECK, after the spike's S11 row: if PayPal returns no `payer_id` for the app token, set
+    `PAYPAL_OPERATOR_IDENTITY=config-only` (a plain env var, not a secret). `/healthz` then shows
+    `operator_identity: "config-only (unconfirmed)"`.
   - Optionally `MCP_DEMO_PASSCODE`; without it, `/mcp` answers 401.
   - TODO-CHECK: the operator's merchant id, from the sandbox account's profile.
 - `paypal/llm`: `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL` (OpenRouter with a spend cap until 15 Dec;
