@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: paypal-web
+  labels:
+    app.kubernetes.io/name: ambree-paypal
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: ambree-paypal
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

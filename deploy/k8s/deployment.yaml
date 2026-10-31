@@ -1,0 +1,99 @@
+# DRAFT for the CTO (the infra is the CTO's; see DEPLOY.md). One small Node pod: the chat page, the
+# operator page, the PayPal webhook endpoint and MCP. The ledger lives in sqlite on /data; the root
+# filesystem is read-only. The label app.kubernetes.io/name: ambree-paypal is what the namespace's
+# NetworkPolicies should select (in from Traefik on :8080, out to DNS and public :443).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: paypal-web
+  labels:
+    app.kubernetes.io/name: ambree-paypal
+    app.kubernetes.io/component: web
+spec:
+  replicas: 1 # sqlite + in-memory conversations: one replica only
+  revisionHistoryLimit: 3
+  strategy:
+    type: Recreate # never two pods on one sqlite file
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ambree-paypal
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ambree-paypal
+        app.kubernetes.io/component: web
+    spec:
+      priorityClassName: paypal-low # TODO-CHECK: created by the monorepo's security.sh paypal block
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 10
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: web
+          image: oraculum/ambree-paypal
+          imagePullPolicy: Never
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: PORT
+              value: "8080"
+            - name: HOST
+              value: "0.0.0.0"
+            - name: PUBLIC_URL
+              value: https://paypal.ambree.ai
+            - name: DB_PATH
+              value: /data/ambree.sqlite
+            # No Secret (or no keys in it) means the fake PayPal and the scripted model, so the pod still boots.
+            # With PAYPAL_CLIENT_ID + SECRET set, PAYPAL_GUIDE_PAYEE_EMAIL is required (the app refuses to start without it).
+            - name: PAYPAL_CLIENT_ID
+              valueFrom: { secretKeyRef: { name: paypal-sandbox, key: PAYPAL_CLIENT_ID, optional: true } }
+            - name: PAYPAL_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: paypal-sandbox, key: PAYPAL_CLIENT_SECRET, optional: true } }
+            - name: PAYPAL_WEBHOOK_ID
+              valueFrom: { secretKeyRef: { name: paypal-sandbox, key: PAYPAL_WEBHOOK_ID, optional: true } }
+            - name: PAYPAL_GUIDE_PAYEE_EMAIL
+              valueFrom: { secretKeyRef: { name: paypal-sandbox, key: PAYPAL_GUIDE_PAYEE_EMAIL, optional: true } }
+            - name: LLM_BASE_URL
+              valueFrom: { secretKeyRef: { name: llm, key: LLM_BASE_URL, optional: true } }
+            - name: LLM_API_KEY
+              valueFrom: { secretKeyRef: { name: llm, key: LLM_API_KEY, optional: true } }
+            - name: LLM_MODEL
+              valueFrom: { secretKeyRef: { name: llm, key: LLM_MODEL, optional: true } }
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 25m
+              memory: 96Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 5
+      volumes:
+        # TODO-CHECK: a PVC (local-path) so the ledger survives restarts until 15 Dec; emptyDir resets it.
+        - name: data
+          emptyDir:
+            sizeLimit: 256Mi

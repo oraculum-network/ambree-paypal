@@ -1,0 +1,16 @@
+# paypal.ambree.ai on oraculum-prod (k3s), namespace `paypal`. DRAFT: the namespace, PSA labels,
+# NetworkPolicies, quota, PriorityClass and the Secrets come from the CTO's infra work (DEPLOY.md).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: paypal
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: ambree-paypal
+      app.kubernetes.io/managed-by: oraculum-deploy
+resources:
+  - deployment.yaml
+  - service.yaml
+  - ingress.yaml
+images:
+  - name: oraculum/ambree-paypal
+    newTag: set-by-deploy

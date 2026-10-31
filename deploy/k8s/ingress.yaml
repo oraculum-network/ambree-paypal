@@ -1,0 +1,25 @@
+# https://paypal.ambree.ai: HTTPS only, Let's Encrypt via Traefik's `le` resolver, the same annotations
+# as qloo.ambree.ai. The A record must resolve publicly before the first apply.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: paypal-web
+  labels:
+    app.kubernetes.io/name: ambree-paypal
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    traefik.ingress.kubernetes.io/router.tls.certresolver: le
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: paypal.ambree.ai
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: paypal-web
+                port:
+                  name: http
