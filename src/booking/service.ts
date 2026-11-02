@@ -161,7 +161,7 @@ const CANNOT_SIMULATE: Record<Exclude<BookingStatus, NotPaid | "captured">, stri
   declined: "the guide declined the request, so there is no trip to warn about",
   capture_pending: "PayPal is still processing the payment; try again once it completes",
   capture_failed: "the payment failed, so nothing was paid",
-  needs_review: "it is held for review because a PayPal reply didn't match what was expected",
+  needs_review: "it is held for review (get_booking says why)",
   partially_refunded: "part of the deposit was already refunded",
   refunded: "the deposit was already refunded",
 };
@@ -305,7 +305,7 @@ function namesBooking(r: { custom_id?: unknown; links?: unknown }, b: Booking): 
 /** Why no refund or retry is sent while an operation is held, by the hold's cause. */
 const UNDER_REVIEW: Record<NonNullable<RefundOp["review_cause"]>, string> = {
   unknown:
-    "A refund on this booking is held for review: PayPal gave no definitive answer about it, so it may already have gone through. Nothing more is refunded or resent until PayPal's notice settles it or a person reconciles it; get_booking shows the current state.",
+    "A refund on this booking is held for review: PayPal gave no definitive answer about it, so it may already have gone through. Nothing more is refunded or resent meanwhile: PayPal's notice may still settle it, and if it doesn't, a person will reconcile it. get_booking shows the current state.",
   mismatch: "A refund on this booking needs review (PayPal's reply didn't match what was sent); no further refunds or retries until it is reconciled.",
   already_refunded: "A refund on this booking needs review (PayPal said the deposit was already refunded, which this booking doesn't show); no further refunds or retries until it is reconciled.",
   unexplained:
@@ -1149,7 +1149,7 @@ export class BookingService {
             this.#log(held, resend ? "refund.resend_refused" : "refund.retry_refused", { n: op.n, request_id: op.request_id, cause: "unknown", error: pe.summary() });
             throw new ServiceError(
               "refund_under_review",
-              `PayPal refused ${resend ? "the resend of a refund whose first reply was lost" : "the client's retry of a refund whose first attempt got no answer"}, so it may already have been refunded; the booking is held for review and nothing more is refunded until PayPal's notice settles it or a person reconciles it. get_booking shows the current state.`,
+              `PayPal refused ${resend ? "the resend of a refund whose first reply was lost" : "the client's retry of a refund whose first attempt got no answer"}, so it may already have been refunded; the booking is held for review and nothing more is refunded meanwhile: PayPal's notice may still settle it, and if it doesn't, a person will reconcile it. get_booking shows the current state.`,
             );
           }
           if (pe.issue && ALREADY_REFUNDED_ISSUES.includes(pe.issue)) {

@@ -7,7 +7,9 @@ const cents = (m) => Math.round(Number(m.value) * 100);
 /**
  * A booking held for review because of a refund (`refund_review`) says that, and that the deposit was paid:
  * held only because PayPal gave no definitive answer about the refund (`refund_review_cause` "unknown"), so
- * it may have gone through and PayPal's notice may still settle it; or because PayPal's reply about it
+ * it may have gone through; PayPal's notice may still settle it, and a person reconciles it if it doesn't
+ * (the notice may never come, so the card promises none). Held because PayPal reports money refunded that
+ * no refund this booking sent accounts for ("unexplained", round 10). Or because PayPal's reply about it
  * didn't match what was sent. One held because the order or capture didn't match the mandate says that.
  * @returns {{ testid: string, text: string } | null}
  */
@@ -25,7 +27,10 @@ export function paymentLine(b) {
       return { testid: "payment-failed", text: `Payment failed: PayPal reported ${b.capture.status ?? "a failure"}; nothing was paid to ${b.guide.name}.` };
     default:
       if (b.refund_review && b.refund_review_cause === "unknown") {
-        return { testid: "refund-review", text: `A refund is held for review: PayPal gave no definitive answer about the refund of ${money(b.refund_review)}, so it may have gone through. Nothing more is refunded until PayPal's notice settles it or a person checks it. The deposit, ${amount} to ${b.guide.name}, was paid (capture ${b.capture.id}).` };
+        return { testid: "refund-review", text: `A refund is held for review: PayPal gave no definitive answer about the refund of ${money(b.refund_review)}, so it may have gone through. Nothing more is refunded meanwhile: if PayPal's notice doesn't settle it, a person will reconcile it. The deposit, ${amount} to ${b.guide.name}, was paid (capture ${b.capture.id}).` };
+      }
+      if (b.refund_review && b.refund_review_cause === "unexplained") {
+        return { testid: "refund-review", text: `A refund needs review: PayPal reports ${money(b.refund_review)} refunded on this booking that no refund this booking sent accounts for, so more may have come back to you than it shows. Nothing more is refunded until a person reconciles it. The deposit, ${amount} to ${b.guide.name}, was paid (capture ${b.capture.id}).` };
       }
       if (b.refund_review) {
         return { testid: "refund-review", text: `A refund needs review: PayPal's reply about the refund of ${money(b.refund_review)} didn't match what was sent, so nothing more is refunded until a person checks it. The deposit, ${amount} to ${b.guide.name}, was paid (capture ${b.capture.id}).` };
