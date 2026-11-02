@@ -145,8 +145,17 @@ export class PayPalRestClient implements PaymentsApi {
     // A write is retried once on a network error or 5xx only if PayPal can dedupe it (PayPal-Request-Id).
     const attempts = method === "GET" || requestId ? 2 : 1;
     let refreshed = false;
+    // Whether an attempt so far may have reached PayPal (a network error or a 5xx): the error this call
+    // ends with then says so (maybeDelivered), even if the last attempt was refused outright.
+    let maybeDelivered = false;
+    const fail = (e: PayPalError) => (maybeDelivered ? e.maybeDeliveredCopy() : e);
     for (let attempt = 1; ; attempt++) {
-      const token = await this.#accessToken();
+      let token: string;
+      try {
+        token = await this.#accessToken();
+      } catch (e) {
+        throw e instanceof PayPalError ? fail(e) : e;
+      }
       const headers: Record<string, string> = { Authorization: `Bearer ${token}`, Accept: "application/json" };
       if (body !== undefined) headers["Content-Type"] = "application/json";
       if (requestId) headers["PayPal-Request-Id"] = requestId;
@@ -155,19 +164,22 @@ export class PayPalRestClient implements PaymentsApi {
       try {
         res = await this.#send(call, `${this.baseUrl}${path}`, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
       } catch (e) {
-        if (attempt < attempts && e instanceof PayPalError && e.kind === "network") continue;
-        throw e;
+        if (!(e instanceof PayPalError)) throw e;
+        if (e.maybeDelivered) maybeDelivered = true;
+        if (attempt < attempts && e.kind === "network") continue;
+        throw fail(e);
       }
       if (res.status >= 200 && res.status < 300) return res.body as T;
       if (res.status === 401 && !refreshed) {
-        // An expired or revoked token: fetch one new token and try again, once.
+        // An expired or revoked token: fetch one new token and try again, once. PayPal didn't act on it.
         refreshed = true;
         this.forgetToken();
         attempt--;
         continue;
       }
+      if (res.status >= 500) maybeDelivered = true;
       if (res.status >= 500 && attempt < attempts) continue;
-      throw errorFromBody(res.status, call, res.body);
+      throw fail(errorFromBody(res.status, call, res.body));
     }
   }
 
@@ -188,7 +200,8 @@ export class PayPalRestClient implements PaymentsApi {
       try {
         parsed = JSON.parse(text);
       } catch {
-        if (res.ok) throw new PayPalError({ kind: "invalid_response", status: res.status, call, message: "reply is not JSON" });
+        // PayPal answered 2xx, so it acted on the request: this is maybe-delivered, never a refusal.
+        if (res.ok) throw new PayPalError({ kind: "invalid_response", status: res.status, call, message: "reply is not JSON", maybeDelivered: true });
       }
     }
     return { status: res.status, body: parsed };

@@ -3,6 +3,18 @@
 
 export type PayPalErrorKind = "http" | "auth" | "timeout" | "network" | "invalid_request" | "invalid_response";
 
+export interface PayPalErrorInit {
+  kind: PayPalErrorKind;
+  status: number;
+  call: string;
+  code?: string;
+  issue?: string;
+  debugId?: string;
+  message: string;
+  /** Default: a network error, a timeout or a 5xx. */
+  maybeDelivered?: boolean;
+}
+
 export class PayPalError extends Error {
   override name = "PayPalError";
   readonly kind: PayPalErrorKind;
@@ -15,15 +27,29 @@ export class PayPalError extends Error {
   readonly debugId: string | undefined;
   /** "POST /v2/checkout/orders/{id}/capture": the method and path template, no ids or query. */
   readonly call: string;
+  /**
+   * This call, or an earlier attempt of it inside the client, may have reached PayPal and been processed:
+   * it ended in a network error, a timeout or a 5xx (or a 2xx reply that couldn't be read). A definitive
+   * refusal with this set doesn't prove nothing happened: an earlier attempt may have done it.
+   */
+  readonly maybeDelivered: boolean;
+  readonly #init: PayPalErrorInit;
 
-  constructor(init: { kind: PayPalErrorKind; status: number; call: string; code?: string; issue?: string; debugId?: string; message: string }) {
+  constructor(init: PayPalErrorInit) {
     super(`${init.call}: ${init.message}`);
+    this.#init = init;
     this.kind = init.kind;
     this.status = init.status;
     this.call = init.call;
     this.code = init.code;
     this.issue = init.issue;
     this.debugId = init.debugId;
+    this.maybeDelivered = init.maybeDelivered ?? (init.kind === "network" || init.kind === "timeout" || init.status >= 500);
+  }
+
+  /** The same error, marked: an earlier attempt of this call may have reached PayPal. */
+  maybeDeliveredCopy(): PayPalError {
+    return this.maybeDelivered ? this : new PayPalError({ ...this.#init, maybeDelivered: true });
   }
 
   /** A safe one-line summary for logs and tool results. */
