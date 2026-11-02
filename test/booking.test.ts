@@ -3,6 +3,7 @@ import { ServiceError } from "../src/booking/service.ts";
 import { SEED_GUIDES, guidesWithPayee, searchGuides } from "../src/guides/seed.ts";
 import { MANDATE_TTL_MS } from "../src/mandate/mandate.ts";
 import { applyOperatorAction, renderOperatorPage } from "../src/operator/page.ts";
+import { later } from "./helpers/race.ts";
 import { makeWorld, tokenOf } from "./helpers/world.ts";
 
 const CONV = "cv_test";
@@ -10,15 +11,15 @@ const CONV = "cv_test";
 async function priced(w = makeWorld()) {
   const { booking, operatorUrl } = w.service.requestQuote({ conversation_id: CONV, guide_id: "g_lantern", date: "2026-11-05", party_size: 2, activity: "hike" });
   const token = tokenOf(operatorUrl);
-  w.service.priceQuote(token, { total: "80", deposit: "30", note: "06:30 at the car park" });
+  await w.service.priceQuote(token, { total: "80", deposit: "30", note: "06:30 at the car park" });
   return { w, id: booking.id, token };
 }
 
 async function paid() {
   const { w, id, token } = await priced();
-  w.service.proposeMandate(id);
+  await w.service.proposeMandate(id);
   const code = w.channels.inbox(CONV).at(-1)!.code;
-  w.service.approveMandate(w.service.get(id)!.mandate_id!, code);
+  await w.service.approveMandate(w.service.get(id)!.mandate_id!, code);
   const b = await w.service.createOrder(id);
   w.fake.approve(b.order_id!);
   await w.fake.flush();
@@ -73,7 +74,7 @@ describe("operator page", () => {
     expect(b.quote).toMatchObject({ total: { currency_code: "EUR", value: "80.00" }, deposit: { value: "30.00" }, payee: SEED_GUIDES[0]!.payee });
     expect(b.quote_hash).toMatch(/^[0-9a-f]{64}$/);
     expect(w.channels.drain(CONV).map((e) => e.type)).toEqual(["guide_priced"]);
-    expect(applyOperatorAction(w.service, token, new URLSearchParams({ action: "price", total: "90", deposit: "10" }))).toMatchObject({ ok: false });
+    expect(await applyOperatorAction(w.service, token, new URLSearchParams({ action: "price", total: "90", deposit: "10" }))).toMatchObject({ ok: false });
     expect(renderOperatorPage(token, b)).toContain("quote hash");
   });
 
@@ -82,20 +83,20 @@ describe("operator page", () => {
     [{ total: "abc", deposit: "10" }, /amounts like/],
     [{ total: "0", deposit: "0" }, /more than 0/],
     [{ total: "5000", deposit: "10" }, /caps/],
-  ])("refuses a bad price %j", (form, msg) => {
+  ])("refuses a bad price %j", async (form, msg) => {
     const w = makeWorld();
     const { operatorUrl } = w.service.requestQuote({ conversation_id: CONV, guide_id: "g_lantern", date: "2026-11-05", party_size: 2, activity: "hike" });
-    const r = applyOperatorAction(w.service, tokenOf(operatorUrl), new URLSearchParams({ action: "price", ...form }));
+    const r = await applyOperatorAction(w.service, tokenOf(operatorUrl), new URLSearchParams({ action: "price", ...form }));
     expect(r.ok).toBe(false);
     expect(r.text).toMatch(msg);
   });
 
-  it("the guide can decline", () => {
+  it("the guide can decline", async () => {
     const w = makeWorld();
     const { booking, operatorUrl } = w.service.requestQuote({ conversation_id: CONV, guide_id: "g_quillfeather", date: "2026-11-05", party_size: 1, activity: "hike" });
-    expect(applyOperatorAction(w.service, tokenOf(operatorUrl), new URLSearchParams({ action: "decline" })).ok).toBe(true);
+    expect((await applyOperatorAction(w.service, tokenOf(operatorUrl), new URLSearchParams({ action: "decline" }))).ok).toBe(true);
     expect(w.service.get(booking.id)!.status).toBe("declined");
-    expect(() => w.service.proposeMandate(booking.id)).toThrow(ServiceError);
+    await expect(later(() => w.service.proposeMandate(booking.id))).rejects.toThrow(ServiceError);
   });
 
   it("refuses unknown guides, bad dates and party sizes", () => {
@@ -133,10 +134,10 @@ describe("mandate → order → capture → webhooks → ledger", () => {
 
   it("the order uses the mandate nonce as PayPal-Request-Id and the guide's payee", async () => {
     const { w, id } = await priced();
-    w.service.proposeMandate(id);
+    await w.service.proposeMandate(id);
     const code = w.channels.inbox(CONV).at(-1)!.code;
     const m = w.service.mandateView(w.service.get(id)!)!;
-    w.service.approveMandate(m.id, code);
+    await w.service.approveMandate(m.id, code);
     await w.service.createOrder(id);
     const create = w.fake.calls.find((c) => c.path === "/v2/checkout/orders")!;
     expect(create.requestId).toBe(m.nonce);
@@ -150,18 +151,18 @@ describe("mandate → order → capture → webhooks → ledger", () => {
   it("no order without an approved mandate", async () => {
     const { w, id } = await priced();
     await expect(w.service.createOrder(id)).rejects.toMatchObject({ code: "no_mandate" });
-    w.service.proposeMandate(id);
+    await w.service.proposeMandate(id);
     await expect(w.service.createOrder(id)).rejects.toMatchObject({ code: "no_mandate" });
     expect(w.fake.calls.filter((c) => c.path === "/v2/checkout/orders")).toHaveLength(0);
   });
 
   it("a wrong code is logged and refused; an expired mandate can't pay", async () => {
     const { w, id } = await priced();
-    w.service.proposeMandate(id);
+    await w.service.proposeMandate(id);
     const { code, mandate_id } = w.channels.inbox(CONV).at(-1)!;
-    expect(() => w.service.approveMandate(mandate_id, code === "000000" ? "111111" : "000000")).toThrow(/not right/);
+    await expect(later(() => w.service.approveMandate(mandate_id, code === "000000" ? "111111" : "000000"))).rejects.toThrow(/not right/);
     expect(w.ledger.list(id).at(-1)!.kind).toBe("mandate.rejected");
-    w.service.approveMandate(mandate_id, code);
+    await w.service.approveMandate(mandate_id, code);
     w.advance(MANDATE_TTL_MS + 1);
     await expect(w.service.createOrder(id)).rejects.toMatchObject({ code: "expired" });
     expect(w.ledger.list(id).at(-1)).toMatchObject({ kind: "order.refused", data: { reason: "expired" } });
@@ -169,26 +170,26 @@ describe("mandate → order → capture → webhooks → ledger", () => {
 
   it("a guide whose payee changed after approval is refused (payee pinning)", async () => {
     const { w, id } = await priced();
-    w.service.proposeMandate(id);
+    await w.service.proposeMandate(id);
     const { code, mandate_id } = w.channels.inbox(CONV).at(-1)!;
-    w.service.approveMandate(mandate_id, code);
+    await w.service.approveMandate(mandate_id, code);
     (w.service.guides as unknown as Array<{ id: string; payee: unknown }>).find((g) => g.id === "g_lantern")!.payee = { merchant_id: "SOMEONEELSE01" };
     await expect(w.service.createOrder(id)).rejects.toMatchObject({ code: "payee_mismatch" });
   });
 
   it("a stale mandate can't be approved after a newer one", async () => {
     const { w, id } = await priced();
-    w.service.proposeMandate(id);
+    await w.service.proposeMandate(id);
     const first = w.channels.inbox(CONV).at(-1)!;
-    w.service.proposeMandate(id);
-    expect(() => w.service.approveMandate(first.mandate_id, first.code)).toThrow(/newer mandate/);
+    await w.service.proposeMandate(id);
+    await expect(later(() => w.service.approveMandate(first.mandate_id, first.code))).rejects.toThrow(/newer mandate/);
   });
 
   it("an ambiguous create failure keeps the mandate and retries with the same nonce", async () => {
     const { w, id } = await priced();
-    w.service.proposeMandate(id);
+    await w.service.proposeMandate(id);
     const { code, mandate_id } = w.channels.inbox(CONV).at(-1)!;
-    w.service.approveMandate(mandate_id, code);
+    await w.service.approveMandate(mandate_id, code);
     w.fake.failNext({ path: /^\/v2\/checkout\/orders$/, status: 503, body: { name: "SERVICE_UNAVAILABLE" } });
     w.fake.failNext({ path: /^\/v2\/checkout\/orders$/, status: 503, body: { name: "SERVICE_UNAVAILABLE" } });
     await expect(w.service.createOrder(id)).rejects.toMatchObject({ status: 503 });
@@ -200,9 +201,9 @@ describe("mandate → order → capture → webhooks → ledger", () => {
 
   it("capture waits for the buyer, and is idempotent", async () => {
     const { w, id } = await priced();
-    w.service.proposeMandate(id);
+    await w.service.proposeMandate(id);
     const { code, mandate_id } = w.channels.inbox(CONV).at(-1)!;
-    w.service.approveMandate(mandate_id, code);
+    await w.service.approveMandate(mandate_id, code);
     const b = await w.service.createOrder(id);
     expect(await w.service.captureIfApproved(id)).toMatchObject({ captured: false, order_status: "PAYER_ACTION_REQUIRED" });
     w.fake.deliver = undefined;
@@ -220,9 +221,9 @@ describe("webhook endpoint rules", () => {
     const got: Array<{ raw: string; headers: Record<string, string> }> = [];
     const { id } = await priced(w);
     w.fake.deliver = (raw, headers) => void got.push({ raw, headers });
-    w.service.proposeMandate(id);
+    await w.service.proposeMandate(id);
     const { code, mandate_id } = w.channels.inbox(CONV).at(-1)!;
-    w.service.approveMandate(mandate_id, code);
+    await w.service.approveMandate(mandate_id, code);
     const b = await w.service.createOrder(id);
     w.fake.approve(b.order_id!);
     await w.fake.flush();
@@ -240,9 +241,9 @@ describe("webhook endpoint rules", () => {
     const got: Array<{ raw: string; headers: Record<string, string> }> = [];
     w.fake.deliver = (raw, headers) => void got.push({ raw, headers });
     const { id } = await priced(w);
-    w.service.proposeMandate(id);
+    await w.service.proposeMandate(id);
     const { code, mandate_id } = w.channels.inbox(CONV).at(-1)!;
-    w.service.approveMandate(mandate_id, code);
+    await w.service.approveMandate(mandate_id, code);
     w.fake.approve((await w.service.createOrder(id)).order_id!);
     await w.fake.flush();
     w.fake.failNext({ path: /verify-webhook-signature/, status: 500, body: {} });
@@ -281,9 +282,9 @@ describe("cyclone → reschedule or refund", () => {
 
   it("the guide accepts a reschedule: the date moves, no money moves", async () => {
     const { w, id, token } = await paid();
-    w.service.proposeReschedule(id, "2026-11-07");
+    await w.service.proposeReschedule(id, "2026-11-07");
     expect(renderOperatorPage(token, w.service.get(id)!)).toContain("Move the trip?");
-    applyOperatorAction(w.service, token, new URLSearchParams({ action: "accept_reschedule" }));
+    await applyOperatorAction(w.service, token, new URLSearchParams({ action: "accept_reschedule" }));
     const b = w.service.get(id)!;
     expect(b.date).toBe("2026-11-07");
     expect(b.status).toBe("captured");
@@ -292,9 +293,9 @@ describe("cyclone → reschedule or refund", () => {
 
   it("the guide declines the reschedule: a full refund is allowed", async () => {
     const { w, id, token } = await paid();
-    w.service.proposeReschedule(id, "2026-11-07");
-    expect(() => w.service.proposeReschedule(id, "2026-11-08")).toThrow(/already waiting/);
-    applyOperatorAction(w.service, token, new URLSearchParams({ action: "decline_reschedule" }));
+    await w.service.proposeReschedule(id, "2026-11-07");
+    await expect(later(() => w.service.proposeReschedule(id, "2026-11-08"))).rejects.toThrow(/already waiting/);
+    await applyOperatorAction(w.service, token, new URLSearchParams({ action: "decline_reschedule" }));
     expect(await w.service.refundReason(w.service.get(id)!)).toBe("the guide declined the reschedule");
     expect((await w.service.refund(id)).status).toBe("refunded");
     const refundCall = w.fake.calls.find((c) => c.path.endsWith("/refund"))!;
@@ -303,7 +304,7 @@ describe("cyclone → reschedule or refund", () => {
 
   it("the guide can offer a refund", async () => {
     const { w, id, token } = await paid();
-    applyOperatorAction(w.service, token, new URLSearchParams({ action: "offer_refund" }));
+    await applyOperatorAction(w.service, token, new URLSearchParams({ action: "offer_refund" }));
     expect((await w.service.refund(id, "30.00")).status).toBe("refunded");
   });
 

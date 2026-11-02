@@ -11,10 +11,10 @@ const CONV = "cv_payee2_00001";
 async function ordered() {
   const w = makeWorld();
   const { booking, operatorUrl } = w.service.requestQuote({ conversation_id: CONV, guide_id: "g_lantern", date: "2026-11-05", party_size: 2, activity: "hike" });
-  w.service.priceQuote(tokenOf(operatorUrl), { total: "80", deposit: "30" });
-  w.service.proposeMandate(booking.id);
+  await w.service.priceQuote(tokenOf(operatorUrl), { total: "80", deposit: "30" });
+  await w.service.proposeMandate(booking.id);
   const { code, mandate_id } = w.channels.inbox(CONV).at(-1)!;
-  w.service.approveMandate(mandate_id, code);
+  await w.service.approveMandate(mandate_id, code);
   w.fake.deliver = undefined;
   const b = await w.service.createOrder(booking.id);
   return { w, id: booking.id, orderId: b.order_id! };

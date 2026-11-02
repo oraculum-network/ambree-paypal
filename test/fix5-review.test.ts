@@ -87,10 +87,10 @@ function requested(w: World) {
 
 async function ordered(w: World) {
   const r = requested(w);
-  w.service.priceQuote(r.token, { total: "80", deposit: "30" });
-  w.service.proposeMandate(r.id);
+  await w.service.priceQuote(r.token, { total: "80", deposit: "30" });
+  await w.service.proposeMandate(r.id);
   const { code, mandate_id } = w.channels.inbox(CONV).at(-1)!;
-  w.service.approveMandate(mandate_id, code);
+  await w.service.approveMandate(mandate_id, code);
   w.fake.deliver = undefined;
   const b = await w.service.createOrder(r.id);
   return { ...r, orderId: b.order_id! };
@@ -137,7 +137,7 @@ describe("F1: the simulation is accepted only on a captured booking", () => {
   it("real feed alerts still reach every warnable booking, paid or not (WARNABLE is unchanged)", async () => {
     const w = makeWorld();
     const unpaid = requested(w);
-    w.service.priceQuote(unpaid.token, { total: "80", deposit: "30" });
+    await w.service.priceQuote(unpaid.token, { total: "80", deposit: "30" });
     realAlert(w);
     expect(await w.service.announceCyclone(CONV)).toBe(1);
     expect(kinds(w, unpaid.id)).toContain("weather.alert");
@@ -278,7 +278,7 @@ describe("F2: a change made while PayPal is answering is never wiped", () => {
     g.arm();
     const refreshing = w.service.refreshRefunds(id);
     await g.entered;
-    w.service.offerRefund(token);
+    await w.service.offerRefund(token);
     g.release();
     const after = await refreshing;
     expect(after).toMatchObject({ status: "partially_refunded", refunded_minor: 1000, refund_offered: true });
@@ -294,7 +294,7 @@ describe("F2: a change made while PayPal is answering is never wiped", () => {
     g.arm();
     const refunding = w.service.refund(id, "10.00");
     await g.entered;
-    w.service.offerRefund(token);
+    await w.service.offerRefund(token);
     g.release();
     expect(await refunding).toMatchObject({ status: "partially_refunded", refunded_minor: 1000, refund_offered: true });
     expect(w.service.get(id)).toMatchObject({ status: "partially_refunded", refund_offered: true });
@@ -320,9 +320,9 @@ describe("F3: a simulated warning never unlocks a refund by itself", () => {
     const w = makeWorld();
     const { id, token } = await paid(w);
     await later(() => w.service.simulateCyclone(id));
-    w.service.proposeReschedule(id, "2026-11-08");
+    await w.service.proposeReschedule(id, "2026-11-08");
     expect(await w.service.refundReason(w.service.get(id)!)).toBeUndefined();
-    applyOperatorAction(w.service, token, new URLSearchParams({ action: "decline_reschedule" }));
+    await applyOperatorAction(w.service, token, new URLSearchParams({ action: "decline_reschedule" }));
     expect(await w.service.refundReason(w.service.get(id)!)).toBe("the guide declined the reschedule");
     expect((await w.service.refund(id)).status).toBe("refunded");
     const requested = w.ledger.list(id).find((e) => e.kind === "refund.requested")!;
@@ -333,7 +333,7 @@ describe("F3: a simulated warning never unlocks a refund by itself", () => {
     const w = makeWorld();
     const { id, token } = await paid(w);
     await later(() => w.service.simulateCyclone(id));
-    w.service.offerRefund(token);
+    await w.service.offerRefund(token);
     expect(await w.service.refundReason(w.service.get(id)!)).toBe("the guide offered it");
   });
 
@@ -350,8 +350,8 @@ describe("F3: a reschedule can be answered only while the booking is captured", 
   async function refundedWithProposal() {
     const w = makeWorld();
     const { id, token } = await paid(w);
-    w.service.proposeReschedule(id, "2026-11-08");
-    w.service.offerRefund(token);
+    await w.service.proposeReschedule(id, "2026-11-08");
+    await w.service.offerRefund(token);
     expect((await w.service.refund(id)).status).toBe("refunded");
     return { w, id, token };
   }
@@ -359,21 +359,21 @@ describe("F3: a reschedule can be answered only while the booking is captured", 
   it("a refunded booking: accept and decline are refused, the date stays, and the page hides the question", async () => {
     const { w, id, token } = await refundedWithProposal();
     const before = w.service.get(id)!;
-    expect(() => w.service.answerReschedule(token, true)).toThrow(ServiceError);
-    expect(() => w.service.answerReschedule(token, false)).toThrow(ServiceError);
+    await expect(later(() => w.service.answerReschedule(token, true))).rejects.toThrow(ServiceError);
+    await expect(later(() => w.service.answerReschedule(token, false))).rejects.toThrow(ServiceError);
     expect(w.service.get(id)).toMatchObject({ date: DATE, status: "refunded", reschedule: before.reschedule });
     // No answer was recorded. (Since round 6 the full refund itself withdraws the waiting move: fix6-withdrawn.)
     expect(kinds(w, id).filter((k) => k.startsWith("reschedule.") && k !== "reschedule.proposed")).toEqual(["reschedule.withdrawn"]);
     expect(renderOperatorPage(token, w.service.get(id)!)).not.toContain("Move the trip?");
-    expect(applyOperatorAction(w.service, token, new URLSearchParams({ action: "accept_reschedule" })).ok).toBe(false);
+    expect((await applyOperatorAction(w.service, token, new URLSearchParams({ action: "accept_reschedule" }))).ok).toBe(false);
   });
 
   it("a captured booking still shows and takes the answer", async () => {
     const w = makeWorld();
     const { id, token } = await paid(w);
-    w.service.proposeReschedule(id, "2026-11-08");
+    await w.service.proposeReschedule(id, "2026-11-08");
     expect(renderOperatorPage(token, w.service.get(id)!)).toContain("Move the trip?");
-    expect(w.service.answerReschedule(token, true).date).toBe("2026-11-08");
+    expect((await w.service.answerReschedule(token, true)).date).toBe("2026-11-08");
   });
 });
 

@@ -59,10 +59,10 @@ export function requested(w: World) {
 /** Ordered, with webhooks not delivered (each test drives the service itself). */
 export async function ordered(w: World) {
   const r = requested(w);
-  w.service.priceQuote(r.token, { total: "80", deposit: "30" });
-  w.service.proposeMandate(r.id);
+  await w.service.priceQuote(r.token, { total: "80", deposit: "30" });
+  await w.service.proposeMandate(r.id);
   const { code, mandate_id } = w.channels.inbox(CONV).at(-1)!;
-  w.service.approveMandate(mandate_id, code);
+  await w.service.approveMandate(mandate_id, code);
   w.fake.deliver = undefined;
   const b = await w.service.createOrder(r.id);
   return { ...r, orderId: b.order_id! };
@@ -77,5 +77,10 @@ export async function paid(w: World) {
 }
 
 export const kinds = (w: World, id: string) => w.ledger.list(id).map((e) => e.kind);
+/**
+ * Calls a booking step as one promise, a microtask later: a step that was synchronous before round 7 and is
+ * queued (async) after it reads the same in a test, and a synchronous throw becomes a rejection.
+ */
+export const later = <T>(fn: () => T): Promise<Awaited<T>> => Promise.resolve().then(fn) as Promise<Awaited<T>>;
 /** POSTs to PayPal's refund endpoint (each one is money asked back from the guide). */
 export const refundPosts = (w: World) => w.fake.calls.filter((c) => c.method === "POST" && c.path.endsWith("/refund")).length;

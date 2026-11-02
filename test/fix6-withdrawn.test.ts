@@ -10,7 +10,7 @@ import { renderOperatorPage } from "../src/operator/page.ts";
 import { Records, SCHEMA_VERSION } from "../src/store/db.ts";
 // @ts-expect-error plain browser module, no types
 import * as labels from "../public/labels.js";
-import { DATE, type World, kinds, paid } from "./helpers/race.ts";
+import { DATE, type World, kinds, later, paid } from "./helpers/race.ts";
 import { makeWorld } from "./helpers/world.ts";
 
 const MOVED = "2026-11-08";
@@ -20,14 +20,14 @@ const realAlert = (w: World) => w.weather.raise({ id: "TC-R4", name: "Cyclone R4
 async function proposed() {
   const w = makeWorld();
   const r = await paid(w);
-  w.service.proposeReschedule(r.id, MOVED);
+  await w.service.proposeReschedule(r.id, MOVED);
   return { w, ...r };
 }
 
 describe("R4: a full refund withdraws a move still waiting for the guide", () => {
   it("the guide offers a refund instead of answering: refunded, the move withdrawn and logged after the refund", async () => {
     const { w, id, token } = await proposed();
-    w.service.offerRefund(token);
+    await w.service.offerRefund(token);
     const b = await w.service.refund(id);
     expect(b).toMatchObject({ status: "refunded", date: DATE, reschedule: { new_date: MOVED, status: "withdrawn" } });
     expect(w.service.get(id)).toMatchObject({ status: "refunded", reschedule: { new_date: MOVED, status: "withdrawn" } });
@@ -39,7 +39,7 @@ describe("R4: a full refund withdraws a move still waiting for the guide", () =>
     expect(w.ledger.verify().ok).toBe(true);
     // Nothing is waiting any more: the guide's page doesn't ask and an answer is refused.
     expect(renderOperatorPage(token, b)).not.toContain("Move the trip?");
-    expect(() => w.service.answerReschedule(token, true)).toThrow(ServiceError);
+    await expect(later(() => w.service.answerReschedule(token, true))).rejects.toThrow(ServiceError);
     expect(w.service.get(id)!.date).toBe(DATE);
   });
 
@@ -64,13 +64,13 @@ describe("R4: a full refund withdraws a move still waiting for the guide", () =>
 
   it("an answered move (declined or accepted) is left as it was", async () => {
     const declined = await proposed();
-    declined.w.service.answerReschedule(declined.token, false);
+    await declined.w.service.answerReschedule(declined.token, false);
     expect(await declined.w.service.refund(declined.id)).toMatchObject({ status: "refunded", reschedule: { new_date: MOVED, status: "declined" } });
     expect(kinds(declined.w, declined.id)).not.toContain(WITHDRAWN);
 
     const accepted = await proposed();
-    accepted.w.service.answerReschedule(accepted.token, true);
-    accepted.w.service.offerRefund(accepted.token);
+    await accepted.w.service.answerReschedule(accepted.token, true);
+    await accepted.w.service.offerRefund(accepted.token);
     expect(await accepted.w.service.refund(accepted.id)).toMatchObject({ status: "refunded", date: MOVED, reschedule: { new_date: MOVED, status: "accepted" } });
     expect(kinds(accepted.w, accepted.id)).not.toContain(WITHDRAWN);
   });
@@ -79,8 +79,8 @@ describe("R4: a full refund withdraws a move still waiting for the guide", () =>
     const w = makeWorld();
     const { id, token } = await paid(w);
     expect((await w.service.simulateCyclone(id)).posted).toBe(true);
-    w.service.proposeReschedule(id, MOVED);
-    w.service.answerReschedule(token, false);
+    await w.service.proposeReschedule(id, MOVED);
+    await w.service.answerReschedule(token, false);
     expect((await w.service.refund(id)).status).toBe("refunded");
     expect(await w.service.simulateCyclone(id)).toMatchObject({ posted: false, booking: { status: "refunded" } });
   });

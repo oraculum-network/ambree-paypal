@@ -14,10 +14,10 @@ const GUIDE = SEED_GUIDES[0]!.payee;
 
 async function approvedMandate(w = makeWorld()) {
   const { booking, operatorUrl } = w.service.requestQuote({ conversation_id: CONV, guide_id: "g_lantern", date: "2026-11-05", party_size: 2, activity: "hike" });
-  w.service.priceQuote(tokenOf(operatorUrl), { total: "80", deposit: "30" });
-  w.service.proposeMandate(booking.id);
+  await w.service.priceQuote(tokenOf(operatorUrl), { total: "80", deposit: "30" });
+  await w.service.proposeMandate(booking.id);
   const { code, mandate_id } = w.channels.inbox(CONV).at(-1)!;
-  w.service.approveMandate(mandate_id, code);
+  await w.service.approveMandate(mandate_id, code);
   return { w, id: booking.id, token: tokenOf(operatorUrl) };
 }
 
@@ -112,7 +112,7 @@ describe("finding 4: a failed create can't outlive the mandate", () => {
     await expect(w.service.createOrder(id)).rejects.toMatchObject({ code: "no_mandate" });
     expect(w.fake.calls.filter((c) => c.path === "/v2/checkout/orders" && c.status === 201)).toHaveLength(0);
     expect(w.service.get(id)!.status).toBe("priced");
-    expect(w.service.proposeMandate(id).status).toBe("proposed");
+    expect((await w.service.proposeMandate(id)).status).toBe("proposed");
   });
 
   it("an ambiguous failure may be retried with the same nonce before expiry, never after", async () => {
@@ -147,7 +147,7 @@ describe("finding 5: pending is not paid", () => {
 
   it("a PENDING refund is reserved but not counted until COMPLETED", async () => {
     const { w, id, token } = await paid();
-    w.service.offerRefund(token);
+    await w.service.offerRefund(token);
     w.fake.failNext({ method: "POST", path: /\/refund$/, status: 201, body: { id: "RPEND000000000001", status: "PENDING", amount: { currency_code: "EUR", value: "30.00" } } });
     const b = await w.service.refund(id);
     expect(b.refunded_minor).toBe(0);
@@ -164,7 +164,7 @@ describe("finding 5: pending is not paid", () => {
 describe("finding 6: a refund retry resends the same operation", () => {
   it("a lost reply is retried unchanged, whatever amount the second call asks", async () => {
     const { w, id, token } = await paid();
-    w.service.offerRefund(token);
+    await w.service.offerRefund(token);
     w.fake.failNext({ method: "POST", path: /\/refund$/, status: 0, dropResponse: true });
     w.fake.failNext({ method: "POST", path: /\/refund$/, status: 0, dropResponse: true });
     await expect(w.service.refund(id, "10.00")).rejects.toMatchObject({ kind: "network" });

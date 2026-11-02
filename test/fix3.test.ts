@@ -14,15 +14,15 @@ async function paidWithOffer() {
   const w = makeWorld();
   const { booking, operatorUrl } = w.service.requestQuote({ conversation_id: CONV, guide_id: "g_lantern", date: "2026-11-05", party_size: 2, activity: "hike" });
   const token = tokenOf(operatorUrl);
-  w.service.priceQuote(token, { total: "80", deposit: "30" });
-  w.service.proposeMandate(booking.id);
+  await w.service.priceQuote(token, { total: "80", deposit: "30" });
+  await w.service.proposeMandate(booking.id);
   const { code, mandate_id } = w.channels.inbox(CONV).at(-1)!;
-  w.service.approveMandate(mandate_id, code);
+  await w.service.approveMandate(mandate_id, code);
   w.fake.deliver = undefined;
   const b = await w.service.createOrder(booking.id);
   w.fake.approve(b.order_id!);
   await w.service.captureIfApproved(booking.id);
-  w.service.offerRefund(token);
+  await w.service.offerRefund(token);
   return { w, id: booking.id };
 }
 

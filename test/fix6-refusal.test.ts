@@ -48,8 +48,8 @@ describe("R2: the simulated-warning note only when that warning is the only woul
 
   it("simulated → the guide declines the move → refunded: asking again says the deposit was already refunded, with no note", async () => {
     const { w, id, token } = await simulatedAndPaid();
-    w.service.proposeReschedule(id, "2026-11-08");
-    w.service.answerReschedule(token, false);
+    await w.service.proposeReschedule(id, "2026-11-08");
+    await w.service.answerReschedule(token, false);
     expect((await w.service.refund(id)).status).toBe("refunded");
     const e = await refusal(w, id);
     expect(e.code).toBe("refund_not_allowed");
@@ -61,15 +61,15 @@ describe("R2: the simulated-warning note only when that warning is the only woul
   it("a refunded booking that never had a simulated warning says the same", async () => {
     const w = makeWorld();
     const { id, token } = await paid(w);
-    w.service.offerRefund(token);
+    await w.service.offerRefund(token);
     expect((await w.service.refund(id)).status).toBe("refunded");
     expect((await refusal(w, id)).message).toMatch(/deposit was already refunded/);
   });
 
   it("simulated → the guide accepts the move: the warning doesn't cover the new day, so no note", async () => {
     const { w, id, token } = await simulatedAndPaid();
-    w.service.proposeReschedule(id, "2026-11-08");
-    w.service.answerReschedule(token, true);
+    await w.service.proposeReschedule(id, "2026-11-08");
+    await w.service.answerReschedule(token, true);
     const e = await refusal(w, id);
     expect(e.message).toMatch(/needs a cyclone warning/);
     expect(e.message).not.toMatch(SUFFIX);

@@ -43,11 +43,11 @@ describe("R1: the refund's reason is derived again on the booking as it is after
     const { w, looked } = world(g);
     const { id, token } = await paid(w);
     alert(w, DATE); // a real orange warning on 11-05 only
-    w.service.proposeReschedule(id, MOVED);
+    await w.service.proposeReschedule(id, MOVED);
     g.arm();
     const refunding = w.service.refund(id);
     await g.entered; // the feed said 11-05 is covered; nothing is reserved yet
-    w.service.answerReschedule(token, true);
+    await w.service.answerReschedule(token, true);
     g.release();
     await expect(refunding).rejects.toMatchObject({ code: "refund_not_allowed" });
     expect(refundPosts(w)).toBe(0);
@@ -61,11 +61,11 @@ describe("R1: the refund's reason is derived again on the booking as it is after
     const { w, looked } = world(g);
     const { id, token } = await paid(w);
     alert(w, MOVED); // covers 11-05 to 11-08
-    w.service.proposeReschedule(id, MOVED);
+    await w.service.proposeReschedule(id, MOVED);
     g.arm();
     const refunding = w.service.refund(id);
     await g.entered;
-    w.service.answerReschedule(token, true);
+    await w.service.answerReschedule(token, true);
     g.release();
     expect(await refunding).toMatchObject({ status: "refunded", date: MOVED });
     expect(looked).toEqual([DATE, MOVED]);
@@ -79,18 +79,18 @@ describe("R1: the refund's reason is derived again on the booking as it is after
     const { w, looked } = world(first, second);
     const { id, token } = await paid(w);
     alert(w, MOVED_AGAIN); // covers 11-05 to 11-11
-    w.service.proposeReschedule(id, MOVED);
+    await w.service.proposeReschedule(id, MOVED);
     first.arm();
     const refunding = w.service.refund(id);
     await first.entered;
-    w.service.answerReschedule(token, true);
+    await w.service.answerReschedule(token, true);
     second.arm();
     first.release();
     // The lookup for 11-08 (fails fast, rather than timing out, if the refund settles without it).
     const next = await Promise.race([second.entered.then(() => "looked up again"), refunding.then(() => "refunded", () => "refused")]);
     expect(next).toBe("looked up again");
-    w.service.proposeReschedule(id, MOVED_AGAIN);
-    w.service.answerReschedule(token, true);
+    await w.service.proposeReschedule(id, MOVED_AGAIN);
+    await w.service.answerReschedule(token, true);
     second.release();
     const e = await refunding.then(
       () => undefined,
@@ -112,11 +112,11 @@ describe("R1: the refund's reason is derived again on the booking as it is after
     const { w } = world(g);
     const { id, token } = await paid(w);
     alert(w, DATE);
-    w.service.proposeReschedule(id, MOVED);
+    await w.service.proposeReschedule(id, MOVED);
     g.arm();
     const refunding = w.service.refund(id);
     await g.entered;
-    w.service.answerReschedule(token, false);
+    await w.service.answerReschedule(token, false);
     g.release();
     expect((await refunding).status).toBe("refunded");
     expect(w.ledger.list(id).find((e) => e.kind === "refund.requested")!.data).toMatchObject({ reason: "the guide declined the reschedule" });
@@ -145,7 +145,7 @@ describe("R1: the refund's reason is derived again on the booking as it is after
     const { id, token } = await paid(w);
     await expect(w.service.refund(id)).rejects.toMatchObject({ code: "refund_not_allowed" });
     expect(looked).toEqual([DATE]);
-    w.service.offerRefund(token);
+    await w.service.offerRefund(token);
     expect((await w.service.refund(id, "10.00")).status).toBe("partially_refunded");
     expect(looked).toEqual([DATE]);
     expect(w.ledger.list(id).find((e) => e.kind === "refund.requested")!.data).toMatchObject({ reason: "the guide offered it" });
