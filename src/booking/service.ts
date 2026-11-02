@@ -658,6 +658,15 @@ export class BookingService {
       this.#log(next, "capture.reconcile_failed", { order_id: order.id, capture_id: cap.id, status: cap.status, amount: cap.amount, expected: m.amount, problem: after ?? "capture amount differs from the mandate" });
       return { booking: next, captured: false, order_status: order.status, capture_status: cap.status };
     }
+    // Not yet recorded as paid, but PayPal already reports the capture refunded (in part or in full): it was
+    // refunded outside this service before we saw it paid. Held for review, never announced as paid (R8-5).
+    // The only caller, #captureNow, returns early once a booking is captured, so every reconcile that gets
+    // here is a first one; the `!b.captured` guard keeps a later one (of a capture we refunded) as it was.
+    if (!b.captured && (cap.status === "REFUNDED" || cap.status === "PARTIALLY_REFUNDED")) {
+      const next = this.#save({ ...b, status: "needs_review", capture_id: cap.id, capture_status: cap.status });
+      this.#log(next, "capture.reconcile_failed", { order_id: order.id, capture_id: cap.id, status: cap.status, amount: cap.amount, expected: m.amount, problem: `the capture was already refunded at PayPal (${cap.status}) before it was recorded as paid` });
+      return { booking: next, captured: false, order_status: order.status, capture_status: cap.status };
+    }
     if (cap.status === "COMPLETED" || cap.status === "PARTIALLY_REFUNDED" || cap.status === "REFUNDED") {
       const next = this.#save({ ...b, status: "captured", capture_id: cap.id, capture_status: cap.status, captured: cap.amount });
       this.#log(next, "capture.completed", { order_id: order.id, capture_id: cap.id, status: cap.status, amount: cap.amount, payee: order.purchase_units?.[0]?.payee, payer_id: order.payer?.payer_id });
