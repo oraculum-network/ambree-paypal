@@ -337,4 +337,20 @@ describe("money and errors", () => {
     expect(b.summary()).toBe("POST /x · HTTP 422 · ORDER_NOT_APPROVED · debug_id d1");
     expect(errorFromBody(502, "GET /y", undefined).message).toBe("GET /y: HTTP 502");
   });
+
+  it("keeps every issue name from the details, first one still in `issue`", () => {
+    const e = errorFromBody(422, "POST /v2/payments/captures/{id}/refund", {
+      name: "UNPROCESSABLE_ENTITY",
+      debug_id: "d2",
+      details: [{ issue: "CAPTURE_FULLY_REFUNDED", description: "a" }, { description: "no issue here" }, { issue: 7 }, { issue: "REFUND_AMOUNT_EXCEEDED", description: "b" }],
+    });
+    expect(e.issue).toBe("CAPTURE_FULLY_REFUNDED");
+    expect(e.issues).toEqual(["CAPTURE_FULLY_REFUNDED", "REFUND_AMOUNT_EXCEEDED"]);
+    expect(e.summary()).toBe("POST /v2/payments/captures/{id}/refund · HTTP 422 · CAPTURE_FULLY_REFUNDED · debug_id d2");
+    expect(errorFromBody(502, "GET /y", undefined).issues).toEqual([]);
+    const many = errorFromBody(400, "POST /z", { details: Array.from({ length: 30 }, (_, i) => ({ issue: `ISSUE_${i}` })) });
+    expect(many.issues).toHaveLength(10);
+    expect(new PayPalError({ kind: "http", status: 422, call: "POST /q", issue: "ONE", message: "x" }).issues).toEqual(["ONE"]);
+    expect(new PayPalError({ kind: "http", status: 502, call: "POST /q", issue: "ONE", message: "x" }).maybeDeliveredCopy().issues).toEqual(["ONE"]);
+  });
 });
