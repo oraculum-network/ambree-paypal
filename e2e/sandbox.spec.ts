@@ -84,3 +84,42 @@ test("sandbox mode: Demo controls show; pay, then simulated cyclone → reschedu
   await expect(page.locator("#transcript li")).toHaveCount(0);
   await expect(simulate).toBeDisabled();
 });
+
+// Round 6 (R4): the guide offers a refund instead of answering the move. The refund closes the move still
+// waiting for the guide: the traveller's card says it was withdrawn because the deposit was refunded.
+test("sandbox mode: a move still waiting when the deposit is refunded shows as withdrawn", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "Start over" }).click();
+  await page.getByLabel("Message").fill("Find me a hiking guide for Le Morne on Thursday and hold the spot");
+  await page.getByRole("button", { name: "Send" }).click();
+  await expect(page.locator("#transcript li.ambree").last()).toContainText("asked them for a price for 2026-11-05");
+  const link = (await page.getByTestId("operator-link").first().getAttribute("href"))!;
+  const guide = await page.context().newPage();
+  await guide.goto(link);
+  await guide.getByLabel("Total for the group (EUR)").fill("80");
+  await guide.getByLabel("Deposit to hold the spot (EUR)").fill("30");
+  await guide.getByRole("button", { name: "Send price" }).click();
+  await expect(page.getByTestId("approval-card")).toBeVisible();
+  const code = (await page.getByTestId("inbox-msg").last().innerText()).match(/\b(\d{6})\b/)![1]!;
+  await page.getByTestId("code").fill(code);
+  await page.getByTestId("approve").click();
+  await page.getByTestId("pay").click();
+  await expect(page.getByTestId("booking-status")).toHaveText("captured");
+
+  await page.getByRole("button", { name: "Simulate a cyclone warning (demo)" }).click();
+  await expect(page.locator("#transcript")).toContainText("move the trip to 2026-11-08");
+  await expect(page.getByTestId("reschedule")).toHaveText("Reschedule to 2026-11-08: proposed");
+
+  await guide.goto(link);
+  await expect(guide.getByRole("heading", { name: "Move the trip?" })).toBeVisible();
+  await guide.getByRole("button", { name: "Offer the traveller a refund" }).click();
+  await expect(guide.getByRole("status")).toContainText("Refund offered");
+
+  await expect(page.getByTestId("booking-status")).toHaveText("refunded");
+  await expect(page.getByTestId("refunded")).toContainText("EUR 30.00");
+  await expect(page.getByTestId("reschedule")).toHaveText("Reschedule to 2026-11-08: withdrawn, because the deposit was refunded.");
+  await expect(page.locator('#ledger li[data-kind="reschedule.withdrawn"]')).toHaveCount(1);
+  await expect(page.locator("#chain")).toContainText("Chain OK");
+  await guide.goto(link);
+  await expect(guide.getByRole("heading", { name: "Move the trip?" })).toHaveCount(0);
+});

@@ -22,6 +22,18 @@ export function paymentLine(b) {
 }
 
 /**
+ * The card's line for a move the agent proposed. "withdrawn": the deposit was fully refunded before the
+ * guide answered, so the move was closed (the guide's page no longer asks).
+ * @returns {{ testid: string, text: string } | null}
+ */
+export function rescheduleLine(b) {
+  const r = b.reschedule;
+  if (!r) return null;
+  if (r.status === "withdrawn") return { testid: "reschedule", text: `Reschedule to ${r.new_date}: withdrawn, because the deposit was refunded.` };
+  return { testid: "reschedule", text: `Reschedule to ${r.new_date}: ${r.status}` };
+}
+
+/**
  * What the Demo controls show in each PayPal mode. The controls (simulate a cyclone warning, Start over)
  * show in fake and sandbox mode. The guide's balance only with the fake: it is the fake's own bookkeeping,
  * and in sandbox mode the guide's balance lives in PayPal's sandbox dashboard. Live mode never runs.

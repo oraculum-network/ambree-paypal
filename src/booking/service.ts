@@ -68,7 +68,8 @@ export interface Booking {
   refunded_minor: number;
   refund_ids: string[];
   refund_ops: RefundOp[];
-  reschedule?: { new_date: string; status: "proposed" | "accepted" | "declined" };
+  /** `withdrawn`: the deposit was fully refunded while the guide hadn't answered (added in round 6; additive). */
+  reschedule?: { new_date: string; status: "proposed" | "accepted" | "declined" | "withdrawn" };
   refund_offered: boolean;
   /**
    * The demo control's simulated cyclone warning (source "simulated") for this booking only, set once. It
@@ -854,8 +855,13 @@ export class BookingService {
       // Another operation in review keeps the whole booking in review: a later success never clears it.
       const inReview = b.refund_ops.some((o) => o.n !== n && o.status === "needs_review");
       const status: BookingStatus = inReview ? "needs_review" : refunded >= capturedMinor ? "refunded" : "partially_refunded";
-      const next = this.#setOp({ ...b, refunded_minor: refunded, refund_ids: [...b.refund_ids, refund.id], status }, n, { status: "completed", refund_id: refund.id, amount_minor: actual });
+      // A full refund closes a move still waiting for the guide (it can't be answered any more): withdrawn
+      // in the same save, and logged after the refund.
+      const pendingMove = status === "refunded" && b.reschedule?.status === "proposed" ? b.reschedule : undefined;
+      const closed = pendingMove ? { reschedule: { new_date: pendingMove.new_date, status: "withdrawn" as const } } : {};
+      const next = this.#setOp({ ...b, refunded_minor: refunded, refund_ids: [...b.refund_ids, refund.id], status, ...closed }, n, { status: "completed", refund_id: refund.id, amount_minor: actual });
       this.#log(next, "refund.completed", { n, refund_id: refund.id, status: refund.status, amount: { currency_code: cur, value: fromMinor(actual) }, reason: op.reason });
+      if (pendingMove) this.#log(next, "reschedule.withdrawn", { from: b.date, to: pendingMove.new_date, reason: "the deposit was refunded" });
       this.#d.channels.emit(b.conversation_id, { type: "refunded", booking_id: b.id, text: `Refunded ${cur} ${fromMinor(actual)} from ${b.guide_name} to the traveller (${op.reason}).` });
       return next;
     }

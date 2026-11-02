@@ -362,7 +362,8 @@ describe("F3: a reschedule can be answered only while the booking is captured", 
     expect(() => w.service.answerReschedule(token, true)).toThrow(ServiceError);
     expect(() => w.service.answerReschedule(token, false)).toThrow(ServiceError);
     expect(w.service.get(id)).toMatchObject({ date: DATE, status: "refunded", reschedule: before.reschedule });
-    expect(kinds(w, id).filter((k) => k.startsWith("reschedule.") && k !== "reschedule.proposed")).toEqual([]);
+    // No answer was recorded. (Since round 6 the full refund itself withdraws the waiting move: fix6-withdrawn.)
+    expect(kinds(w, id).filter((k) => k.startsWith("reschedule.") && k !== "reschedule.proposed")).toEqual(["reschedule.withdrawn"]);
     expect(renderOperatorPage(token, w.service.get(id)!)).not.toContain("Move the trip?");
     expect(applyOperatorAction(w.service, token, new URLSearchParams({ action: "accept_reschedule" })).ok).toBe(false);
   });
