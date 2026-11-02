@@ -116,6 +116,8 @@ webhook_events(event_id PRIMARY KEY, event_type, received_at)                   
   A definitive create failure goes back to `priced`. `needs_review` (the order or capture doesn't match
   the mandate) and `capture_failed` stop the money steps.
   `declined` (the guide said no) and `cancelled` are terminal. A reschedule keeps the status and changes `date`.
+- **Reschedule:** `proposed → accepted | declined`, or `withdrawn` when a full refund completes before the
+  guide answered (§15). It can be answered only while the booking is `captured` and no refund has started.
 - **Quote** (frozen once priced): `{booking_id, guide_id, guide_name, activity, area, date, party_size,
   total{currency_code,value}, deposit{currency_code,value}, payee, guide_note, priced_at}`. The **quote hash** is
   sha256 hex of the canonical JSON: keys sorted, no whitespace, strings NFC.
@@ -470,3 +472,30 @@ GDACS warnings can't be triggered on demand.
     (`isJsonRequest` in `src/app.ts`), so "Application/JSON" is read, not dropped.
   - `test/fix5-review.test.ts` covers the review's findings, with deterministic races: a gate holds one
     PayPal reply (or feed lookup) while the test changes the booking.
+
+## 15. Round 6: the refund reason, its refusal, and a move during a refund (2 Nov)
+
+Four findings from the independent reviewers, each with a test that failed at 09d7db8
+(`test/fix6-*.test.ts`; the races are deterministic, held by `test/helpers/race.ts`'s gate):
+
+- **R1, the reason holds on the booking it reserves on** (`refund` → `#reasonNow`). The status, the guide's
+  offer and a declined reschedule are read on the booking as stored after the weather feed answered. A feed
+  warning counts only if that booking's date is still the date that was looked up. A date the guide moved
+  meanwhile is looked up once more; a second move answers `date_changed` (retryable, nothing reserved or
+  sent). `refundReason(b)` keeps its contract (`check_weather`'s `refund_allowed`).
+- **R2, each refusal says why.** The simulated-warning note ("doesn't allow a refund by itself") appears only
+  when that warning is the only would-be reason: the booking is `captured` or `partially_refunded`, the
+  warning covers its date, and there is no offer and no declined reschedule. A `refunded` booking is told
+  the deposit was already refunded; an unpaid or held booking's refusal names its status. The code stays
+  `refund_not_allowed`.
+- **R3, no move during a refund.** A refund being sent or pending leaves the booking `captured` until PayPal
+  answers. `answerReschedule` refuses (`wrong_state`), and the guide's page hides "Move the trip?", while any
+  refund operation is in a status other than `failed` (`refundStarted`, `rescheduleAnswerable`).
+- **R4, a full refund withdraws a waiting move.** In `#applyRefund` (so from `refund` and `refreshRefunds`), a
+  refund that makes the booking `refunded` turns a `proposed` reschedule into `withdrawn` in the same save
+  and logs `reschedule.withdrawn` (`from`, `to`, `reason: "the deposit was refunded"`) after
+  `refund.completed`. The traveller's card says "withdrawn, because the deposit was refunded"
+  (`labels.js` `rescheduleLine`). A partial refund leaves the move `proposed`. The status is additive and the
+  field optional, so `SCHEMA_VERSION` stays 2.
+- **Fake mode:** unchanged in behaviour. Its demo-feed raise is a feed warning (rule (a)); R1–R4 apply in
+  every mode, and its e2e refund path declines the move before the refund, so nothing is withdrawn there.
