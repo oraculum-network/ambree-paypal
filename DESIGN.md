@@ -104,7 +104,10 @@ Partial refunds are allowed. The agent cannot refund for any other reason; it ca
 guides(id, name, area, activities[], languages[], bio, payee{email_address|merchant_id}, currency)      -- seed, in code
 bookings(id, conversation_id, guide_id, activity, area, date, party_size, status,
          operator_token_hash, quote?, quote_hash?, mandate_id?, order_id?, approve_url?, capture_id?,
-         captured{currency_code,value}?, refunded_minor, reschedule?{new_date,status,n?}, refund_offered,
+         captured{currency_code,value}?, refunded_minor, refund_ids[], reschedule?{new_date,status,n?}, refund_offered,
+         refund_ops[{n, request_id, amount_minor, full, reason,
+                     status: sending|pending|completed|failed|needs_review, refund_id?,
+                     maybe_sent?, review_cause?: unknown|mismatch|already_refunded, acknowledged?}],   -- §18
          created_at, updated_at)                                                                         -- records table, JSON
 mandates(id, booking_id, amount{currency_code,value}, payee, quote_hash, nonce, expires_at,
          step_up_hash, attempts, status: proposed|approved|used|expired|locked)                          -- records table, JSON
@@ -114,7 +117,9 @@ webhook_events(event_id PRIMARY KEY, event_type, received_at)                   
 
 - **Booking status:** `requested → priced → mandate_proposed → mandate_approved → order_created → (capture_pending →) captured → (refunded | partially_refunded)`.
   A definitive create failure goes back to `priced`. `needs_review` (the order or capture doesn't match
-  the mandate) and `capture_failed` stop the money steps.
+  the mandate, a capture PayPal already reports refunded before it was recorded as paid, or a refund held
+  for review) and `capture_failed` stop the money steps. Only a refund held because its outcome was unknown
+  ever leaves review, when its own webhook settles it (§18).
   `declined` (the guide said no) and `cancelled` are terminal. A reschedule keeps the status and changes `date`.
 - **Reschedule:** `proposed → accepted | declined`, or `withdrawn` when a refund (part or all of the deposit,
   §15, §16) completes before the guide answered. It can be proposed and answered only while the booking is
@@ -197,14 +202,14 @@ only on network errors or 5xx, and only for calls that carry a `PayPal-Request-I
 |---|---|---|---|
 | `search_guides` | `area?`, `activity?`, `date?`, `language?` | Lists seed guides that match | no |
 | `request_quote` | `guide_id`, `date`, `party_size`, `activity`, `note?` | Creates a booking and an operator link; the guide is "notified" | no |
-| `get_booking` | `booking_id` | Status, quote, mandate state, order and capture ids, refunds (done, pending, in review), the reschedule and, when the guide can't answer it now, why (`reschedule_hold`, §17) | no |
+| `get_booking` | `booking_id` | Reads every pending refund from PayPal first (§18 I4), then: status, quote, mandate state, order and capture ids, refunds (done, pending, in review and why), the reschedule and, when the guide can't answer it now, why (`reschedule_hold`, §17) | no |
 | `propose_mandate` | `booking_id` | Builds the mandate from the frozen quote; the step-up code goes to the traveller channel only | no |
 | `create_order` | `booking_id` | **Only** with an approved, unexpired, unused mandate whose quote hash, amount and payee match. Creates the order with payee = the guide; returns the approve link | prepares a payment |
 | `get_order` | `booking_id` | `GET /v2/checkout/orders/{id}` | no |
 | `capture_order` | `booking_id` | Idempotent capture, only once the order is APPROVED | yes (traveller → guide) |
 | `check_weather` | `booking_id` | Cyclone alerts for the booking date and a plain explanation | no |
 | `propose_reschedule` | `booking_id`, `new_date` | Asks the guide on the operator page; refused once a refund has started (§16) | no |
-| `refund_payment` | `booking_id`, `amount?` | Only when the policy (§2.2) allows; partial or full | yes (guide → traveller) |
+| `refund_payment` | `booking_id`, `amount?` | Only when the policy (§2.2) allows; partial or full. No definitive answer: `refund_unconfirmed` (it may have gone through; calling again resends the same refund). An earlier refund PayPal confirmed since is reported (`acknowledged`) and nothing is sent (§18) | yes (guide → traveller) |
 
 **PayPal Agent Toolkit plug-in point.**
 - `src/paypal/api.ts` defines `PaymentsApi`: `createOrder`, `getOrder`, `captureOrder`, `refundCapture`, `getRefund`, `verifyWebhookSignature`.
@@ -568,12 +573,14 @@ Five findings from the independent reviewers, each with a test that failed at 77
   `sending` (at most one is), the refund is read back by GET (nothing is sent, so nothing can be refunded
   twice), logged `refund.recovered`, and recorded on that operation by `#applyRefund` (which fails closed on
   another amount or currency, and withdraws a waiting move on completion). Only COMPLETED or PENDING is
-  recorded; a failed refund that can't be tied to the operation leaves it `sending`. A GET that fails
-  answers 500, so PayPal redelivers. And a resend (the operation was already `sending`) that PayPal refuses
-  outright no longer frees the reservation: the first send may have refunded (a request id no longer
-  deduped is answered e.g. 422 `CAPTURE_FULLY_REFUNDED`), so the operation and the booking go to
+  recorded; a failed refund that can't be tied to the operation leaves it `sending` (superseded in round 9,
+  §18 I2: a FAILED or CANCELLED one of the operation's amount fails it and frees the deposit). A GET that
+  fails answers 500, so PayPal redelivers. And a resend (the operation was already `sending`) that PayPal
+  refuses outright no longer frees the reservation: the first send may have refunded (a request id no
+  longer deduped is answered e.g. 422 `CAPTURE_FULLY_REFUNDED`), so the operation and the booking go to
   `needs_review` (`refund.resend_refused`; the caller gets `refund_under_review`). A first send refused
-  outright is `failed` as before. **UNVERIFIED** (spike): that the refund resource in PayPal's refund
+  outright is `failed` as before (superseded in round 9, §18 I1: not when an attempt of it may have reached
+  PayPal inside the client, nor when PayPal says the money already moved; and such a hold can now clear). **UNVERIFIED** (spike): that the refund resource in PayPal's refund
   webhooks carries the `custom_id` we send. Without it a refund with no known id finds no booking, and the
   event completes unused as before (the next `refund_payment` still resends the operation).
 - **D4, a held move says what it waits on** (`fix8-hold`). A move proposed before a refund started stays
@@ -594,3 +601,125 @@ Five findings from the independent reviewers, each with a test that failed at 77
 - **Earlier tests** that posted a bare `{action: accept/decline_reschedule}` post what the page's form posts
   (the proposal key; read from the page in the HTTP tests). `SCHEMA_VERSION` stays 2: `reschedule.n` is
   optional.
+
+## 18. Round 9: a refund whose outcome is unknown ends the same in every order (2 Nov)
+
+R8-1 to R8-4 were one defect. A refund operation whose outcome is **unknown** (an attempt may have reached
+PayPal, but no definitive reply came back) was resolved by whichever signal came first: the reply to the
+client's own retry inside `PayPalRestClient`, the refund's webhook, or the agent's next `refund_payment`.
+Round 8 handled one order; the reviewers found four more:
+
+- **R8-1:** a PENDING refund whose reply was lost, then failed at PayPal. Its `PAYMENT.REFUND.FAILED` was
+  dropped (only COMPLETED or PENDING was recorded). The resend then got PayPal's replayed PENDING reply, and
+  nothing ever read it again, so the booking stayed "refund under way" for good.
+- **R8-2:** attempt 1 refunded and lost its reply (a network error or a 5xx); the client's retry was refused
+  422. The service saw only that 422 and released the reservation (`failed`), so the booking said nothing
+  was refunded while the guide's balance was 0. In the partial case a second refund went out.
+- **R8-3:** the webhook recorded a lost-reply partial refund, and then the agent's retry of the same 10.00
+  reserved a second operation and refunded again.
+- **R8-4:** the resend was refused before the webhook arrived, so the booking was held for review, and the
+  webhook that would settle it was then ignored. That hold never cleared.
+
+The code now keeps four invariants whatever the order.
+
+- **I1, maybe-delivered is sticky.** `PayPalError.maybeDelivered` (`src/paypal/errors.ts`) is set by the
+  client when this call, or any earlier attempt of it inside `#api`'s retry, ended in a network error, a
+  timeout or a 5xx (`src/paypal/client.ts` `#api`: a local flag set before each retry, copied onto the error
+  the call ends with). A 2xx reply that couldn't be read sets it too: PayPal acted on the request. A 401 the
+  client refreshes past does not. In `refundPayment`'s catch the first statement saves `op.maybe_sent = true`
+  when the error isn't a plain refusal or carries `maybeDelivered`. `#reserveRefund` saves it before a
+  resend, since a `sending` operation's earlier send may have arrived. A definitive refusal of a `maybe_sent`
+  operation then holds the operation and the booking for review with the reservation kept
+  (`review_cause: "unknown"`; `refund.resend_refused` on a resend, `refund.retry_refused` when the client's
+  own retry was refused). A first send refused with `CAPTURE_FULLY_REFUNDED` or `REFUND_AMOUNT_EXCEEDED`
+  (the refund issues the repo models that say money already moved) is held too (`review_cause:
+  "already_refunded"`, `refund.already_refunded`), not failed. That hold never clears: the refusal wasn't
+  this operation's own outcome. It is also the safety net for a `PaymentsApi` adapter that can't report
+  `maybeDelivered`, such as an Agent Toolkit adapter (§6). Any other first-send refusal is `failed` as
+  before.
+- **I2, evidence resolves the unknown operation.** `unknownOps(b)` holds the operations whose outcome is
+  unknown: `sending`, or `needs_review` with `review_cause: "unknown"`. `assertOneUnknown` keeps it to at
+  most one. It runs in `#reserveRefund` before anything is decided or sent, in `#setOp`, on every save in
+  `#applyRefund`, and in `unknownOp`; a booking that breaks it (only a writer outside the service could) is
+  refused with an internal error and nothing is sent. A refund webhook (`PAYMENT.CAPTURE.REFUNDED` or any
+  `PAYMENT.REFUND.*`, any status) runs `#refreshNow` (the strict one) and then `#resolveUnknownNow`. When the
+  event's refund is new to the booking and names it (`custom_id`), the refund is read back by GET. If the GET
+  reply names the booking too (or names none) and carries the operation's amount and currency, it settles
+  the operation through `#applyRefund`: COMPLETED becomes completed, PENDING becomes pending, FAILED or
+  CANCELLED becomes failed and frees the reservation (`refund.recovered`, `from: sending | needs_review`).
+  A COMPLETED or PENDING refund of another amount still holds the operation for good (`review_cause:
+  "mismatch"`, `refund.reconcile_failed`), as before. A FAILED or CANCELLED refund of another amount moved no
+  money and isn't this operation's. It is logged (`refund.evidence_unmatched`), and the operation stays
+  unknown and reserved. Holding a booking for good over a refund that moved nothing would be new behaviour,
+  so this reading of "a mismatch holds for review" is the CTO's to confirm. `#applyRefund` now derives the
+  booking's status from its refunds (`statusFromRefunds`: any operation in review means `needs_review`;
+  otherwise `refunded`, `partially_refunded` or `captured` by what was refunded). So a booking held only by
+  an unknown outcome leaves review once that is settled, and a waiting move is withdrawn if money came back
+  (§16 S2). A mismatch or an already-refunded hold keeps the booking in review. So does a capture or order
+  hold: a booking in review with no refund operation in review is never touched (`heldElsewhere`). An
+  operation held before round 9 has no `review_cause` and counts as `mismatch` (fail closed).
+- **I3, one intended refund, one operation.** When `#applyRefund` settles an operation from evidence it
+  sets `acknowledged: false`, because the `refund_payment` call that sent it never heard the answer. In
+  `#reserveRefund`, after the review check and the resend of a `sending` operation, such an operation is
+  acknowledged (`true`, logged `refund.acknowledged`). If it is completed or pending, the call returns it and
+  sends nothing (`refundPayment` returns `{ booking, acknowledged }`, and `refund()` returns the booking). If
+  it failed, the call goes on to reserve a new operation as usual. Any amount the agent asks for on that call
+  is ignored, as for a resend: after a call that ended without an answer, the next call is its retry. The
+  `refund_payment` tool turns a non-definitive PayPalError into `refund_unconfirmed`: "PayPal gave no
+  definitive answer (...), so the refund may have gone through. Calling refund_payment again resends the
+  same refund and never refunds twice; get_booking shows the current state." An acknowledged call's result
+  carries `acknowledged {n, status, amount}` and a `note` that nothing new was sent. The tool's description
+  and the system prompt carry the same rule. One call made after a definitive answer is a new request. That
+  includes two MCP calls for the same refund sent at once, if the first is answered: the second runs after
+  it on the booking's queue.
+- **I4, GET is truth, the webhook a hint.** `refundPayment` runs `#refreshNow(id, { lenient: true })` first,
+  inside its queued step, and `get_booking` calls the queued `refreshRefunds` (lenient too). Both read every
+  `pending` operation by GET before anything is decided, so a refund whose terminal webhook was lost or
+  already consumed still settles (R8-1's end state can't stick). A lenient GET that fails skips that
+  operation and changes nothing; `get_booking` then returns the stored state. The webhook's refresh stays
+  strict: a failed GET answers 500 and PayPal redelivers. The operator page and `/api/state` never call
+  PayPal.
+
+Also, regardless of severity:
+
+- **R8-5:** `#reconcileCapture` holds a capture that PayPal already reports `REFUNDED` or
+  `PARTIALLY_REFUNDED` on a booking not yet captured. It goes to `needs_review` (`capture.reconcile_failed`,
+  problem "the capture was already refunded at PayPal (...) before it was recorded as paid"), with no `paid`
+  event. Its only caller, `#captureNow`, returns early once a booking is captured, so every reconcile that
+  gets that far is a first one. The `!b.captured` guard keeps a later read of a capture we refunded ourselves
+  as it was.
+- **R8-6:** the scripted model's `refundReply` (`src/agent/scripted.ts`) says "Done: ... refunded" only for
+  a refunded or partially refunded booking. A refund pending at PayPal says it is pending, a booking in
+  review says the refund is held for review, and an acknowledged earlier refund says it went through (or is
+  pending) and that nothing new was sent. A `refund_unconfirmed` error reads "I couldn't confirm the refund
+  yet".
+- **The card:** `labels.js` `refundLine` adds "Refund under way: {amount} back to you from {guide}; PayPal
+  hasn't confirmed it yet." (`refund-pending`) while `summary().refund_pending` is set, next to "Paid".
+  `summary()` adds `refund_review_cause` (`unknown`, `mismatch` or `already_refunded`). `paymentLine` says
+  that a refund held only for an unknown outcome "may have gone through" and may still be settled by
+  PayPal's notice, not that a reply didn't match.
+
+**Tests** (`test/fix9-*.test.ts`). `fix9-outcome` reproduces R8-1 to R8-6 and the card line and pins each
+invariant; 30 of its 34 tests failed at 11fd5fc. `fix9-matrix` is the ordering matrix: a full or
+10.00-of-30.00 refund whose first attempt lost its reply, and three things PayPal may have done with it
+(completed it at once; created it PENDING, then completed it; created it PENDING, then failed it, at the
+moment its webhook is sent). The client's own retry is answered with a replayed 201, a 422
+`CAPTURE_FULLY_REFUNDED`, or lost too. Then every arrival order is tried of that reply, the webhook, the
+agent's resend and a `get_booking`: 24 orders, or 6 without the resend after a 201, which answered the
+call. The retry's reply is held at the fake until its turn, so the others can arrive before it and queue.
+It asserts, at every step, at most one unknown operation. At the end it asserts: what PayPal refunded equals
+`refunded_minor` plus the amounts held for review (and nothing is held once the refund's own webhook
+arrived); PayPal refunded either nothing or the intended amount, with a second operation only after the
+first failed; nothing is left pending, sending or held; the status and the waiting move follow the money.
+144 of its 324 cases failed at 11fd5fc: R8-2 96, R8-1 24, R8-3 24. The fake gained a refund that is PENDING
+and settles later (`pendNextRefund`, `settleRefund`), a 5xx after processing (`dropResponse` with a 5xx),
+and a held reply (`wait`, `pass`). **Earlier test whose meaning changed:** `fix8-lostreply`'s first D3 case:
+the `refund_payment` after the webhook recorded the lost-reply refund now reports it (`acknowledged`)
+instead of being refused, and the call after that is refused as nothing left. `SCHEMA_VERSION` stays 2:
+every new field is optional.
+
+**UNVERIFIED** (spike): that PayPal answers a repeated `PayPal-Request-Id` with the first reply (the fake
+does, so R8-1's stale PENDING replay is modelled on it); that the refund resource in refund webhooks, and in
+`GET /v2/payments/refunds/{id}`, carries the `custom_id` we send (without it, no booking is found and the
+event completes unused, so the next `refund_payment` still resends); and the names of PayPal's refund
+webhooks beyond `PAYMENT.CAPTURE.REFUNDED` (the handler takes any `PAYMENT.REFUND.*`).
