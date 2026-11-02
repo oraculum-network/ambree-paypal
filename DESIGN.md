@@ -793,6 +793,10 @@ GET that names another booking or capture is ignored. Then, on the booking as st
 - **Another refund id.** `#applyRefund` also holds as a mismatch an answer that names a different refund id from
   the one its operation recorded (a GET of a pending refund). The service never applies one otherwise, so this
   check is defensive.
+- **Kept by their `webhook.*` row only.** Two refund events change nothing but leave the event's own ledger row.
+  One is for a booking never recorded as paid (`captured` unset): for instance one held under R8-5 because PayPal
+  already reported its capture refunded, which is in review already. The other is a resource that contradicts
+  itself (its `custom_id` is this booking's, but its `up` link names another capture).
 
 **F1, PayPal's total refunded.** This depends on an UNVERIFIED premise: that the refund reply and the GET carry
 `seller_payable_breakdown.total_refunded_amount`, and that it is the capture's running total of completed
