@@ -266,23 +266,23 @@ only on network errors or 5xx, and only for calls that carry a `PayPal-Request-I
 5. Watch the ledger, and press "verify chain".
 6. Press "raise cyclone" (demo control), follow Ambree's reschedule, decline it as the guide, and see the refund.
 
-## 10. Deploy shape (the CTO writes the infra later)
+## 10. Deploy shape (as hosted; the steps are in DEPLOY.md)
 
 - **Image:** `paypal.ambree.ai`, its own namespace `paypal` on the Oracle k3s host, as `qloo` did.
   - Image `oraculum/ambree-paypal:<sha7>`, built on the host, `imagePullPolicy: Never`.
   - Traefik Ingress with a Let's Encrypt certificate.
-  - Runs as user `node` with a read-only root filesystem, plus one writable `emptyDir` (or a small PVC, see below)
-    at `/data` for the SQLite file.
-- **Secret:** `paypal/paypal-sandbox` holds `PAYPAL_CLIENT_ID`, `PAYPAL_CLIENT_SECRET` and `PAYPAL_WEBHOOK_ID`.
-  Secret `paypal/llm` holds `LLM_API_KEY`. Both are `optional: true`; with no Secret the pod runs the fake and the
-  scripted model.
+  - Runs as user `node` with a read-only root filesystem; the only writable path is `/data`, the PVC `paypal-data`
+    (64Mi, `local-path`, made by the admin), which holds the SQLite file. One replica, `Recreate`.
+- **Secret:** `paypal/paypal-secrets`, made by hand, holds `PAYPAL_CLIENT_ID`, `PAYPAL_CLIENT_SECRET`,
+  `PAYPAL_WEBHOOK_ID`, `LLM_API_KEY` and `MCP_DEMO_PASSCODE`. Every key is required (no `optional`), so the pod
+  doesn't start without it; there is no fake-PayPal fallback on the host. The merchant ids, `LLM_BASE_URL` and
+  `LLM_MODEL` are plain values in the Deployment.
 - **Network:** egress on TCP 443 only; the target hosts are `api-m.sandbox.paypal.com` and the LLM host. A
   NetworkPolicy can't name hosts, so this uses the same form as alexa/qloo.
-- **Data:** the ledger must survive restarts until 15 Dec, so a PVC (**TODO-CHECK** that the host has a local-path
-  provisioner) or a hostPath. If neither exists, use `emptyDir` and accept a reset on restart.
+- **Data:** the ledger survives restarts until 15 Dec on the PVC.
 - **Webhook:** set up in the sandbox app for `https://paypal.ambree.ai/webhooks/paypal`. Its id goes into the Secret.
-- **New env names** (added after the review): `PAYPAL_OPERATOR_EMAIL` and/or `PAYPAL_OPERATOR_MERCHANT_ID`
-  (required in sandbox mode), and `MCP_DEMO_PASSCODE` (optional; without it MCP is off).
+- **New env names** (added after the review): `PAYPAL_OPERATOR_MERCHANT_ID` (required in sandbox mode; the
+  `*_EMAIL` variables are refused) and `MCP_DEMO_PASSCODE` (optional; without it MCP is off).
 
 ## 11. After the review (fix phase, 31 Oct)
 
