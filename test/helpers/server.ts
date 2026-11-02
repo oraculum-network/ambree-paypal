@@ -1,17 +1,19 @@
 // Starts the real HTTP app on a free port with captured logs, and a tiny cookie-keeping client.
 
-import { type App, createApp } from "../../src/app.ts";
+import { type App, type AppOptions, createApp } from "../../src/app.ts";
 import { loadConfig } from "../../src/config.ts";
 
-export async function startApp(env: Record<string, string> = {}) {
+/** `options` reach createApp as they are (e.g. `paypalFetch` for a sandbox-mode app with no network). */
+export async function startApp(env: Record<string, string> = {}, options: Omit<AppOptions, "config"> = {}) {
   const probe = createApp({ config: loadConfig({ PORT: "0", HOST: "127.0.0.1" }) });
   const port = await probe.listen();
   await probe.close();
   const logs: Array<Record<string, unknown>> = [];
   const app: App = createApp({
-    config: loadConfig({ PORT: String(port), HOST: "127.0.0.1", PUBLIC_URL: `http://127.0.0.1:${port}`, ...env }),
     today: () => "2026-11-03",
     logger: (f) => void logs.push(f),
+    ...options,
+    config: loadConfig({ PORT: String(port), HOST: "127.0.0.1", PUBLIC_URL: `http://127.0.0.1:${port}`, ...env }),
   });
   await app.listen();
   return { app, base: `http://127.0.0.1:${port}`, logs };

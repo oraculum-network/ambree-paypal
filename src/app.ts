@@ -53,6 +53,11 @@ export interface AppOptions {
   today?: () => string;
   /** Fake mode only: the merchant id the fake PayPal reports as the REST app's owner (tests). */
   fakeOwnerMerchantId?: string;
+  /**
+   * Tests only, sandbox mode only: the fetch the PayPal REST client uses (a stub, or FakePayPal.fetch), so
+   * sandbox-mode routes run with no network. The client still refuses any base URL but the sandbox's.
+   */
+  paypalFetch?: typeof fetch;
 }
 
 export interface App {
@@ -138,7 +143,7 @@ export function createApp(opts: AppOptions): App {
     };
     payments = new PayPalRestClient({ clientId: fake.clientId, clientSecret: fake.clientSecret, webhookId: fake.webhookId, fetch: fake.fetch });
   } else {
-    payments = new PayPalRestClient({ clientId: config.paypal.clientId, clientSecret: config.paypal.clientSecret, webhookId: config.paypal.webhookId, baseUrl: config.paypal.baseUrl, onCall: (c) => log({ event: "paypal", ...c }) });
+    payments = new PayPalRestClient({ clientId: config.paypal.clientId, clientSecret: config.paypal.clientSecret, webhookId: config.paypal.webhookId, baseUrl: config.paypal.baseUrl, fetch: opts.paypalFetch, onCall: (c) => log({ event: "paypal", ...c }) });
   }
 
   const guides = guidesWithPayee(config.guidePayee);
