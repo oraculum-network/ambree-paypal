@@ -135,6 +135,19 @@ function settledReason(b: Booking): { decided: true; reason?: string } | { decid
   return { decided: false };
 }
 
+/** What a refused refund says about this booking, on which no refund rule holds. */
+function refundRefusal(b: Booking): string {
+  if (b.status === "refunded") return "The deposit was already refunded; there is nothing left to refund.";
+  if (NOT_PAID.includes(b.status)) return `This booking isn't paid yet (it is ${b.status}), so there is nothing to refund.`;
+  if (b.status !== "captured" && b.status !== "partially_refunded") return `This booking can't be refunded now (it is ${b.status}).`;
+  // The simulated warning is named only when it is the only would-be reason: it covers the date, and
+  // neither the guide's offer nor a declined reschedule holds (either one would have allowed the refund).
+  const sim = b.simulated_alert;
+  const onlySimulated = sim !== undefined && sim.from <= b.date && b.date <= sim.to && !b.refund_offered && b.reschedule?.status !== "declined";
+  const note = onlySimulated ? " A simulated cyclone warning (demo) doesn't allow a refund by itself: the guide has to decline the new date or offer the refund." : "";
+  return `A refund needs a cyclone warning (orange or red) on the date, a declined reschedule, or the guide's offer.${note}`;
+}
+
 function hashToken(token: string): string {
   return sha256Hex(`operator:${token}`);
 }
@@ -744,10 +757,7 @@ export class BookingService {
         // booking as stored once the feed answered.
         let reason: string | undefined;
         ({ booking: b, reason } = await this.#reasonNow(bookingId));
-        if (!reason) {
-          const simulated = b.simulated_alert ? " A simulated cyclone warning (demo) doesn't allow a refund by itself: the guide has to decline the new date or offer the refund." : "";
-          throw new ServiceError("refund_not_allowed", `A refund needs a cyclone warning (orange or red) on the date, a declined reschedule, or the guide's offer.${simulated}`);
-        }
+        if (!reason) throw new ServiceError("refund_not_allowed", refundRefusal(b));
         const capturedMinor = toMinor(b.captured!.value);
         const reserved = BookingService.reservedMinor(b);
         const left = capturedMinor - reserved;
