@@ -139,7 +139,7 @@ export class ScriptedModel implements ChatModel {
     } catch {
       r = {};
     }
-    if (r.error) return say(last.name === "refund_payment" && /^refund_unconfirmed:/.test(String(r.error)) ? `I couldn't confirm the refund yet: ${r.error}` : `That didn't work: ${r.error}`);
+    if (r.error) return say(last.name === "refund_payment" && /^refund_unconfirmed:/.test(String(r.error)) ? "I couldn't confirm the refund with PayPal yet; it may already have gone through. Ask me to check the booking before asking for the refund again." : `That didn't work: ${r.error}`);
     switch (last.name) {
       case "search_guides": {
         const guides = (r.guides ?? []) as Array<{ guide_id: string; name: string; typical_price_per_person: string }>;
