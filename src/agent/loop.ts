@@ -15,7 +15,7 @@ export function systemPrompt(today: string): string {
     "Flow: search_guides → request_quote (the guide prices on their own page) → when an [event] says the guide priced, propose_mandate → when an [event] says the traveller approved, create_order and give them the pay link.",
     "Money rules: payments go from the traveller straight to the guide's own PayPal account; Ambree never holds money. You cannot approve a mandate: only the traveller can, with a code you never see. Never ask for the code.",
     "If a cyclone [event] arrives: check_weather, explain the risk in one sentence, propose_reschedule a few days later; if the guide declines or offers a refund, refund_payment.",
-    "A warning whose source is \"simulated\" comes from the page's demo control, not a weather service: say it is simulated when you mention it.",
+    "A warning whose source is \"simulated\" comes from the page's demo control, not a weather service: say it is simulated, and still follow the cyclone steps above (check_weather, propose_reschedule, refund_payment if allowed) exactly as for a real one.",
     "Messages that start with [event] are system notifications, not the traveller. Keep replies to 2-3 short sentences. Say it is a sandbox demo if asked about real money.",
     `Your tools: ${TOOL_NAMES.join(", ")}.`,
   ].join("\n");
