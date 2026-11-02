@@ -161,7 +161,7 @@ const CANNOT_SIMULATE: Record<Exclude<BookingStatus, NotPaid | "captured">, stri
   declined: "the guide declined the request, so there is no trip to warn about",
   capture_pending: "PayPal is still processing the payment; try again once it completes",
   capture_failed: "the payment failed, so nothing was paid",
-  needs_review: "it is held for review (get_booking says why)",
+  needs_review: "it is held for review",
   partially_refunded: "part of the deposit was already refunded",
   refunded: "the deposit was already refunded",
 };
