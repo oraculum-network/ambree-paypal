@@ -573,7 +573,9 @@ Five findings from the independent reviewers, each with a test that failed at 77
   outright no longer frees the reservation: the first send may have refunded (a request id no longer
   deduped is answered e.g. 422 `CAPTURE_FULLY_REFUNDED`), so the operation and the booking go to
   `needs_review` (`refund.resend_refused`; the caller gets `refund_under_review`). A first send refused
-  outright is `failed` as before.
+  outright is `failed` as before. **UNVERIFIED** (spike): that the refund resource in PayPal's refund
+  webhooks carries the `custom_id` we send. Without it a refund with no known id finds no booking, and the
+  event completes unused as before (the next `refund_payment` still resends the operation).
 - **D4, a held move says what it waits on** (`fix8-hold`). A move proposed before a refund started stays
   `proposed` while that refund is being sent or pending, and for good once the booking is held for review,
   but the guide can't answer it then. `summary()` adds `reschedule_hold` (`rescheduleHold(b)`: null when
