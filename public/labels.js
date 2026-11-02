@@ -59,7 +59,8 @@ const CANNOT_SIMULATE = {
 
 /**
  * Whether "Simulate a cyclone warning (demo)" can be pressed, and the reason when it can't. On the hosted
- * sandbox it acts on the tab's newest booking, and only once that booking is paid (captured). Fake mode is
+ * sandbox it acts on the tab's newest booking, and only once that booking is paid (captured) with no refund
+ * under way (`refund_pending`: being sent or pending at PayPal), as the server checks. Fake mode is
  * unchanged: any booking will do (it raises a demo-feed warning around all of them).
  * @returns {{ disabled: boolean, hint: string }}
  */
@@ -67,6 +68,7 @@ export function simulateControl(mode, bookings) {
   const newest = (bookings ?? []).at(-1);
   if (mode !== "sandbox") return { disabled: !newest, hint: "" };
   if (!newest) return { disabled: true, hint: "Book a guide and pay the deposit first: the simulated warning goes on your newest booking." };
+  if (newest.status === "captured" && newest.refund_pending) return { disabled: true, hint: "Can't simulate now: a refund of the deposit has started, so the trip can't be moved." };
   if (newest.status === "captured") return { disabled: false, hint: "" };
   if (NOT_PAID.includes(newest.status)) return { disabled: true, hint: "Pay for your newest booking first, then simulate: the warning is for a paid booking." };
   return { disabled: true, hint: `Can't simulate now: ${CANNOT_SIMULATE[newest.status] ?? `your newest booking is ${newest.status}`}.` };

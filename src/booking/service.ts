@@ -125,6 +125,8 @@ const CANNOT_SIMULATE: Record<Exclude<BookingStatus, NotPaid | "captured">, stri
   partially_refunded: "part of the deposit was already refunded",
   refunded: "the deposit was already refunded",
 };
+/** Why a captured booking can't take the simulated warning while one of its refunds is being sent or pending. */
+const SIMULATE_REFUND_STARTED = "a refund of the deposit has started, so the trip can't be moved";
 const NOT_FOUND = "No such booking in this conversation.";
 /** Refund rule (a): a real feed warning covers the date that was looked up. */
 const WARNING_REASON = "a cyclone warning covers the date";
@@ -703,7 +705,8 @@ export class BookingService {
   /**
    * The hosted demo's control: one simulated cyclone warning for this booking's day only, saved on the
    * booking, logged (`weather.simulated_alert`) and announced to the agent, once per booking, and only on a
-   * paid (captured) booking: any other status is refused and nothing is saved, logged or announced. It calls
+   * booking that can be moved: paid (captured) with no refund started. Anything else is refused and nothing
+   * is saved, logged or announced, so the warning isn't spent on a booking the agent can't move. It calls
    * no payment API: the agent reacts to the event by proposing a new date (see refundReason). It queues
    * with the booking's other steps (#serial), so it never lands inside a capture or refund that is waiting
    * on PayPal, and two racing calls can't both post.
@@ -720,6 +723,8 @@ export class BookingService {
       const why = CANNOT_SIMULATE[b.status as keyof typeof CANNOT_SIMULATE];
       throw new ServiceError("cannot_simulate", `A cyclone warning can't be simulated now for this booking (it is ${b.status}): ${why}.`);
     }
+    // Captured, but a refund being sent or pending at PayPal: the trip can't be moved (proposeReschedule).
+    if (refundStarted(b)) throw new ServiceError("cannot_simulate", `A cyclone warning can't be simulated now for this booking: ${SIMULATE_REFUND_STARTED}.`);
     const alert: CycloneAlert = {
       id: `SIM-${b.id}`,
       name: "Demo cyclone (simulated)",
