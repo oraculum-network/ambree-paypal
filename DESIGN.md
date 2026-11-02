@@ -116,8 +116,9 @@ webhook_events(event_id PRIMARY KEY, event_type, received_at)                   
   A definitive create failure goes back to `priced`. `needs_review` (the order or capture doesn't match
   the mandate) and `capture_failed` stop the money steps.
   `declined` (the guide said no) and `cancelled` are terminal. A reschedule keeps the status and changes `date`.
-- **Reschedule:** `proposed → accepted | declined`, or `withdrawn` when a full refund completes before the
-  guide answered (§15). It can be answered only while the booking is `captured` and no refund has started.
+- **Reschedule:** `proposed → accepted | declined`, or `withdrawn` when a refund (part or all of the deposit,
+  §15, §16) completes before the guide answered. It can be proposed and answered only while the booking is
+  `captured` and no refund has started.
 - **Quote** (frozen once priced): `{booking_id, guide_id, guide_name, activity, area, date, party_size,
   total{currency_code,value}, deposit{currency_code,value}, payee, guide_note, priced_at}`. The **quote hash** is
   sha256 hex of the canonical JSON: keys sorted, no whitespace, strings NFC.
@@ -201,7 +202,7 @@ only on network errors or 5xx, and only for calls that carry a `PayPal-Request-I
 | `get_order` | `booking_id` | `GET /v2/checkout/orders/{id}` | no |
 | `capture_order` | `booking_id` | Idempotent capture, only once the order is APPROVED | yes (traveller → guide) |
 | `check_weather` | `booking_id` | Cyclone alerts for the booking date and a plain explanation | no |
-| `propose_reschedule` | `booking_id`, `new_date` | Asks the guide on the operator page | no |
+| `propose_reschedule` | `booking_id`, `new_date` | Asks the guide on the operator page; refused once a refund has started (§16) | no |
 | `refund_payment` | `booking_id`, `amount?` | Only when the policy (§2.2) allows; partial or full | yes (guide → traveller) |
 
 **PayPal Agent Toolkit plug-in point.**
@@ -428,9 +429,9 @@ GDACS warnings can't be triggered on demand.
     judge's session) on the same day never sees it. The record field is optional, so `SCHEMA_VERSION` stays 2.
   - It logs `weather.simulated_alert` and emits the agent event "Simulated cyclone warning (demo) for
     {date}, not a real warning: …".
-  - It is idempotent and runs one at a time with the booking's money steps (`#serial`): a second call (or a
-    racing one) answers `posted: false` with no new row or event, and a press while a capture or refund is
-    waiting on PayPal waits for it.
+  - It is idempotent and runs one at a time with the booking's other steps (`#serial`; since round 7 every
+    step, §16): a second call (or a racing one) answers `posted: false` with no new row or event, and a press
+    while a capture or refund is waiting on PayPal waits for it.
   - Only a paid (`captured`) booking takes it; the agent can only move a captured booking, so a warning spent
     earlier could never lead to the reschedule. Any other status answers 409 and records nothing (no
     `simulated_alert`, no ledger row, no event), with one message per group:
@@ -482,7 +483,9 @@ Four findings from the independent reviewers, each with a test that failed at 09
   offer and a declined reschedule are read on the booking as stored after the weather feed answered. A feed
   warning counts only if that booking's date is still the date that was looked up. A date the guide moved
   meanwhile is looked up once more; a second move answers `date_changed` (retryable, nothing reserved or
-  sent). `refundReason(b)` keeps its contract (`check_weather`'s `refund_allowed`).
+  sent). `refundReason(b)` keeps its contract (`check_weather`'s `refund_allowed`). Since round 7 (§16) the
+  service's own steps queue behind the refund, so only a writer outside the service can move the date
+  meanwhile; `#reasonNow` became `#reserveRefund`.
 - **R2, each refusal says why.** The simulated-warning note ("doesn't allow a refund by itself") appears only
   when that warning is the only would-be reason: the booking is `captured` or `partially_refunded`, the
   warning covers its date, and there is no offer and no declined reschedule. A `refunded` booking is told
@@ -495,7 +498,43 @@ Four findings from the independent reviewers, each with a test that failed at 09
   refund that makes the booking `refunded` turns a `proposed` reschedule into `withdrawn` in the same save
   and logs `reschedule.withdrawn` (`from`, `to`, `reason: "the deposit was refunded"`) after
   `refund.completed`. The traveller's card says "withdrawn, because the deposit was refunded"
-  (`labels.js` `rescheduleLine`). A partial refund leaves the move `proposed`. The status is additive and the
-  field optional, so `SCHEMA_VERSION` stays 2.
+  (`labels.js` `rescheduleLine`). A partial refund left the move `proposed` (superseded in round 7, §16: it
+  withdraws it too). The status is additive and the field optional, so `SCHEMA_VERSION` stays 2.
 - **Fake mode:** unchanged in behaviour. Its demo-feed raise is a feed warning (rule (a)); R1–R4 apply in
   every mode, and its e2e refund path declines the move before the refund, so nothing is withdrawn there.
+
+## 16. Round 7: one booking's steps never interleave (2 Nov)
+
+Review rounds kept finding lost updates and stale decisions: only the money steps queued on the booking
+(`#serial`), so the guide's page, the agent's mandate and move tools, the traveller's approval and the
+webhook's own dedupe and row could land between a step's read and its save, across an await. Each finding
+has a test that failed at the starting code (`test/fix7-serial.test.ts`: 26 of 35 failed; the races are
+deterministic, held by `test/helpers/race.ts`'s gate, or chained 0 to 5 microtasks after the feed's reply).
+
+- **S1, one queue per booking.** Every public step that changes a booking, or decides money on it, runs its
+  whole read-decide-write in `#serial(bookingId)`, one at a time per booking: `priceQuote`, `declineRequest`,
+  `proposeMandate`, `approveMandate` (on the mandate's booking), `createOrder`, `captureIfApproved`,
+  `handleWebhook` (after verifying: the dedupe, the ledger row and the reaction), `simulateCyclone`,
+  `announceCyclone` (each booking's lookup and announcement), `proposeReschedule`, `answerReschedule`,
+  `offerRefund`, `refund` and `refreshRefunds`. A step sent while another waits on PayPal or the weather
+  feed waits for it, then decides on the booking as that step left it. Different bookings never wait for
+  each other. A queued step never calls another queued public method for the same booking (it would wait
+  for itself): it calls the unqueued `#…Now` body (`#captureNow`, `#refreshNow`, `#answerNow`, …).
+  `requestQuote` isn't queued: it creates the booking, whose id nobody holds yet. The operator page's
+  `applyOperatorAction` and the approve route await the steps, which are now async.
+- **S2, no move once a refund has started.** `proposeReschedule` refuses (`wrong_state`, "A refund of the
+  deposit has started, so the trip can't be moved.") while any refund operation is in a status but
+  `failed`, as `answerReschedule` already did (§15 R3). `#applyRefund` withdraws a `proposed` move whenever
+  a refund completes and leaves the booking `partially_refunded` or `refunded`, logging
+  `reschedule.withdrawn` with reason "part of the deposit was refunded" or "the deposit was refunded"; a
+  booking held for review keeps its move. The card says "withdrawn, because part of the deposit was
+  refunded." on a partially refunded booking, and the agent's `refunded` event ends "The move to {date} is
+  withdrawn: the guide is no longer asked."
+- **S3, the reservation on one fresh read.** `refund` → `#reserveRefund` decides the reason and saves the
+  reservation synchronously on one `must(bookingId)` taken after the last await (the feed lookup); with S1,
+  a guide's answer sent in the microtasks after the feed replied queues behind the refund and is decided
+  on the booking the refund left (never overwritten).
+- **The model** is told what `withdrawn` and `date_changed` mean (the system prompt, and the `get_booking`,
+  `propose_reschedule` and `refund_payment` descriptions); the scripted model is unchanged.
+- **Fake mode:** the demo control's `announceCyclone` now queues per booking, so a press while a refund is
+  held at PayPal waits for it and reads the booking as the refund left it. Otherwise unchanged.
