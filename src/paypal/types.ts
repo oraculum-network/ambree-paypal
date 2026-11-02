@@ -81,7 +81,14 @@ export interface Refund {
   amount?: Money;
   custom_id?: string;
   note_to_payer?: string;
+  /**
+   * UNVERIFIED (DESIGN.md §19): `total_refunded_amount` is taken to be PayPal's running total refunded on the
+   * capture (completed refunds), carried on the refund reply and on GET. Absent: the check that uses it is
+   * skipped.
+   */
+  seller_payable_breakdown?: { gross_amount?: Money; net_amount?: Money; total_refunded_amount?: Money };
   create_time?: string;
+  /** `up` names the capture (`/v2/payments/captures/{id}`); UNVERIFIED on webhook resources (§19). */
   links?: Link[];
 }
 

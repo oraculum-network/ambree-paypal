@@ -49,6 +49,11 @@ interface Failure {
   pass?: boolean;
   /** Hold this request until the promise settles, then answer it as the other fields say. */
   wait?: Promise<unknown>;
+  /**
+   * With `pass` or `dropResponse`: process the request at once (its webhook is sent then), but hold the
+   * reply (or its loss) until the promise settles.
+   */
+  replyAfter?: Promise<unknown>;
 }
 
 export const FAKE_CLIENT_ID = "fake-client-id";
@@ -82,11 +87,31 @@ export class FakePayPal {
   readonly sentWebhooks: WebhookEvent[] = [];
   readonly fetch: typeof fetch;
   deliver: FakePayPalOptions["deliver"];
+  /**
+   * `false` models a PayPal that does NOT dedupe a repeated PayPal-Request-Id: every request is processed as
+   * a new one, so the client's own retry or the service's resend of a refund makes another refund (the
+   * premise of round 9's R9-1 and R9-4; UNVERIFIED either way, DESIGN.md §19). Default true: the same id on
+   * the same path replays the first reply.
+   */
+  dedupe = true;
+  /**
+   * `false`: refund resources (the POST reply, GET, and every refund webhook) carry no `custom_id`, only
+   * their `up` link to the capture (R9-2, R9-5; UNVERIFIED, §19).
+   */
+  refundCustomId = true;
+  /**
+   * `false`: refund resources carry no `seller_payable_breakdown`. Default true: `total_refunded_amount` is
+   * the capture's completed refunds at the moment the resource is produced (a PENDING refund isn't in it).
+   * The real field's semantics are UNVERIFIED (§19).
+   */
+  refundTotals = true;
 
   readonly #opts: FakePayPalOptions;
   readonly #orders = new Map<string, StoredOrder>();
   readonly #captures = new Map<string, { capture: Capture; orderId: string; refundedMinor: number }>();
   readonly #refunds = new Map<string, Refund>();
+  /** Each refund's capture. */
+  readonly #refundCapture = new Map<string, string>();
   /** Refunds created PENDING (pendNextRefund): what each holds on its capture until it settles. */
   readonly #pendingRefunds = new Map<string, { captureId: string; minor: number }>();
   #pendNext = 0;
@@ -138,12 +163,26 @@ export class FakePayPal {
     if (status === "COMPLETED") {
       const stored = this.#orders.get(c.orderId)!;
       this.#balances.set(stored.payeeKey, (this.#balances.get(stored.payeeKey) ?? 0) - held.minor);
-      this.#emit("PAYMENT.CAPTURE.REFUNDED", "refund", structuredClone(r), `A ${r.amount!.currency_code} ${r.amount!.value} capture payment was refunded`);
+      this.#emit("PAYMENT.CAPTURE.REFUNDED", "refund", this.#refundView(r), `A ${r.amount!.currency_code} ${r.amount!.value} capture payment was refunded`);
     } else {
       c.refundedMinor -= held.minor;
       c.capture.status = c.refundedMinor <= 0 ? "COMPLETED" : c.refundedMinor >= capturedMinor ? "REFUNDED" : "PARTIALLY_REFUNDED";
-      this.#emit("PAYMENT.REFUND.FAILED", "refund", structuredClone(r), `A ${r.amount!.currency_code} ${r.amount!.value} refund failed`);
+      this.#emit("PAYMENT.REFUND.FAILED", "refund", this.#refundView(r), `A ${r.amount!.currency_code} ${r.amount!.value} refund failed`);
     }
+  }
+
+  /**
+   * A refund as PayPal shows it now (reply, GET, webhook): without `custom_id` when `refundCustomId` is off,
+   * and with `seller_payable_breakdown` (the capture's completed refunds so far) when `refundTotals` is on.
+   */
+  #refundView(r: Refund): Refund {
+    const out = structuredClone(r);
+    if (!this.refundCustomId) delete out.custom_id;
+    const captureId = this.#refundCapture.get(r.id);
+    if (this.refundTotals && captureId && out.amount) {
+      out.seller_payable_breakdown = { gross_amount: { ...out.amount }, total_refunded_amount: { currency_code: out.amount.currency_code, value: fromMinor(this.refundedFrom(captureId)) } };
+    }
+    return out;
   }
 
   /** The ids of the refunds PayPal made, oldest first (whatever their status). */
@@ -225,6 +264,7 @@ export class FakePayPal {
       if (f.pass) {
         const res = await this.#route(method, url.pathname, headers, typeof init?.body === "string" ? init.body : undefined, requestId);
         this.calls.push({ method, path: url.pathname, status: res.status, requestId });
+        if (f.replyAfter) await f.replyAfter.catch(() => undefined);
         return res;
       }
       if (f.hang) {
@@ -237,6 +277,7 @@ export class FakePayPal {
       if (f.dropResponse) {
         const lost = await this.#route(method, url.pathname, headers, typeof init?.body === "string" ? init.body : undefined, requestId);
         this.calls.push({ method, path: url.pathname, status: lost.status, requestId });
+        if (f.replyAfter) await f.replyAfter.catch(() => undefined);
         if (f.status >= 500) return json(f.status, f.body ?? { name: "INTERNAL_SERVER_ERROR", message: "An internal server error occurred.", debug_id: newId("D").toLowerCase(), details: [] });
         throw new TypeError("fetch failed");
       }
@@ -268,8 +309,8 @@ export class FakePayPal {
       }
     }
 
-    // Idempotency: the same PayPal-Request-Id on the same path replays the first reply.
-    const idemKey = requestId ? `${method} ${path} ${requestId}` : undefined;
+    // Idempotency: the same PayPal-Request-Id on the same path replays the first reply (unless `dedupe` is off).
+    const idemKey = requestId && this.dedupe ? `${method} ${path} ${requestId}` : undefined;
     if (idemKey && this.#idem.has(idemKey)) {
       const prior = this.#idem.get(idemKey)!;
       return json(prior.status, prior.body);
@@ -306,7 +347,7 @@ export class FakePayPal {
     if (method === "POST" && (m = path.match(/^\/v2\/payments\/captures\/([^/]+)\/refund$/))) return this.#refund(m[1]!, body);
     if (method === "GET" && (m = path.match(/^\/v2\/payments\/refunds\/([^/]+)$/))) {
       const r = this.#refunds.get(m[1]!);
-      return r ? json(200, r) : ppError(404, "RESOURCE_NOT_FOUND", "INVALID_RESOURCE_ID", "Specified resource ID does not exist.");
+      return r ? json(200, this.#refundView(r)) : ppError(404, "RESOURCE_NOT_FOUND", "INVALID_RESOURCE_ID", "Specified resource ID does not exist.");
     }
     if (method === "POST" && path === "/v1/notifications/verify-webhook-signature") return this.#verify(body);
     if (method === "GET" && path === "/v1/identity/openidconnect/userinfo") {
@@ -425,9 +466,10 @@ export class FakePayPal {
       ],
     };
     this.#refunds.set(refundId, refund);
+    this.#refundCapture.set(refundId, captureId);
     if (pending) this.#pendingRefunds.set(refundId, { captureId, minor });
-    else this.#emit("PAYMENT.CAPTURE.REFUNDED", "refund", structuredClone(refund), `A ${refund.amount!.currency_code} ${refund.amount!.value} capture payment was refunded`);
-    return json(201, refund);
+    else this.#emit("PAYMENT.CAPTURE.REFUNDED", "refund", this.#refundView(refund), `A ${refund.amount!.currency_code} ${refund.amount!.value} capture payment was refunded`);
+    return json(201, this.#refundView(refund));
   }
 
   // ---------- webhooks ----------
