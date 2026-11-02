@@ -1,7 +1,8 @@
 // Round 4: the hosted demo (PayPal mode `sandbox`). The cyclone simulation works there, but only on the
-// caller's own booking, once, labelled as simulated, and it never calls PayPal itself; the Demo controls
-// show; "Start over" stays inside the caller's own session. Sandbox mode runs with no network: PayPal
-// calls go to a stub that refuses (and counts) every call, or to the in-process fake.
+// caller's own paid (captured) booking, once, labelled as simulated, and it never calls PayPal itself; the
+// Demo controls show; "Start over" stays inside the caller's own session. Sandbox mode runs with no
+// network: PayPal calls go to a stub that refuses (and counts) every call, or to the in-process fake.
+// Round 5 (test/fix5-review.test.ts) narrowed it to captured bookings and took away its refund unlock.
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createApp } from "../src/app.ts";
@@ -48,6 +49,20 @@ async function pricedBooking(base: string): Promise<{ tab: Browser; id: string; 
   return { tab, id: first.bookings[0].booking_id as string, link };
 }
 
+/** A new tab with one booking the traveller has paid (captured), through the fake standing in for PayPal. */
+async function paidBooking(base: string, fake: FakePayPal): Promise<{ tab: Browser; id: string; link: string }> {
+  const r = await pricedBooking(base);
+  let st = await until(r.tab, (x) => x.bookings[0]?.status === "mandate_proposed", "mandate");
+  const code = (st.inbox.at(-1).text as string).match(/\b(\d{6})\b/)![1]!;
+  expect((await r.tab.json(`/api/mandates/${st.bookings[0].mandate.id}/approve`, { code })).ok).toBe(true);
+  st = await until(r.tab, (x) => x.bookings[0]?.status === "order_created", "order");
+  const orderId = st.bookings[0].order.id as string;
+  fake.approve(orderId);
+  expect((await r.tab.fetch(`/paypal/return?booking=${r.id}&token=${orderId}`)).status).toBe(303);
+  await until(r.tab, (x) => x.bookings[0]?.status === "captured", "capture");
+  return r;
+}
+
 function simulate(tab: Browser, bookingId: string, headers: Record<string, string> = {}): Promise<Response> {
   return tab.fetch("/api/demo/cyclone", { method: "POST", headers: { "Content-Type": "application/json", ...headers }, body: JSON.stringify({ conversation_id: tab.conv, booking_id: bookingId }) });
 }
@@ -74,47 +89,6 @@ describe("round 4: the cyclone simulation in sandbox mode (no PayPal call allowe
     const page = await (await fetch(`${s.base}/`)).text();
     expect(page).toContain("Simulate a cyclone warning (demo)");
     expect(page).not.toContain("Raise a cyclone warning");
-  });
-
-  it("the caller's own booking: one simulated warning for that booking's day, labelled, and no PayPal call", async () => {
-    const { tab, id } = await pricedBooking(s.base);
-    const before = await tab.json("/api/state");
-    const res = await simulate(tab, id);
-    expect(res.status).toBe(200);
-    expect(await res.json()).toMatchObject({ ok: true, simulated: true, posted: true, booking_id: id, date: "2026-11-05" });
-
-    const after = await tab.json("/api/state");
-    expect(after.pending_events).toBe(before.pending_events + 1);
-    expect(after.bookings[0].status).toBe(before.bookings[0].status);
-    const rows = simulatedRows(after);
-    expect(rows).toHaveLength(1);
-    expect(rows[0]!.data).toMatchObject({ simulated: true, alert: { from: "2026-11-05", to: "2026-11-05", source: "simulated" } });
-    expect(after.bookings[0].simulated_warning).toMatchObject({ date: "2026-11-05" });
-
-    const chat = await tab.json("/api/chat", {});
-    const events = (chat.transcript as State[]).filter((m) => m.role === "event").map((m) => m.text as string);
-    expect(events.some((t) => /^\[event\] cyclone bk_[0-9a-f]{12}: Simulated cyclone warning \(demo\) for 2026-11-05/.test(t))).toBe(true);
-    expect((await s.app.service.weatherFor(id)).alerts.map((a) => a.source)).toEqual(["simulated"]);
-    expect(paypalCalls).toEqual([]);
-  });
-
-  it("a second call posts no second warning (also when two calls race)", async () => {
-    const { tab, id } = await pricedBooking(s.base);
-    expect((await simulate(tab, id)).status).toBe(200);
-    const once = await tab.json("/api/state");
-    const again = await simulate(tab, id);
-    expect(again.status).toBe(200);
-    expect(await again.json()).toMatchObject({ ok: true, simulated: true, posted: false, booking_id: id });
-    const twice = await tab.json("/api/state");
-    expect(simulatedRows(twice)).toHaveLength(1);
-    expect(twice.pending_events).toBe(once.pending_events);
-
-    const other = await pricedBooking(s.base);
-    const raced = await Promise.all([simulate(other.tab, other.id), simulate(other.tab, other.id)]);
-    const bodies = await Promise.all(raced.map((r) => r.json() as Promise<State>));
-    expect(bodies.map((b) => b.posted).sort()).toEqual([false, true]);
-    expect(simulatedRows(await other.tab.json("/api/state"))).toHaveLength(1);
-    expect(paypalCalls).toEqual([]);
   });
 
   it("another session's booking is 404 and nothing is posted", async () => {
@@ -152,22 +126,79 @@ describe("round 4: the cyclone simulation in sandbox mode (no PayPal call allowe
     expect(simulatedRows(await tab.json("/api/state"))).toHaveLength(0);
   });
 
-  it("a booking that can't take a warning yet says so and records nothing", async () => {
+  it("a booking that isn't paid yet says so and records nothing (and no PayPal call is made)", async () => {
     const tab = new Browser(s.base);
     const first = await tab.json("/api/chat", { message: REQUEST });
     const id = first.bookings[0].booking_id as string;
+    for (const step of ["requested", "priced"]) {
+      if (step === "priced") expect((await form(first.guide_phone[0].url, { action: "price", total: "80", deposit: "30" })).status).toBe(200);
+      const res = await simulate(tab, id);
+      expect(res.status, step).toBe(409);
+      expect(await res.json(), step).toMatchObject({ ok: false, reason: "not_paid", error: expect.stringMatching(/pay for the booking first, then simulate/) });
+    }
+    const st = await tab.json("/api/state");
+    expect(simulatedRows(st)).toHaveLength(0);
+    expect(st.bookings[0].simulated_warning).toBeNull();
+    expect(paypalCalls).toEqual([]);
+  });
+});
+
+describe("round 4: the simulation on a paid booking in sandbox mode (the fake stands in for PayPal; the simulation itself calls none)", () => {
+  let s: Awaited<ReturnType<typeof startApp>>;
+  const fake = new FakePayPal({ checkoutUrl: "http://127.0.0.1:9/checkout" });
+  beforeAll(async () => {
+    s = await startApp({ ...SANDBOX_ENV, PAYPAL_OPERATOR_IDENTITY: "config-only" }, { paypalFetch: fake.fetch });
+  });
+  afterAll(async () => {
+    await s?.app.close();
+  });
+
+  it("the caller's own paid booking: one simulated warning for that booking's day, labelled, and no PayPal call", async () => {
+    const { tab, id } = await paidBooking(s.base, fake);
+    const before = await tab.json("/api/state");
+    const calls = fake.calls.length;
     const res = await simulate(tab, id);
-    expect(res.status).toBe(409);
-    expect((await res.json()).error).toMatch(/requested/);
-    expect(simulatedRows(await tab.json("/api/state"))).toHaveLength(0);
-    // Once the guide has priced it, the same booking can take the warning.
-    expect((await form(first.guide_phone[0].url, { action: "price", total: "80", deposit: "30" })).status).toBe(200);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ ok: true, simulated: true, posted: true, booking_id: id, date: "2026-11-05" });
+
+    const after = await tab.json("/api/state");
+    expect(after.pending_events).toBe(before.pending_events + 1);
+    expect(after.bookings[0].status).toBe("captured");
+    const rows = simulatedRows(after);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.data).toMatchObject({ simulated: true, alert: { from: "2026-11-05", to: "2026-11-05", source: "simulated" } });
+    expect(after.bookings[0].simulated_warning).toMatchObject({ date: "2026-11-05" });
+
+    const chat = await tab.json("/api/chat", {});
+    const events = (chat.transcript as State[]).filter((m) => m.role === "event").map((m) => m.text as string);
+    expect(events.some((t) => /^\[event\] cyclone bk_[0-9a-f]{12}: Simulated cyclone warning \(demo\) for 2026-11-05/.test(t))).toBe(true);
+    expect((await s.app.service.weatherFor(id)).alerts.map((a) => a.source)).toEqual(["simulated"]);
+    expect(fake.calls.length).toBe(calls);
+  });
+
+  it("a second call posts no second warning (also when two calls race)", async () => {
+    const { tab, id } = await paidBooking(s.base, fake);
+    const calls = fake.calls.length;
     expect((await simulate(tab, id)).status).toBe(200);
+    const once = await tab.json("/api/state");
+    const again = await simulate(tab, id);
+    expect(again.status).toBe(200);
+    expect(await again.json()).toMatchObject({ ok: true, simulated: true, posted: false, booking_id: id });
+    const twice = await tab.json("/api/state");
+    expect(simulatedRows(twice)).toHaveLength(1);
+    expect(twice.pending_events).toBe(once.pending_events);
+    expect(fake.calls.length).toBe(calls);
+
+    const other = await paidBooking(s.base, fake);
+    const raced = await Promise.all([simulate(other.tab, other.id), simulate(other.tab, other.id)]);
+    const bodies = await Promise.all(raced.map((r) => r.json() as Promise<State>));
+    expect(bodies.map((b) => b.posted).sort()).toEqual([false, true]);
+    expect(simulatedRows(await other.tab.json("/api/state"))).toHaveLength(1);
   });
 
   it("the warning stays on that booking: another session's booking on the same day sees none", async () => {
-    const mine = await pricedBooking(s.base);
-    const theirs = await pricedBooking(s.base);
+    const mine = await paidBooking(s.base, fake);
+    const theirs = await paidBooking(s.base, fake);
     expect((await simulate(mine.tab, mine.id)).status).toBe(200);
     expect((await s.app.service.weatherFor(mine.id)).alerts).toHaveLength(1);
     expect((await s.app.service.weatherFor(theirs.id)).alerts).toEqual([]);
@@ -206,16 +237,23 @@ describe("round 4: sandbox mode end to end (the fake stands in for PayPal's sand
     expect(res.status).toBe(200);
     expect(fake.calls.length).toBe(callsBefore);
     expect(s.app.service.get(id)).toMatchObject({ status: "captured", refunded_minor: 0, refund_ops: [] });
-    // The existing refund rule now allows a refund, and says the warning was simulated.
-    expect(await s.app.service.refundReason(s.app.service.get(id)!)).toBe("a simulated cyclone warning (demo) covers the date");
+    // A simulated warning alone never unlocks a refund: it only gets the agent to propose a new date.
+    expect(await s.app.service.refundReason(s.app.service.get(id)!)).toBeUndefined();
 
     st = await until(tab, (x) => x.bookings[0]?.reschedule?.status === "proposed", "reschedule");
     expect(st.transcript.at(-1).text).toMatch(/simulated cyclone warning \(demo\).*move the trip to 2026-11-08/i);
+    // The traveller asks for the money back before the guide answers: refused, and nothing is sent.
+    const asked = await tab.json("/api/chat", { message: "Please refund my deposit" });
+    expect(asked.replies.at(-1)).toMatch(/didn't work.*doesn't allow a refund by itself/);
+    expect(fake.calls.filter((c) => c.path.endsWith("/refund"))).toHaveLength(0);
     expect(await (await fetch(link)).text()).toContain("Move the trip?");
     await form(link, { action: "decline_reschedule" });
 
     st = await until(tab, (x) => x.bookings[0]?.status === "refunded", "refund");
     expect(fake.calls.filter((c) => c.method === "POST" && c.path.endsWith("/refund"))).toHaveLength(1);
+    // The refund (and so PayPal's note_to_payer) reads the guide's decline, not the simulated warning.
+    expect((st.ledger as State[]).find((e) => e.kind === "refund.requested")!.data).toMatchObject({ reason: "the guide declined the reschedule" });
+    expect(await (await fetch(link)).text()).not.toContain("Move the trip?");
     const kinds = (st.ledger as State[]).map((e) => e.kind);
     expect(kinds).toEqual(expect.arrayContaining(["capture.completed", SIMULATED_KIND, "reschedule.declined", "refund.completed"]));
     expect(kinds.filter((k) => k === SIMULATED_KIND)).toHaveLength(1);
