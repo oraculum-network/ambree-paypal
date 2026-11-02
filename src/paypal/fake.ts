@@ -146,6 +146,11 @@ export class FakePayPal {
     }
   }
 
+  /** The ids of the refunds PayPal made, oldest first (whatever their status). */
+  refundIds(): string[] {
+    return [...this.#refunds.keys()];
+  }
+
   /** Money refunded from a capture so far (completed refunds only), in minor units. */
   refundedFrom(captureId: string): number {
     const c = this.#captures.get(captureId);
