@@ -660,11 +660,13 @@ export class BookingService {
       }
       try {
         // Refund events (PAYMENT.CAPTURE.REFUNDED and PAYMENT.REFUND.*, e.g. PAYMENT.REFUND.FAILED) refresh
-        // every pending refund by GET, so a failed one releases its reservation; capture events refresh the
-        // capture. Already on the queue, so the unqueued variants.
+        // every pending refund by GET, so a failed one releases its reservation, and record the event's
+        // refund on a refund whose reply was lost (#recoverSendingNow); capture events refresh the
+        // capture. Already on the queue, so the unqueued variants. A GET that fails answers 500 below.
         const refundEvent = event.event_type === "PAYMENT.CAPTURE.REFUNDED" || event.event_type.startsWith("PAYMENT.REFUND.");
         if (refundEvent) {
           await this.#refreshNow(b.id);
+          await this.#recoverSendingNow(b.id, event.resource, event.id);
         } else if (event.event_type === "CHECKOUT.ORDER.APPROVED" || event.event_type.startsWith("PAYMENT.CAPTURE.")) {
           if (b.order_id) await this.#captureNow(b.id);
         }
@@ -840,7 +842,7 @@ export class BookingService {
    * meanwhile; a date moved anyway (by a writer outside the service) is looked up once more, and a second
    * move refuses the request (`date_changed`, nothing reserved), which can simply be retried.
    */
-  async #reserveRefund(bookingId: string, amount: string | undefined): Promise<{ booking: Booking; op: RefundOp }> {
+  async #reserveRefund(bookingId: string, amount: string | undefined): Promise<{ booking: Booking; op: RefundOp; resend: boolean }> {
     let looked: { date: string; warned: boolean } | undefined;
     for (let lookups = 0; ; lookups++) {
       const b = this.must(bookingId);
@@ -852,7 +854,7 @@ export class BookingService {
       const sending = b.refund_ops.find((o) => o.status === "sending");
       if (sending) {
         this.#log(b, "refund.retry", { n: sending.n, request_id: sending.request_id, amount_minor: sending.amount_minor, requested: amount ?? null });
-        return { booking: b, op: sending };
+        return { booking: b, op: sending, resend: true };
       }
       const settled = settledReason(b);
       let reason: string | undefined;
@@ -883,7 +885,7 @@ export class BookingService {
       const op: RefundOp = { n, request_id: `refund-${b.id}-${n}`, amount_minor: minor, full: minor === capturedMinor, reason, status: "sending" };
       const next = this.#save({ ...b, refund_ops: [...b.refund_ops, op] });
       this.#log(next, "refund.requested", { n, request_id: op.request_id, amount: { currency_code: next.captured!.currency_code, value: fromMinor(minor) }, reason });
-      return { booking: next, op };
+      return { booking: next, op, resend: false };
     }
   }
 
@@ -895,18 +897,30 @@ export class BookingService {
   /**
    * Refunds part or all of the capture. Queued: the reason is decided and the operation reserved (persisted
    * with its amount and PayPal-Request-Id) before it is sent; if a send has no definitive answer, the next
-   * call resends that same operation unchanged.
+   * call resends that same operation unchanged (or the refund's webhook records it: #recoverSendingNow).
+   * PayPal refusing a first send releases the reservation (`failed`). PayPal refusing a resend doesn't: the
+   * first send may have refunded already, its reply lost (once the request id is no longer deduped, a
+   * resend of a full refund is answered e.g. 422 CAPTURE_FULLY_REFUNDED), so the operation and the booking
+   * are held for review, still reserved.
    */
   async refund(bookingId: string, amount?: string): Promise<Booking> {
     return this.#serial(bookingId, async () => {
       // `b` serves only fields fixed once captured (id, capture_id, the currency) and the PayPal call.
-      const { booking: b, op } = await this.#reserveRefund(bookingId, amount);
+      const { booking: b, op, resend } = await this.#reserveRefund(bookingId, amount);
       const cur = b.captured!.currency_code;
       const body = op.full ? {} : { amount: { currency_code: cur, value: fromMinor(op.amount_minor) } };
       let refund: Refund;
       try {
         refund = await this.#d.payments.refundCapture(b.capture_id!, { ...body, custom_id: b.id, note_to_payer: `Ambree: ${op.reason}.` }, op.request_id);
       } catch (e) {
+        if (isDefinitive(e) && resend) {
+          const held = this.#setOp({ ...this.must(bookingId), status: "needs_review" }, op.n, { status: "needs_review" });
+          this.#log(held, "refund.resend_refused", { n: op.n, request_id: op.request_id, error: (e as PayPalError).summary() });
+          throw new ServiceError(
+            "refund_under_review",
+            "PayPal refused the resend of a refund whose first reply was lost, so it may already have been refunded; the booking is held for review and nothing more is refunded until a person has reconciled it.",
+          );
+        }
         if (isDefinitive(e)) {
           const failed = this.#setOp(this.must(bookingId), op.n, { status: "failed" });
           this.#log(failed, "refund.failed", { n: op.n, error: (e as PayPalError).summary() });
@@ -932,6 +946,27 @@ export class BookingService {
       b = this.#applyRefund(bookingId, op.n, refund);
     }
     return b;
+  }
+
+  /**
+   * A refund event about a refund this booking doesn't know, naming this booking (custom_id), while one of
+   * its refunds is still `sending` (sent, its reply lost; at most one is, as #reserveRefund resends it
+   * rather than reserve another): that refund is taken as the lost reply's. It is read back by GET (nothing
+   * is sent, so nothing can be refunded twice) and recorded on the sending operation by #applyRefund, which
+   * fails closed (an amount or currency other than the operation's holds the booking for review). Only a
+   * COMPLETED or PENDING refund is recorded: a failed one that can't be tied to the operation leaves it
+   * `sending`, and the next refund call resends it and PayPal's reply to that request id decides. A GET
+   * that fails throws, so the webhook answers 500 and PayPal redelivers. Unqueued: the webhook's step.
+   */
+  async #recoverSendingNow(bookingId: string, resource: Record<string, unknown>, eventId: string): Promise<void> {
+    const b = this.must(bookingId);
+    const sending = b.refund_ops.find((o) => o.status === "sending");
+    const refundId = typeof resource.id === "string" ? resource.id : undefined;
+    if (!sending || !refundId || resource.custom_id !== b.id || b.refund_ops.some((o) => o.refund_id === refundId)) return;
+    const refund = await this.#d.payments.getRefund(refundId);
+    if (refund.id !== refundId || (refund.status !== "COMPLETED" && refund.status !== "PENDING")) return;
+    this.#log(this.must(bookingId), "refund.recovered", { n: sending.n, request_id: sending.request_id, refund_id: refundId, status: refund.status, event_id: eventId });
+    this.#applyRefund(bookingId, sending.n, refund);
   }
 
   #setOp(b: Booking, n: number, patch: Partial<RefundOp>): Booking {
