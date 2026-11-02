@@ -104,8 +104,17 @@ async function readBody(req: IncomingMessage, limit: number): Promise<string | u
   return Buffer.concat(chunks).toString("utf8");
 }
 
+/**
+ * Whether the request says its body is JSON. Media types are case-insensitive (RFC 9110 §8.3.1), so
+ * "Application/JSON; charset=UTF-8" counts. The mutation check and the body reader both use this one test,
+ * so a body that passes the 415 check is never then dropped.
+ */
+export function isJsonRequest(req: IncomingMessage): boolean {
+  return (req.headers["content-type"] ?? "").split(";")[0]!.trim().toLowerCase() === "application/json";
+}
+
 async function readJson(req: IncomingMessage, limit = JSON_LIMIT): Promise<Record<string, unknown> | undefined> {
-  if ((req.headers["content-type"] ?? "").split(";")[0]!.trim() !== "application/json") return undefined;
+  if (!isJsonRequest(req)) return undefined;
   const raw = await readBody(req, limit);
   if (raw === undefined) return undefined;
   try {
@@ -220,7 +229,7 @@ export function createApp(opts: AppOptions): App {
   function refuseMutation(req: IncomingMessage, opts: { json: boolean }): { status: number; error: string } | undefined {
     const origin = req.headers.origin;
     if (origin !== undefined && origin !== publicOrigin) return { status: 403, error: "cross-origin request refused" };
-    if (opts.json && (req.headers["content-type"] ?? "").split(";")[0]!.trim().toLowerCase() !== "application/json") return { status: 415, error: "Content-Type must be application/json" };
+    if (opts.json && !isJsonRequest(req)) return { status: 415, error: "Content-Type must be application/json" };
     return undefined;
   }
   const mcpConfigured = config.mcpPasscode ? Buffer.from(config.mcpPasscode) : undefined;
