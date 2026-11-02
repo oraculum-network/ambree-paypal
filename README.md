@@ -49,7 +49,7 @@ Ambree never holds your money. PayPal sandbox only.
     mandate's payee, amount and currency, and must reference the booking. After capture, the capture's amount
     must match too. Otherwise the booking goes to `needs_review` and is not marked paid.
   - "Paid" and "refunded" mean PayPal said `COMPLETED`. The page shows "Payment pending", "Payment failed"
-    or "Payment needs review" otherwise.
+    or "Payment needs review" otherwise, and "A refund needs review" when a refund reply didn't match.
   - It refunds only when a real cyclone warning covers the day, the guide declined the reschedule, or the
     guide offered the refund. The hosted demo's simulated warning never allows a refund by itself: it only
     gets Ambree to ask the guide for a new date. Each refund is saved (amount and PayPal-Request-Id) before it
@@ -69,7 +69,8 @@ Ambree never holds your money. PayPal sandbox only.
     session.
   - The demo control "Simulate a cyclone warning (demo)" (`POST /api/demo/cyclone`) also needs an existing
     session (401 otherwise). On the hosted sandbox it acts only on a booking the session owns (404
-    otherwise), only once that booking is paid (409 otherwise, saying why), once, and calls no payment API.
+    otherwise), only once that booking is paid and while no refund of it is under way (409 otherwise, saying
+    why), once, and calls no payment API.
   - MCP is off unless `MCP_DEMO_PASSCODE` is set. MCP calls run in their own scope and can't see web
     bookings.
 
