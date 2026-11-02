@@ -276,7 +276,7 @@ describe("R8-3: one intended refund, one operation", () => {
     expect(moved(w)).toBe(1000);
   });
 
-  it("the tool's error on an ambiguous send says it may have gone through, that calling again never refunds twice, and get_booking", async () => {
+  it("the tool's error on an ambiguous send says it may have gone through, that calling again resends with the same PayPal-Request-Id, and get_booking", async () => {
     const { w, id } = await offered();
     loseBothReplies(w);
     const out = await tool(w, "refund_payment", { booking_id: id });
@@ -285,7 +285,7 @@ describe("R8-3: one intended refund, one operation", () => {
     expect(msg).toMatch(/^refund_unconfirmed: /);
     expect(msg).toMatch(/may have gone through/);
     expect(msg).toMatch(/refund_payment again resends the same refund/);
-    expect(msg).toMatch(/never refunds twice/);
+    expect(msg).toMatch(/same PayPal-Request-Id/);
     expect(msg).toMatch(/get_booking/);
   });
 
@@ -293,7 +293,7 @@ describe("R8-3: one intended refund, one operation", () => {
     for (const text of [systemPrompt("2026-11-03"), findTool("refund_payment")!.description]) {
       expect(text).toMatch(/refund_unconfirmed/);
       expect(text).toMatch(/may have gone through/);
-      expect(text).toMatch(/never refunds twice/);
+      expect(text).toMatch(/same PayPal-Request-Id/);
     }
     expect(systemPrompt("2026-11-03")).toMatch(/refund_unconfirmed[^\n]*get_booking/);
   });

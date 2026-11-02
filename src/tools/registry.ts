@@ -163,7 +163,7 @@ export const TOOLS = [
     name: "refund_payment",
     title: "Refund the deposit",
     description:
-      "Refund the deposit (all of it, or `amount`) from the guide's capture back to the traveller. Allowed only when a cyclone warning (orange/red) covers the date, the guide declined a reschedule, or the guide offered a refund. A simulated (demo) warning alone does not allow it. A completed refund withdraws a reschedule still waiting for the guide (status withdrawn); while a refund is pending or held for review, a waiting reschedule is on hold (get_booking's reschedule_hold). date_changed: the date changed while the weather was checked and nothing was refunded; call it once again. refund_unconfirmed: PayPal gave no definitive answer, so the refund may have gone through; call refund_payment again with the same arguments, which resends the same refund and never refunds twice (or, once PayPal has confirmed it, reports it as `acknowledged` and sends nothing); get_booking shows the current state.",
+      "Refund the deposit (all of it, or `amount`) from the guide's capture back to the traveller. Allowed only when a cyclone warning (orange/red) covers the date, the guide declined a reschedule, or the guide offered a refund. A simulated (demo) warning alone does not allow it. A completed refund withdraws a reschedule still waiting for the guide (status withdrawn); while a refund is pending or held for review, a waiting reschedule is on hold (get_booking's reschedule_hold). date_changed: the date changed while the weather was checked and nothing was refunded; call it once again. refund_unconfirmed: PayPal gave no definitive answer, so the refund may have gone through; call refund_payment again with the same arguments, which resends the same refund with the same PayPal-Request-Id so PayPal can recognise it (if PayPal reports a second refund anyway, the booking is held for review and nothing more is sent) (or, once PayPal has confirmed it, reports it as `acknowledged` and sends nothing); get_booking shows the current state.",
     input: z.object({ booking_id: bookingId, amount: z.string().regex(/^\d{1,4}(\.\d{1,2})?$/).optional() }),
     moneyMoving: true,
     run: async (a, ctx) => {
@@ -175,7 +175,7 @@ export const TOOLS = [
         if (e instanceof PayPalError && !isDefinitive(e)) {
           throw new ServiceError(
             "refund_unconfirmed",
-            `PayPal gave no definitive answer (${e.summary()}), so the refund may have gone through. Calling refund_payment again resends the same refund and never refunds twice; get_booking shows the current state.`,
+            `PayPal gave no definitive answer (${e.summary()}), so the refund may have gone through. Calling refund_payment again resends the same refund with the same PayPal-Request-Id, so PayPal can recognise it; if PayPal reports a second refund anyway, the booking is held for review and nothing more is sent. get_booking shows the current state.`,
           );
         }
         throw e;

@@ -844,13 +844,14 @@ export class BookingService {
         markWebhookLogged(this.#d.db, event.id);
       }
       try {
-        // Refund events (PAYMENT.CAPTURE.REFUNDED and PAYMENT.REFUND.*, e.g. PAYMENT.REFUND.FAILED) refresh
+        // Refund events (any event whose resource is a refund, e.g. PAYMENT.CAPTURE.REFUNDED or REVERSED, plus
+        // PAYMENT.REFUND.*, e.g. PAYMENT.REFUND.FAILED) refresh
         // every pending refund by GET, so a failed one releases its reservation; then the event's refund, if
         // no operation has it, is weighed (#refundEvidenceNow): it settles the booking's one refund whose
         // outcome is unknown if it matches it, and is otherwise recorded (I5). Capture events refresh the
         // capture. Already on the queue, so the unqueued variants. A GET that fails answers 500 below, so
         // PayPal redelivers: a refund event is answered 200 only once its evidence is recorded.
-        const refundEvent = event.event_type === "PAYMENT.CAPTURE.REFUNDED" || event.event_type.startsWith("PAYMENT.REFUND.");
+        const refundEvent = event.resource_type === "refund" || event.event_type === "PAYMENT.CAPTURE.REFUNDED" || event.event_type.startsWith("PAYMENT.REFUND.");
         if (refundEvent) {
           await this.#refreshNow(b.id, { lenient: false });
           await this.#refundEvidenceNow(b.id, event.resource, event.id);
