@@ -104,8 +104,20 @@ export interface ServiceDeps {
 }
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
-/** The statuses a cyclone warning is announced for: under way but not yet paid, or paid and not refunded. */
+/** The statuses a real feed warning is announced for: under way but not yet paid, or paid and not refunded. */
 const WARNABLE: readonly BookingStatus[] = ["captured", "order_created", "mandate_approved", "priced", "mandate_proposed"];
+/** Not paid yet: the demo's simulated warning waits until the deposit is captured. */
+const NOT_PAID: readonly BookingStatus[] = ["requested", "priced", "mandate_proposed", "mandate_approved", "order_created"];
+type NotPaid = "requested" | "priced" | "mandate_proposed" | "mandate_approved" | "order_created";
+/** Finished or still in processing: why the demo's simulated warning can't go on the booking now. */
+const CANNOT_SIMULATE: Record<Exclude<BookingStatus, NotPaid | "captured">, string> = {
+  declined: "the guide declined the request, so there is no trip to warn about",
+  capture_pending: "PayPal is still processing the payment; try again once it completes",
+  capture_failed: "the payment failed, so nothing was paid",
+  needs_review: "it is held for review because a PayPal reply didn't match what was expected",
+  partially_refunded: "part of the deposit was already refunded",
+  refunded: "the deposit was already refunded",
+};
 const NOT_FOUND = "No such booking in this conversation.";
 
 function hashToken(token: string): string {
@@ -585,9 +597,9 @@ export class BookingService {
 
   /**
    * The hosted demo's control: one simulated cyclone warning for this booking's day only, saved on the
-   * booking, logged (`weather.simulated_alert`) and announced to the agent, once per booking. It calls no
-   * payment API: the agent reacts to the event, and the refund rules decide exactly as for a real warning.
-   * It queues with the booking's money steps (#serial), so it never lands inside a capture or refund that
+   * booking, logged (`weather.simulated_alert`) and announced to the agent, once per booking, and only on a
+   * paid (captured) booking: any other status is refused and nothing is saved, logged or announced. It calls
+   * no payment API: the agent reacts to the event by proposing a new date (see refundReason). It queues with the booking's money steps (#serial), so it never lands inside a capture or refund that
    * is waiting on PayPal, and two racing calls can't both post.
    */
   async simulateCyclone(bookingId: string): Promise<{ posted: boolean; booking: Booking }> {
@@ -597,7 +609,11 @@ export class BookingService {
   #simulateNow(bookingId: string): { posted: boolean; booking: Booking } {
     const b = this.must(bookingId);
     if (b.simulated_alert) return { posted: false, booking: b };
-    if (!WARNABLE.includes(b.status)) throw new ServiceError("wrong_state", `This booking can't take a warning now (it is ${b.status}); try again once the guide has priced it.`);
+    if (b.status !== "captured") {
+      if (NOT_PAID.includes(b.status)) throw new ServiceError("not_paid", `This booking isn't paid yet (it is ${b.status}): pay for the booking first, then simulate.`);
+      const why = CANNOT_SIMULATE[b.status as keyof typeof CANNOT_SIMULATE];
+      throw new ServiceError("cannot_simulate", `A cyclone warning can't be simulated now for this booking (it is ${b.status}): ${why}.`);
+    }
     const alert: CycloneAlert = {
       id: `SIM-${b.id}`,
       name: "Demo cyclone (simulated)",

@@ -31,6 +31,32 @@ export function demoView(mode) {
   return { controls: mode === "fake" || mode === "sandbox", guideBalance: mode === "fake" };
 }
 
+const NOT_PAID = ["requested", "priced", "mandate_proposed", "mandate_approved", "order_created"];
+/** Why a finished (or still processing) booking can't take the simulated warning; the server says the same. */
+const CANNOT_SIMULATE = {
+  declined: "the guide declined the request",
+  capture_pending: "PayPal is still processing the payment",
+  capture_failed: "the payment failed",
+  needs_review: "the booking is held for review",
+  partially_refunded: "part of the deposit was already refunded",
+  refunded: "the deposit was already refunded",
+};
+
+/**
+ * Whether "Simulate a cyclone warning (demo)" can be pressed, and the reason when it can't. On the hosted
+ * sandbox it acts on the tab's newest booking, and only once that booking is paid (captured). Fake mode is
+ * unchanged: any booking will do (it raises a demo-feed warning around all of them).
+ * @returns {{ disabled: boolean, hint: string }}
+ */
+export function simulateControl(mode, bookings) {
+  const newest = (bookings ?? []).at(-1);
+  if (mode !== "sandbox") return { disabled: !newest, hint: "" };
+  if (!newest) return { disabled: true, hint: "Book a guide and pay the deposit first: the simulated warning goes on your newest booking." };
+  if (newest.status === "captured") return { disabled: false, hint: "" };
+  if (NOT_PAID.includes(newest.status)) return { disabled: true, hint: "Pay for your newest booking first, then simulate: the warning is for a paid booking." };
+  return { disabled: true, hint: `Can't simulate now: ${CANNOT_SIMULATE[newest.status] ?? `your newest booking is ${newest.status}`}.` };
+}
+
 /** The line under the Demo controls after "Simulate a cyclone warning (demo)". */
 export function demoMessage(r) {
   if (!r || r.error) return r?.error ?? "That didn't work.";

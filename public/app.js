@@ -1,6 +1,6 @@
 // The chat page: talks to /api/chat and /api/state, renders the approval card, pay button, guide's
 // phone, inbox and ledger. Polls state so guide answers and webhooks show up without a reload.
-import { demoMessage, demoView, paymentLine } from "/labels.js";
+import { demoMessage, demoView, paymentLine, simulateControl } from "/labels.js";
 
 // The session cookie (HttpOnly) is the traveller's authority. Each tab keeps its own conversation id in
 // sessionStorage and sends it with every request; the server checks the session owns it.
@@ -47,7 +47,10 @@ function render(s) {
   $("mode").textContent = `PayPal: ${s.mode.paypal === "fake" ? "offline fake (same JSON as the sandbox)" : "sandbox"} · model: ${s.mode.model}`;
   const demo = demoView(s.mode.paypal);
   $("demo-controls").hidden = !demo.controls;
-  $("raise-cyclone").disabled = !s.bookings.length;
+  const sim = simulateControl(s.mode.paypal, s.bookings);
+  $("raise-cyclone").disabled = sim.disabled;
+  $("simulate-why").textContent = sim.hint;
+  $("simulate-why").hidden = !sim.hint;
 
   const t = $("transcript");
   t.replaceChildren(...s.transcript.map((m) => el("li", { class: m.role, "data-role": m.role }, m.role === "event" ? m.text.replace(/^\[event\] \w+ bk_[0-9a-f]+: /, "◆ ") : m.text)));
