@@ -190,14 +190,66 @@ only on network errors or 5xx, and only for calls that carry a `PayPal-Request-I
 | S1 | Does a sandbox REST app's token work for orders with a **third-party payee** (`email_address` of another sandbox business account)? | (b) the create reply's status and payee echo |
 | S2 | Can the API caller (the app owner, not the payee) **capture** that order? | (d) |
 | S3 | Does `merchant_id` work as well as `email_address`? | run with `--payee-merchant-id` |
-| S4 | Can the API caller **refund** a capture whose payee is another account, without `PayPal-Auth-Assertion`? | (e). If not, the fallbacks are (i) the guide refunds from their own PayPal (the operator page then says how) or (ii) the report's fallback, an invoice from the guide's own app |
+| S4 | Can the API caller **refund** a capture whose payee is another account, without `PayPal-Auth-Assertion`? | (e1), and (e4) for the rest. If not, the fallbacks are (i) the guide refunds from their own PayPal (the operator page then says how) or (ii) the report's fallback, an invoice from the guide's own app |
 | S5 | Which approve link comes back with `payment_source.paypal.experience_context`: `approve` or `payer-action`? | the printed links |
 | S6 | The capture reply shape, and whether `custom_id` is echoed on the capture | the printed ids |
 | S7 | The exact webhook payloads and headers; `verification_status` values | after deploy: a sandbox webhook to `paypal.ambree.ai`, plus `simulate-event` |
 | S8 | Does a personal sandbox account work as payee (concept A's question)? Not needed for B | optional run |
 | S9 | Currency: EUR versus USD for an MU business sandbox account | run once with each |
 | S10 | JS SDK v6 buttons versus the redirect approve link for a third-party payee | not in the spike; the build uses the approve link (redirect) first |
-| S11 | (Round 10 adds the refund premises listed at the end of §19 to this run.) Does `GET /v1/identity/openidconnect/userinfo?schema=openid`, called with the **app's client-credentials token**, describe the REST app's owner, and is its `payer_id` the owner's merchant id (equal to the id in the sandbox dashboard)? If not, which documented call returns the app owner's merchant id? | row "a2 identity": prints payer_id, user_id, account_type and the field names (never a token). Compare payer_id with the dashboard's merchant id |
+| S11 | (The refund premises at the end of §19 and §20 are S12.) Does `GET /v1/identity/openidconnect/userinfo?schema=openid`, called with the **app's client-credentials token**, describe the REST app's owner, and is its `payer_id` the owner's merchant id (equal to the id in the sandbox dashboard)? If not, which documented call returns the app owner's merchant id? | row "a2 identity": prints payer_id, user_id, account_type and the field names (never a token). Compare payer_id with the dashboard's merchant id |
+| S12 | The **refund premises** the code now depends on (§19 "Verify in spike S11", and §20), numbered in that list's order: **P1** dedupe of a repeated `PayPal-Request-Id`; **P2** `custom_id` on the refund; **P2b** its `links[rel=up]` to the capture; **P3** the resource of `PAYMENT.CAPTURE.REFUNDED` and of `PAYMENT.CAPTURE.REVERSED` (§20); **P4** the refund failure event names; **P5** `seller_payable_breakdown.total_refunded_amount`; **P6** a refund PENDING then FAILED or CANCELLED; **P7** the issue a refused refund carries | (e1)-(e6) on the captured amount A, which must be at least 2.00: e1 refunds 1.00 (`custom_id` "spike-{runId}", request id "spike-refund1-{runId}"); e2 repeats that POST exactly; e3 GETs e1's refund; e4 refunds the rest of A (less e2's 1.00 if it was a second refund); e5 asks 1.00 more of the fully refunded capture under a new request id; e6 repeats e4's request. The block "Refund premises (DESIGN.md §19-§20)" answers P1, P2, P2b, P5 and P7. P3, P4 and P6 need the developer dashboard's webhook simulator and the sandbox webhook event log |
+
+**S12, what each answer changes in the code.** P2 and P2b are read on the POST reply and on GET only; whether
+refund *webhooks* carry them too is P3, read in the event log.
+
+- **P1, dedupe (e2, e6).**
+  - Both DEDUPED: the client's retry and the agent's resend are safe as designed, and I5 and F1 stay the backstop.
+  - e2 NOT DEDUPED: one intent can cost two refunds. I5 and F1 hold the booking, but only after the money
+    moved. The path to revisit is the client's own retry of a refund POST (`#api` retries a write with a
+    request id once on a network error or a 5xx). Whether refund POSTs stop retrying and go straight to
+    `refund_unconfirmed` is a CTO decision.
+  - e2 refused (a 4xx): the client's retry and the resend are refused rather than replayed. A refused resend is
+    held as `unknown` until its refund's own evidence settles it (§18), so this fails closed. The run is then
+    not OK, since this answer is not the expected one.
+  - e2 DEDUPED, e6 refused: dedupe holds while the capture has room, but not once it is fully refunded. A
+    resend after a lost reply of the refund that emptied the capture is held as `unknown`, as above.
+- **P2, `custom_id` (reply, GET).** "yes": the service finds the booking by `custom_id` (`namesBooking`).
+  "no": F2's capture link (P2b) is the only way the service finds it. The spike's `custom_id` equals the
+  order's, as the service's does, so the run can't tell an echo from a copy of the capture's. The code doesn't
+  need to.
+- **P2b, the `up` link (reply, GET).** "yes": F2 works as built. "no" or "other", with P2 "no": a refund
+  whose id is on no booking finds no booking. Then an unknown hold waits for a person, and I5 can't see a
+  duplicate. With P1 NO as well, the code needs another way to find a refund's booking before the demo.
+- **P5, `total_refunded_amount` (reply, GET, running total).**
+  - absent: F1 is skipped and I5 alone applies.
+  - present and a running total: F1 works as built.
+  - only the refund's own amount, or a GET that shows the total from when that refund was made: F1
+    under-detects, never over-holds, since `paypal_refunded_minor` keeps the largest total seen. I5 still
+    applies. A larger total than the refunds made (fees, the gross, pending counted twice) would hold
+    falsely, and F1's reading must change.
+  - The run can't tell whether a PENDING refund is counted: sandbox refunds complete at once.
+- **P7, the refusal issues (e5, e6).** The service matches only the first issue (`PayPalError.issue`) against
+  `ALREADY_REFUNDED_ISSUES` (`CAPTURE_FULLY_REFUNDED`, `REFUND_AMOUNT_EXCEEDED` in `src/booking/service.ts`).
+  If e5's first issue isn't in that list, a fresh refund refused on a capture refunded out of band is marked
+  `failed`, not held as `already_refunded`. Then add the issue to the list. The spike prints every issue
+  (`PayPalError.issues`).
+- **P3, P4, P6 (not in the run).**
+  - P3: `handleWebhook` takes every `PAYMENT.CAPTURE.REFUNDED` as a refund event and weighs its resource as
+    the refund (`#refundEvidenceNow`), as the fake sends it. If the real resource is the capture, that
+    premise and the evidence tests built on it are wrong for real events. If `REVERSED`'s resource is the
+    capture, a reversal goes unnoticed until a person looks (§20).
+  - P4: subscribe to the exact names (DEPLOY.md's TODO-CHECK).
+  - P6: if a sandbox refund can't go PENDING and then FAILED, R9-3 and R9-4 (C2) stay tested on the fake only.
+
+**The run's money guard** (`RefundBudget` in the spike) is asserted before every refund POST.
+- A POST that may make a new refund (e1, e2, e4) must keep the worst case within A. The worst case counts the
+  amount once for every exchange that may have reached PayPal, the client's own retry included; e2 counts as
+  new.
+- A probe (e5, e6) is sent only once PayPal's own replies show all of A refunded. The probe asks beyond A on
+  purpose, but PayPal can only refuse it or replay an earlier reply.
+- The run is OK when every planned call ran: e1-e4 answer with a refund (e4 may be not needed, at A = 2.00
+  without dedupe), e5 with a 4xx, and e6 with e4's refund or a 4xx.
 
 ## 6. The agent's tools (one registry: `src/tools/`; served to the model and over MCP)
 

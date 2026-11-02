@@ -156,13 +156,33 @@ other than `https://api-m.sandbox.paypal.com`.
 
 ### Check PayPal itself: the spike
 
-`scripts/spike.ts` runs one real sandbox order whose payee is another sandbox account: token, create, your
-approval in a browser, capture, full refund. It prints a table of HTTP statuses and ids, and never a token or
-secret.
+`scripts/spike.ts` runs one real sandbox order whose payee is another sandbox account. The steps are the
+token, create, your approval in a browser and the capture. Then come six refund calls on the captured amount
+A, which answer the refund premises the code depends on (DESIGN.md §5 S12):
+- e1 refunds 1.00, and e2 sends the same request again;
+- e3 reads e1 back;
+- e4 refunds the rest;
+- e5 asks 1.00 more of the emptied capture, and e6 repeats e4.
+
+PayPal refunds all of A in the end, never more. The run prints a table of HTTP statuses and ids, then a block
+"Refund premises (DESIGN.md §19-§20)". It never prints a token, a secret or the client id.
 
 ```bash
 PAYPAL_CLIENT_ID=... PAYPAL_CLIENT_SECRET=... node scripts/spike.ts --payee-merchant-id GUIDEMERCHANT1
 ```
+
+Keep the default amount (10.00): the refund calls need A of at least 2.00, and below that they are refused
+and nothing is refunded. `--no-refund` skips them.
+
+**What to paste back:**
+- Everything from the table's `step | call` header to the `SPIKE OK` or `SPIKE FAILED` line: the table, the
+  premise block (P1, P2, P2b, P5, P7) and the verdict.
+- The spike can't answer P3, P4 and P6. They come from the developer dashboard, in the sandbox app's webhook
+  simulator and its webhook event log:
+  - the `resource_type` of a `PAYMENT.CAPTURE.REFUNDED` and a `PAYMENT.CAPTURE.REVERSED` event, and whether
+    the resource carries `custom_id` and `links[rel=up]`;
+  - the exact names of the refund failure events in the event list;
+  - whether a refund ever shows PENDING and then FAILED or CANCELLED.
 
 ## For judges
 
