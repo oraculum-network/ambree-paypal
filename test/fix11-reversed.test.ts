@@ -7,9 +7,10 @@
 
 import { describe, expect, it } from "vitest";
 import { systemPrompt } from "../src/agent/loop.ts";
+import { ScriptedModel } from "../src/agent/scripted.ts";
 import { findTool, runTool } from "../src/tools/registry.ts";
 import { expectMoneyTruth } from "./helpers/evidence.ts";
-import { CONV, type World, deliver, keepWebhooks, paid } from "./helpers/race.ts";
+import { CONV, type World, deliver, eventType, keepWebhooks, paid } from "./helpers/race.ts";
 import { makeWorld } from "./helpers/world.ts";
 
 const MOVED = "2026-11-08";
@@ -37,6 +38,7 @@ describe("PAYMENT.CAPTURE.REVERSED with a refund resource is refund evidence", (
     const resource = await w.payments.getRefund(reversal.id);
     w.fake.emitWebhook("PAYMENT.CAPTURE.REVERSED", "refund", resource);
     await w.fake.flush();
+    expect(eventType(got.at(-1)!)).toBe("PAYMENT.CAPTURE.REVERSED"); // not the fake's own REFUNDED for it
     expect(await deliver(w, got.at(-1)!)).toEqual({ status: 200, result: "logged" });
     const b = w.service.get(id)!;
     expect(b).toMatchObject({ status: "needs_review", refunded_minor: 0 });
@@ -51,6 +53,7 @@ describe("PAYMENT.CAPTURE.REVERSED with a refund resource is refund evidence", (
     const { w, id, got, captureId } = await booked(true);
     w.fake.emitWebhook("PAYMENT.CAPTURE.REVERSED", "capture", { id: captureId, status: "REVERSED", custom_id: id });
     await w.fake.flush();
+    expect(eventType(got.at(-1)!)).toBe("PAYMENT.CAPTURE.REVERSED");
     expect(await deliver(w, got.at(-1)!)).toEqual({ status: 200, result: "logged" });
     expect(row(w, id, "refund.unexplained")).toEqual([]);
   });
@@ -71,5 +74,21 @@ describe("the resend texts promise only what the code keeps", () => {
       expect(text).toMatch(/same PayPal-Request-Id/);
       expect(text).toMatch(/held for review/);
     }
+  });
+});
+
+describe("the scripted agent's own words after refund_unconfirmed", () => {
+  it("tells the traveller it may have gone through and to check the booking; no tool code or PayPal header names", async () => {
+    const BK = "bk_0123456789ab";
+    const error = "refund_unconfirmed: PayPal gave no definitive answer (network), so the refund may have gone through. Calling refund_payment again resends the same refund with the same PayPal-Request-Id, so PayPal can recognise it.";
+    const r = await new ScriptedModel(() => "2026-11-03").complete([
+      { role: "user", content: `[event] refund_offered ${BK}: The guide offered to refund the deposit.` },
+      { role: "assistant", content: null, tool_calls: [{ id: "c1", name: "refund_payment", arguments: JSON.stringify({ booking_id: BK }) }] },
+      { role: "tool", tool_call_id: "c1", name: "refund_payment", content: JSON.stringify({ error }) },
+    ]);
+    expect(r.content).toMatch(/couldn't confirm the refund/);
+    expect(r.content).toMatch(/may already have gone through/);
+    expect(r.content).toMatch(/check the booking/);
+    expect(r.content).not.toMatch(/PayPal-Request-Id|refund_unconfirmed|refund_payment/);
   });
 });
