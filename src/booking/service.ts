@@ -1171,24 +1171,18 @@ export class BookingService {
    * Records PayPal's word on refund operation `n`: a reply to its send, a GET, or (`evidence`) the refund's
    * webhook read back by GET while its outcome was unknown. It runs after a PayPal call, so it merges the
    * refund's own fields (refund_ops, refunded_minor, refund_ids, status) onto the booking as stored now. The
-   * booking's status follows its refunds (statusFromRefunds), so an operation held only because its outcome
-   * was unknown takes the booking out of review once it is settled and nothing else holds it.
+   * booking's status follows its refunds (#saveRefunds), so an operation held only because its outcome was
+   * unknown takes the booking out of review once it is settled and nothing else holds it.
    */
   #applyRefund(bookingId: string, n: number, refund: Refund, opts: { evidence?: boolean } = {}): Booking {
     const b = this.must(bookingId);
     const op = b.refund_ops.find((o) => o.n === n)!;
     const cur = b.captured!.currency_code;
     const actual = op.amount_minor;
-    // Held for review by something other than its refunds (after capture only a writer outside the service
-    // could do that): it stays held whatever the refund says.
-    const heldElsewhere = b.status === "needs_review" && !b.refund_ops.some((o) => o.status === "needs_review");
     // Settled by evidence its own call never heard of: the next refund call reports it (I3).
     const ack: Partial<RefundOp> = opts.evidence ? { acknowledged: false } : {};
-    /** Operation `n` patched, and the booking's status as its refunds then leave it. */
-    const settle = (patch: Partial<RefundOp>, extra: Partial<Booking> = {}): Booking => {
-      const next: Booking = { ...b, ...extra, refund_ops: b.refund_ops.map((o) => (o.n === n ? { ...o, review_cause: undefined, ...patch } : o)) };
-      return { ...next, status: heldElsewhere ? "needs_review" : statusFromRefunds(next) };
-    };
+    /** The operations with operation `n` patched. */
+    const patched = (patch: Partial<RefundOp>): RefundOp[] => b.refund_ops.map((o) => (o.n === n ? { ...o, review_cause: undefined, ...patch } : o));
     if (refund.status === "COMPLETED" || refund.status === "PENDING") {
       // Fail closed: PayPal's reply must carry exactly the persisted operation's currency and amount.
       // Anything else stops the booking for review: nothing is counted as refunded, nothing is announced,
@@ -1200,40 +1194,46 @@ export class BookingService {
         got = -1;
       }
       if (got !== op.amount_minor) {
-        const next = this.#setOp({ ...b, status: "needs_review" }, n, { status: "needs_review", review_cause: "mismatch", refund_id: refund.id });
-        this.#log(next, "refund.reconcile_failed", { n, refund_id: refund.id, status: refund.status, expected: { currency_code: cur, value: fromMinor(op.amount_minor) }, got: refund.amount ?? null });
-        return next;
+        const held = { ...b, refund_ops: patched({ status: "needs_review", review_cause: "mismatch", refund_id: refund.id }) };
+        return this.#saveRefunds(b, held, [["refund.reconcile_failed", { n, refund_id: refund.id, status: refund.status, expected: { currency_code: cur, value: fromMinor(op.amount_minor) }, got: refund.amount ?? null }]]).booking;
       }
     }
     if (refund.status === "COMPLETED") {
       // Another operation in review keeps the whole booking in review: a later success never clears it.
-      const done = settle({ status: "completed", refund_id: refund.id, amount_minor: actual, ...ack }, { refunded_minor: b.refunded_minor + actual, refund_ids: [...b.refund_ids, refund.id] });
-      // A refund that completes, in part or in full, closes a move still waiting for the guide (it can't be
-      // answered any more: the booking is no longer `captured`): withdrawn in the same save, and logged
-      // after the refund. A booking held for review keeps its move as it was.
-      const pendingMove = (done.status === "refunded" || done.status === "partially_refunded") && b.reschedule?.status === "proposed" ? b.reschedule : undefined;
-      const closed = pendingMove ? { reschedule: { ...pendingMove, status: "withdrawn" as const } } : {};
-      assertOneUnknown(done);
-      const next = this.#save({ ...done, ...closed });
-      this.#log(next, "refund.completed", { n, refund_id: refund.id, status: refund.status, amount: { currency_code: cur, value: fromMinor(actual) }, reason: op.reason });
-      if (pendingMove) this.#log(next, "reschedule.withdrawn", { from: b.date, to: pendingMove.new_date, reason: next.status === "refunded" ? "the deposit was refunded" : "part of the deposit was refunded" });
-      const withdrawn = pendingMove ? ` The move to ${pendingMove.new_date} is withdrawn: the guide is no longer asked.` : "";
+      const done = { ...b, refunded_minor: b.refunded_minor + actual, refund_ids: [...b.refund_ids, refund.id], refund_ops: patched({ status: "completed", refund_id: refund.id, amount_minor: actual, ...ack }) };
+      const { booking: next, withdrawn: move } = this.#saveRefunds(b, done, [["refund.completed", { n, refund_id: refund.id, status: refund.status, amount: { currency_code: cur, value: fromMinor(actual) }, reason: op.reason }]]);
+      const withdrawn = move ? ` The move to ${move.new_date} is withdrawn: the guide is no longer asked.` : "";
       this.#d.channels.emit(b.conversation_id, { type: "refunded", booking_id: b.id, text: `Refunded ${cur} ${fromMinor(actual)} from ${b.guide_name} to the traveller (${op.reason}).${withdrawn}` });
       return next;
     }
     if (refund.status === "PENDING") {
-      const pending = settle({ status: "pending", refund_id: refund.id, amount_minor: actual, ...ack });
-      assertOneUnknown(pending);
-      const next = this.#save(pending);
-      if (op.status !== "pending") this.#log(next, "refund.pending", { n, refund_id: refund.id, amount: { currency_code: cur, value: fromMinor(actual) } });
-      return next;
+      const pending = { ...b, refund_ops: patched({ status: "pending", refund_id: refund.id, amount_minor: actual, ...ack }) };
+      return this.#saveRefunds(b, pending, op.status !== "pending" ? [["refund.pending", { n, refund_id: refund.id, amount: { currency_code: cur, value: fromMinor(actual) } }]] : []).booking;
     }
     // FAILED, CANCELLED or any other terminal status: the money didn't move, so the reservation is released.
-    const failed = settle({ status: "failed", refund_id: refund.id, ...ack });
-    assertOneUnknown(failed);
-    const next = this.#save(failed);
-    this.#log(next, "refund.failed", { n, refund_id: refund.id, status: refund.status });
-    return next;
+    const failed = { ...b, refund_ops: patched({ status: "failed", refund_id: refund.id, ...ack }) };
+    return this.#saveRefunds(b, failed, [["refund.failed", { n, refund_id: refund.id, status: refund.status }]]).booking;
+  }
+
+  /**
+   * The one save for a booking whose refunds changed (`next`, built from `prev` as stored now): its status
+   * is derived from its refunds (statusFromRefunds), unless something other than its refunds holds it for
+   * review (after capture only a writer outside the service could do that: it stays held). Round 10, F3:
+   * whichever settle leaves it refunded or partially refunded withdraws a move still waiting for the guide
+   * in the same save (it can't be answered any more: the booking is no longer `captured`); a booking held
+   * for review keeps its move as it was. Then `rows` are logged in order, and `reschedule.withdrawn` after
+   * them.
+   */
+  #saveRefunds(prev: Booking, next: Booking, rows: Array<[string, Record<string, unknown>]>): { booking: Booking; withdrawn?: NonNullable<Booking["reschedule"]> } {
+    const heldElsewhere = prev.status === "needs_review" && !prev.refund_ops.some((o) => o.status === "needs_review");
+    const status = heldElsewhere ? "needs_review" : statusFromRefunds(next);
+    const move = (status === "refunded" || status === "partially_refunded") && next.reschedule?.status === "proposed" ? next.reschedule : undefined;
+    const settled: Booking = { ...next, status, ...(move ? { reschedule: { ...move, status: "withdrawn" as const } } : {}) };
+    assertOneUnknown(settled);
+    const saved = this.#save(settled);
+    for (const [kind, data] of rows) this.#log(saved, kind, data);
+    if (move) this.#log(saved, "reschedule.withdrawn", { from: prev.date, to: move.new_date, reason: status === "refunded" ? "the deposit was refunded" : "part of the deposit was refunded" });
+    return { booking: saved, withdrawn: move };
   }
 
   /** What tools and the page may show of a booking: never the operator token or the mandate nonce. */
