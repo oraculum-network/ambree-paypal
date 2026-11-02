@@ -246,8 +246,10 @@ describe("round 4: sandbox mode end to end (the fake stands in for PayPal's sand
     const asked = await tab.json("/api/chat", { message: "Please refund my deposit" });
     expect(asked.replies.at(-1)).toMatch(/didn't work.*doesn't allow a refund by itself/);
     expect(fake.calls.filter((c) => c.path.endsWith("/refund"))).toHaveLength(0);
-    expect(await (await fetch(link)).text()).toContain("Move the trip?");
-    await form(link, { action: "decline_reschedule" });
+    const question = await (await fetch(link)).text();
+    expect(question).toContain("Move the trip?");
+    // As the page's decline form posts it: it names the move it answers (round 8).
+    await form(link, { action: "decline_reschedule", proposal: question.match(/name="proposal" value="([^"]+)"/)![1]! });
 
     st = await until(tab, (x) => x.bookings[0]?.status === "refunded", "refund");
     expect(fake.calls.filter((c) => c.method === "POST" && c.path.endsWith("/refund"))).toHaveLength(1);

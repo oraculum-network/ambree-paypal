@@ -3,7 +3,7 @@
 // answer, or a refund offer. Plain HTML forms, so it works on any phone browser.
 
 import type { Booking, BookingService } from "../booking/service.ts";
-import { ServiceError, rescheduleAnswerable } from "../booking/service.ts";
+import { ServiceError, proposalKey, rescheduleAnswerable } from "../booking/service.ts";
 import { formatMoney } from "../paypal/money.ts";
 
 export function esc(s: unknown): string {
@@ -42,10 +42,12 @@ ${form(token, "decline", "I can't do this date", "", "secondary")}</section>`);
 <p class="small mono">quote hash ${esc(b.quote_hash)}</p></section>`);
   }
 
-  // Only while the guide can still answer: captured, and no refund started (see answerReschedule).
+  // Only while the guide can still answer: captured, and no refund started (see answerReschedule). Both
+  // forms name the move they answer, so a page left open answers only the move it shows.
   if (b.reschedule && rescheduleAnswerable(b)) {
+    const asked = `<input type="hidden" name="proposal" value="${esc(proposalKey(b))}">`;
     parts.push(`<section class="card warn"><h2>Move the trip?</h2><p>Ambree asks to move the trip from ${esc(b.date)} to <strong>${esc(b.reschedule.new_date)}</strong> because of the weather.</p>
-${form(token, "accept_reschedule", `Yes, ${b.reschedule.new_date} works`)}${form(token, "decline_reschedule", "No, I can't", "", "secondary")}</section>`);
+${form(token, "accept_reschedule", `Yes, ${b.reschedule.new_date} works`, asked)}${form(token, "decline_reschedule", "No, I can't", asked, "secondary")}</section>`);
   }
   if ((b.status === "captured" || b.status === "partially_refunded") && !b.refund_offered) {
     parts.push(`<section class="card"><h2>Can't run it?</h2>${form(token, "offer_refund", "Offer the traveller a refund", "", "secondary")}</section>`);
@@ -59,7 +61,9 @@ export function renderInvalidLink(): string {
 
 /**
  * Applies a form post from the operator page. Returns the flash message to show. Each step queues behind
- * whatever else is changing this booking (a refund waiting on PayPal, say) and is decided after it.
+ * whatever else is changing this booking (a refund waiting on PayPal, say) and is decided after it. A
+ * reschedule answer must name the move it answers (the form's `proposal`); one that names none, or an
+ * earlier move, is refused, and the page shown after it asks the current question.
  */
 export async function applyOperatorAction(service: BookingService, token: string, form: URLSearchParams): Promise<{ ok: boolean; text: string }> {
   try {
@@ -71,10 +75,10 @@ export async function applyOperatorAction(service: BookingService, token: string
         await service.declineRequest(token);
         return { ok: true, text: "Declined. The traveller will be told." };
       case "accept_reschedule":
-        await service.answerReschedule(token, true);
+        await service.answerReschedule(token, true, form.get("proposal") ?? "");
         return { ok: true, text: "Moved. Thank you." };
       case "decline_reschedule":
-        await service.answerReschedule(token, false);
+        await service.answerReschedule(token, false, form.get("proposal") ?? "");
         return { ok: true, text: "Noted: the traveller may get the deposit back." };
       case "offer_refund":
         await service.offerRefund(token);

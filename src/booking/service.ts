@@ -70,9 +70,10 @@ export interface Booking {
   refund_ops: RefundOp[];
   /**
    * `withdrawn`: a refund of the deposit (in part, since round 7, or in full) completed while the guide hadn't
-   * answered (added in round 6; additive).
+   * answered (added in round 6; additive). `n`: which proposal on this booking this is (1, 2, …), so an
+   * answer names the move it answers (round 8; absent on older records, which count as 0).
    */
-  reschedule?: { new_date: string; status: "proposed" | "accepted" | "declined" | "withdrawn" };
+  reschedule?: { new_date: string; status: "proposed" | "accepted" | "declined" | "withdrawn"; n?: number };
   refund_offered: boolean;
   /**
    * The demo control's simulated cyclone warning (source "simulated") for this booking only, set once. It
@@ -149,6 +150,14 @@ export function refundStarted(b: Booking): boolean {
 /** Whether the guide can answer a proposed move now: the booking is captured and no refund has started. */
 export function rescheduleAnswerable(b: Booking): boolean {
   return b.reschedule?.status === "proposed" && b.status === "captured" && !refundStarted(b);
+}
+
+/**
+ * The move the guide's page asks about, as its accept and decline forms name it: the proposal's number and
+ * date. An answer that names another key was rendered for an earlier move and is refused (`stale_reschedule`).
+ */
+export function proposalKey(b: Booking): string | undefined {
+  return b.reschedule ? `${b.reschedule.n ?? 0}:${b.reschedule.new_date}` : undefined;
 }
 
 /** What a refused refund says about this booking, on which no refund rule holds. */
@@ -738,7 +747,7 @@ export class BookingService {
       if (b.status !== "captured") throw new ServiceError("wrong_state", `Only a paid booking can be moved (it is ${b.status}).`);
       if (refundStarted(b)) throw new ServiceError("wrong_state", "A refund of the deposit has started, so the trip can't be moved.");
       if (b.reschedule?.status === "proposed") throw new ServiceError("pending", "A reschedule is already waiting for the guide.");
-      const next = this.#save({ ...b, reschedule: { new_date: newDate, status: "proposed" } });
+      const next = this.#save({ ...b, reschedule: { new_date: newDate, status: "proposed", n: (b.reschedule?.n ?? 0) + 1 } });
       this.#log(next, "reschedule.proposed", { from: b.date, to: newDate });
       return next;
     });
@@ -747,20 +756,26 @@ export class BookingService {
   /**
    * The guide answers a proposed move; only while the booking is still paid and not refunded (captured)
    * and no refund has started (one being sent or pending leaves the booking captured until PayPal answers).
+   * `proposal` is the move the answer was given to (`proposalKey`, from the page's form; the page always
+   * sends it): an answer to an earlier move, already answered or replaced, changes nothing
+   * (`stale_reschedule`). Left out, the answer is for the move proposed now (the service's own callers).
    * Queued: an answer sent while a refund is deciding or waiting on PayPal is decided after it.
    */
-  async answerReschedule(token: string, accept: boolean): Promise<Booking> {
+  async answerReschedule(token: string, accept: boolean, proposal?: string): Promise<Booking> {
     const id = this.#byTokenOrThrow(token).id;
-    return this.#serial(id, () => this.#answerNow(id, accept));
+    return this.#serial(id, () => this.#answerNow(id, accept, proposal));
   }
 
-  #answerNow(bookingId: string, accept: boolean): Booking {
+  #answerNow(bookingId: string, accept: boolean, proposal: string | undefined): Booking {
     const b = this.must(bookingId);
     if (b.reschedule?.status !== "proposed") throw new ServiceError("no_reschedule", "No reschedule is waiting.");
+    if (proposal !== undefined && proposal !== proposalKey(b)) {
+      throw new ServiceError("stale_reschedule", "That answer was for an earlier move, which was already answered or replaced; nothing was changed. The page now shows the move asked about now.");
+    }
     if (b.status !== "captured") throw new ServiceError("wrong_state", `The booking is ${b.status}, so the trip can no longer be moved.`);
     if (refundStarted(b)) throw new ServiceError("wrong_state", "A refund of the deposit has started, so the trip can no longer be moved.");
     const to = b.reschedule.new_date;
-    const next = this.#save(accept ? { ...b, date: to, reschedule: { new_date: to, status: "accepted" } } : { ...b, reschedule: { new_date: to, status: "declined" } });
+    const next = this.#save(accept ? { ...b, date: to, reschedule: { ...b.reschedule, status: "accepted" } } : { ...b, reschedule: { ...b.reschedule, status: "declined" } });
     this.#log(next, accept ? "reschedule.accepted" : "reschedule.declined", { from: b.date, to });
     this.#d.channels.emit(b.conversation_id, {
       type: "reschedule_answered",
@@ -941,7 +956,7 @@ export class BookingService {
       // answered any more: the booking is no longer `captured`): withdrawn in the same save, and logged
       // after the refund. A booking held for review keeps its move as it was.
       const pendingMove = (status === "refunded" || status === "partially_refunded") && b.reschedule?.status === "proposed" ? b.reschedule : undefined;
-      const closed = pendingMove ? { reschedule: { new_date: pendingMove.new_date, status: "withdrawn" as const } } : {};
+      const closed = pendingMove ? { reschedule: { ...pendingMove, status: "withdrawn" as const } } : {};
       const next = this.#setOp({ ...b, refunded_minor: refunded, refund_ids: [...b.refund_ids, refund.id], status, ...closed }, n, { status: "completed", refund_id: refund.id, amount_minor: actual });
       this.#log(next, "refund.completed", { n, refund_id: refund.id, status: refund.status, amount: { currency_code: cur, value: fromMinor(actual) }, reason: op.reason });
       if (pendingMove) this.#log(next, "reschedule.withdrawn", { from: b.date, to: pendingMove.new_date, reason: status === "refunded" ? "the deposit was refunded" : "part of the deposit was refunded" });
@@ -978,7 +993,7 @@ export class BookingService {
       capture: b.capture_id && b.captured ? { id: b.capture_id, amount: b.captured, status: b.capture_status ?? null } : b.capture_id ? { id: b.capture_id, amount: null, status: b.capture_status ?? null } : null,
       refunded: b.captured ? { currency_code: b.captured.currency_code, value: fromMinor(b.refunded_minor) } : null,
       refund_pending: b.captured && pending ? { currency_code: b.captured.currency_code, value: fromMinor(pending) } : null,
-      reschedule: b.reschedule ?? null,
+      reschedule: b.reschedule ? { new_date: b.reschedule.new_date, status: b.reschedule.status } : null,
       refund_offered: b.refund_offered,
       simulated_warning: b.simulated_alert ? { name: b.simulated_alert.name, level: b.simulated_alert.level, date: b.simulated_alert.from } : null,
     };

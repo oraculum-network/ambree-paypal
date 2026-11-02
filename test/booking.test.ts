@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { ServiceError } from "../src/booking/service.ts";
+import { ServiceError, proposalKey } from "../src/booking/service.ts";
 import { SEED_GUIDES, guidesWithPayee, searchGuides } from "../src/guides/seed.ts";
 import { MANDATE_TTL_MS } from "../src/mandate/mandate.ts";
 import { applyOperatorAction, renderOperatorPage } from "../src/operator/page.ts";
@@ -284,7 +284,7 @@ describe("cyclone → reschedule or refund", () => {
     const { w, id, token } = await paid();
     await w.service.proposeReschedule(id, "2026-11-07");
     expect(renderOperatorPage(token, w.service.get(id)!)).toContain("Move the trip?");
-    await applyOperatorAction(w.service, token, new URLSearchParams({ action: "accept_reschedule" }));
+    await applyOperatorAction(w.service, token, new URLSearchParams({ action: "accept_reschedule", proposal: proposalKey(w.service.get(id)!)! }));
     const b = w.service.get(id)!;
     expect(b.date).toBe("2026-11-07");
     expect(b.status).toBe("captured");
@@ -295,7 +295,7 @@ describe("cyclone → reschedule or refund", () => {
     const { w, id, token } = await paid();
     await w.service.proposeReschedule(id, "2026-11-07");
     await expect(later(() => w.service.proposeReschedule(id, "2026-11-08"))).rejects.toThrow(/already waiting/);
-    await applyOperatorAction(w.service, token, new URLSearchParams({ action: "decline_reschedule" }));
+    await applyOperatorAction(w.service, token, new URLSearchParams({ action: "decline_reschedule", proposal: proposalKey(w.service.get(id)!)! }));
     expect(await w.service.refundReason(w.service.get(id)!)).toBe("the guide declined the reschedule");
     expect((await w.service.refund(id)).status).toBe("refunded");
     const refundCall = w.fake.calls.find((c) => c.path.endsWith("/refund"))!;

@@ -4,7 +4,7 @@
 // be answered and the guide's page no longer asks. A refund PayPal refused (`failed`) blocks nothing.
 
 import { describe, expect, it } from "vitest";
-import { ServiceError } from "../src/booking/service.ts";
+import { ServiceError, proposalKey } from "../src/booking/service.ts";
 import { applyOperatorAction, renderOperatorPage } from "../src/operator/page.ts";
 import { DATE, type World, gate, kinds, later, paid, slow } from "./helpers/race.ts";
 import { makeWorld } from "./helpers/world.ts";
@@ -28,8 +28,12 @@ async function expectNoAnswer(w: World, id: string, token: string) {
     expect((e as ServiceError).message).toMatch(/refund/);
   }
   expect(renderOperatorPage(token, w.service.get(id)!)).not.toContain(QUESTION);
-  expect((await applyOperatorAction(w.service, token, new URLSearchParams({ action: "accept_reschedule" }))).ok).toBe(false);
-  expect((await applyOperatorAction(w.service, token, new URLSearchParams({ action: "decline_reschedule" }))).ok).toBe(false);
+  // As the page's forms post them, naming the move asked about (round 8): refused because of the refund.
+  const proposal = proposalKey(w.service.get(id)!)!;
+  for (const action of ["accept_reschedule", "decline_reschedule"]) {
+    const flash = await applyOperatorAction(w.service, token, new URLSearchParams({ action, proposal }));
+    expect(flash, action).toMatchObject({ ok: false, text: expect.stringMatching(/refund/) });
+  }
   expect(w.service.get(id)!.date).toBe(DATE);
   expect(answers(w, id)).toEqual([]);
 }
@@ -51,7 +55,8 @@ describe("R3: no answer to a move once a refund is under way", () => {
     expect(renderOperatorPage(token, w.service.get(id)!)).not.toContain(QUESTION);
     const refused = (p: Promise<unknown>) => p.then(() => undefined, (e: unknown) => e);
     const answering = [true, false].map((accept) => refused(later(() => w.service.answerReschedule(token, accept))));
-    const posting = later(() => applyOperatorAction(w.service, token, new URLSearchParams({ action: "accept_reschedule" })));
+    const proposal = proposalKey(w.service.get(id)!)!;
+    const posting = later(() => applyOperatorAction(w.service, token, new URLSearchParams({ action: "accept_reschedule", proposal })));
     g.release();
     expect(await refunding).toMatchObject({ status: "refunded", date: DATE, reschedule: { status: "withdrawn" } });
     for (const e of await Promise.all(answering)) expect(e).toMatchObject({ code: "no_reschedule" });

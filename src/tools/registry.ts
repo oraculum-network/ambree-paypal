@@ -144,7 +144,7 @@ export const TOOLS = [
     run: async (a, ctx) => {
       own(ctx, a.booking_id);
       const b = await ctx.service.proposeReschedule(a.booking_id, a.new_date);
-      return { booking_id: b.id, reschedule: b.reschedule, sent: "The guide was asked on their page." };
+      return { booking_id: b.id, reschedule: ctx.service.summary(b).reschedule, sent: "The guide was asked on their page." };
     },
   }),
   define({

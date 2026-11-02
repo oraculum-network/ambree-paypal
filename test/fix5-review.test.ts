@@ -8,7 +8,7 @@
 // F5 each refused simulation says accurately why.
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { type Booking, type BookingStatus, ServiceError } from "../src/booking/service.ts";
+import { type Booking, type BookingStatus, ServiceError, proposalKey } from "../src/booking/service.ts";
 import { applyOperatorAction, renderOperatorPage } from "../src/operator/page.ts";
 import type { PaymentsApi } from "../src/paypal/api.ts";
 import { FAKE_CLIENT_ID, FAKE_CLIENT_SECRET, FAKE_WEBHOOK_ID, FakePayPal } from "../src/paypal/fake.ts";
@@ -327,7 +327,7 @@ describe("F3: a simulated warning never unlocks a refund by itself", () => {
     await later(() => w.service.simulateCyclone(id));
     await w.service.proposeReschedule(id, "2026-11-08");
     expect(await w.service.refundReason(w.service.get(id)!)).toBeUndefined();
-    await applyOperatorAction(w.service, token, new URLSearchParams({ action: "decline_reschedule" }));
+    await applyOperatorAction(w.service, token, new URLSearchParams({ action: "decline_reschedule", proposal: proposalKey(w.service.get(id)!)! }));
     expect(await w.service.refundReason(w.service.get(id)!)).toBe("the guide declined the reschedule");
     expect((await w.service.refund(id)).status).toBe("refunded");
     const requested = w.ledger.list(id).find((e) => e.kind === "refund.requested")!;
@@ -370,7 +370,7 @@ describe("F3: a reschedule can be answered only while the booking is captured", 
     // No answer was recorded. (Since round 6 the full refund itself withdraws the waiting move: fix6-withdrawn.)
     expect(kinds(w, id).filter((k) => k.startsWith("reschedule.") && k !== "reschedule.proposed")).toEqual(["reschedule.withdrawn"]);
     expect(renderOperatorPage(token, w.service.get(id)!)).not.toContain("Move the trip?");
-    expect((await applyOperatorAction(w.service, token, new URLSearchParams({ action: "accept_reschedule" }))).ok).toBe(false);
+    expect((await applyOperatorAction(w.service, token, new URLSearchParams({ action: "accept_reschedule", proposal: proposalKey(before)! }))).ok).toBe(false);
   });
 
   it("a captured booking still shows and takes the answer", async () => {

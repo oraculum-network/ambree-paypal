@@ -89,8 +89,10 @@ describe("the whole flow over HTTP (fake PayPal, scripted model)", () => {
     expect((await post("/api/demo/cyclone", {})).bookings_warned).toBe(1);
     s = await until((x) => x.bookings[0]?.reschedule?.status === "proposed", "reschedule");
     expect(s.transcript.at(-1).text).toMatch(/move the trip to 2026-11-08/);
-    expect(await (await fetch(link)).text()).toContain("Move the trip?");
-    await operator(link, { action: "decline_reschedule" });
+    const asked = await (await fetch(link)).text();
+    expect(asked).toContain("Move the trip?");
+    // As the page's decline form posts it: it names the move it answers (round 8).
+    await operator(link, { action: "decline_reschedule", proposal: asked.match(/name="proposal" value="([^"]+)"/)![1]! });
 
     s = await until((x) => x.bookings[0]?.status === "refunded" && x.ledger.some((e: State) => e.kind === "webhook.PAYMENT.CAPTURE.REFUNDED"), "refund");
     expect(s.bookings[0].guide_balance).toBe(0);
