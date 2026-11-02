@@ -639,9 +639,11 @@ export class BookingService {
     return next;
   }
 
+  /** The guide answers a proposed move; only while the booking is still paid and not refunded (captured). */
   answerReschedule(token: string, accept: boolean): Booking {
     const b = this.#byTokenOrThrow(token);
     if (b.reschedule?.status !== "proposed") throw new ServiceError("no_reschedule", "No reschedule is waiting.");
+    if (b.status !== "captured") throw new ServiceError("wrong_state", `The booking is ${b.status}, so the trip can no longer be moved.`);
     const to = b.reschedule.new_date;
     const next = this.#save(accept ? { ...b, date: to, reschedule: { new_date: to, status: "accepted" } } : { ...b, reschedule: { new_date: to, status: "declined" } });
     this.#log(next, accept ? "reschedule.accepted" : "reschedule.declined", { from: b.date, to });
@@ -663,15 +665,17 @@ export class BookingService {
     return next;
   }
 
-  /** Why a refund is allowed now, or undefined. */
+  /**
+   * Why a refund is allowed now, or undefined: (a) a real feed warning (orange or red) covers the date,
+   * (b) the guide declined the reschedule, or (c) the guide offered it. The demo's simulated warning never
+   * allows one by itself: it only gets the agent to propose a new date, and the guide's answer decides.
+   */
   async refundReason(b: Booking): Promise<string | undefined> {
     if (b.status !== "captured" && b.status !== "partially_refunded") return undefined;
     if (b.refund_offered) return "the guide offered it";
     if (b.reschedule?.status === "declined") return "the guide declined the reschedule";
-    const alerts = (await this.#alertsFor(b)).filter((a) => a.level !== "green");
-    if (alerts.some((a) => a.source !== "simulated")) return "a cyclone warning covers the date";
-    if (alerts.length) return "a simulated cyclone warning (demo) covers the date";
-    return undefined;
+    const real = (await this.#d.weather.alertsFor(b.date)).filter((a) => a.level !== "green" && a.source !== "simulated");
+    return real.length ? "a cyclone warning covers the date" : undefined;
   }
 
   /** Minor units completed, pending or still being sent: none of it may be refunded again. */
@@ -698,7 +702,10 @@ export class BookingService {
         const reason = await this.refundReason(b);
         // The reason waited on the weather feed: reserve the refund on the booking as stored now.
         b = this.must(bookingId);
-        if (!reason) throw new ServiceError("refund_not_allowed", "A refund needs a cyclone warning (orange or red) on the date, a declined reschedule, or the guide's offer.");
+        if (!reason) {
+          const simulated = b.simulated_alert ? " A simulated cyclone warning (demo) doesn't allow a refund by itself: the guide has to decline the new date or offer the refund." : "";
+          throw new ServiceError("refund_not_allowed", `A refund needs a cyclone warning (orange or red) on the date, a declined reschedule, or the guide's offer.${simulated}`);
+        }
         const capturedMinor = toMinor(b.captured!.value);
         const reserved = BookingService.reservedMinor(b);
         const left = capturedMinor - reserved;

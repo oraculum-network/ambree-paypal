@@ -42,7 +42,7 @@ ${form(token, "decline", "I can't do this date", "", "secondary")}</section>`);
 <p class="small mono">quote hash ${esc(b.quote_hash)}</p></section>`);
   }
 
-  if (b.reschedule?.status === "proposed") {
+  if (b.reschedule?.status === "proposed" && b.status === "captured") {
     parts.push(`<section class="card warn"><h2>Move the trip?</h2><p>Ambree asks to move the trip from ${esc(b.date)} to <strong>${esc(b.reschedule.new_date)}</strong> because of the weather.</p>
 ${form(token, "accept_reschedule", `Yes, ${b.reschedule.new_date} works`)}${form(token, "decline_reschedule", "No, I can't", "", "secondary")}</section>`);
   }

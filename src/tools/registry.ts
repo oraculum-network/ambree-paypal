@@ -148,7 +148,7 @@ export const TOOLS = [
   define({
     name: "refund_payment",
     title: "Refund the deposit",
-    description: "Refund the deposit (all of it, or `amount`) from the guide's capture back to the traveller. Allowed only when a cyclone warning (orange/red) covers the date, the guide declined a reschedule, or the guide offered a refund.",
+    description: "Refund the deposit (all of it, or `amount`) from the guide's capture back to the traveller. Allowed only when a cyclone warning (orange/red) covers the date, the guide declined a reschedule, or the guide offered a refund. A simulated (demo) warning alone does not allow it.",
     input: z.object({ booking_id: bookingId, amount: z.string().regex(/^\d{1,4}(\.\d{1,2})?$/).optional() }),
     moneyMoving: true,
     run: async (a, ctx) => {
