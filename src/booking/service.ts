@@ -204,6 +204,40 @@ function statusFromRefunds(b: Booking): BookingStatus {
   return b.refunded_minor >= captured ? "refunded" : b.refunded_minor > 0 ? "partially_refunded" : "captured";
 }
 
+/** The capture a refund resource names by its `up` link (`/v2/payments/captures/{id}`), if any (F2; UNVERIFIED on webhook resources). */
+export function refundCaptureId(r: { links?: unknown }): string | undefined {
+  if (!Array.isArray(r.links)) return undefined;
+  for (const l of r.links as unknown[]) {
+    const { rel, href } = (l && typeof l === "object" ? l : {}) as { rel?: unknown; href?: unknown };
+    if (rel !== "up" || typeof href !== "string") continue;
+    let path: string;
+    try {
+      path = new URL(href).pathname;
+    } catch {
+      continue;
+    }
+    const m = /^\/v2\/payments\/captures\/([^/]+)\/?$/.exec(path);
+    if (m) return decodeURIComponent(m[1]!);
+  }
+  return undefined;
+}
+
+/** A refund resource names another booking: its custom_id, or the capture its `up` link names, isn't this booking's. */
+function namesOther(r: { custom_id?: unknown; links?: unknown }, b: Booking): boolean {
+  if (typeof r.custom_id === "string" && r.custom_id !== b.id) return true;
+  const cap = refundCaptureId(r);
+  return cap !== undefined && cap !== b.capture_id;
+}
+
+/**
+ * A refund resource names this booking: by its custom_id, or with none (round 10, F2), by the capture its
+ * `up` link names; and nothing in it names another booking.
+ */
+function namesBooking(r: { custom_id?: unknown; links?: unknown }, b: Booking): boolean {
+  if (namesOther(r, b)) return false;
+  return r.custom_id === b.id || (r.custom_id === undefined && b.capture_id !== undefined && refundCaptureId(r) === b.capture_id);
+}
+
 /** Why no refund or retry is sent while an operation is held, by the hold's cause. */
 const UNDER_REVIEW: Record<NonNullable<RefundOp["review_cause"]>, string> = {
   unknown:
@@ -693,7 +727,12 @@ export class BookingService {
       if (b) return b;
     }
     const id = typeof resource.id === "string" ? resource.id : undefined;
-    return id ? this.#bookings.list().find((b) => b.order_id === id || b.capture_id === id || b.refund_ops.some((o) => o.refund_id === id)) : undefined;
+    const all = this.#bookings.list();
+    const byId = id ? all.find((b) => b.order_id === id || b.capture_id === id || b.refund_ops.some((o) => o.refund_id === id)) : undefined;
+    if (byId) return byId;
+    // F2: a refund resource with no custom_id names its booking by the capture its `up` link points to.
+    const capture = custom === undefined ? refundCaptureId(resource) : undefined;
+    return capture ? all.find((b) => b.capture_id === capture) : undefined;
   }
 
   /**
@@ -1085,9 +1124,10 @@ export class BookingService {
   }
 
   /**
-   * I2: a refund event about a refund this booking doesn't know, naming this booking (custom_id), while one
-   * of its refund operations has an unknown outcome (`sending`, or held for review only for that; at most
-   * one does): the event's refund is read back by GET (nothing is sent, so nothing can be refunded twice).
+   * I2: a refund event about a refund this booking doesn't know, naming this booking (custom_id, or with
+   * none its capture: round 10, F2), while one of its refund operations has an unknown outcome (`sending`,
+   * or held for review only for that; at most one does): the event's refund is read back by GET (nothing is
+   * sent, so nothing can be refunded twice). A GET naming another booking or capture is ignored.
    * If the refund names this booking and carries the operation's amount and currency, it settles that
    * operation through #applyRefund, whatever its status: COMPLETED → completed, PENDING → pending, FAILED or
    * CANCELLED → failed and the reservation released; the booking leaves review if nothing else holds it.
@@ -1100,9 +1140,9 @@ export class BookingService {
     const b = this.must(bookingId);
     const op = unknownOp(b);
     const refundId = typeof resource.id === "string" ? resource.id : undefined;
-    if (!op || !refundId || resource.custom_id !== b.id || b.refund_ops.some((o) => o.refund_id === refundId)) return;
+    if (!op || !refundId || !namesBooking(resource, b) || b.refund_ops.some((o) => o.refund_id === refundId)) return;
     const refund = await this.#d.payments.getRefund(refundId);
-    if (refund.id !== refundId || (refund.custom_id !== undefined && refund.custom_id !== b.id)) return;
+    if (refund.id !== refundId || namesOther(refund, b)) return;
     const now = this.must(bookingId);
     if (unknownOp(now)?.n !== op.n) return; // settled meanwhile (only a writer outside the service could)
     const cur = now.captured!.currency_code;
