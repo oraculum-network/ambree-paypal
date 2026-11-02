@@ -599,8 +599,9 @@ export class BookingService {
    * The hosted demo's control: one simulated cyclone warning for this booking's day only, saved on the
    * booking, logged (`weather.simulated_alert`) and announced to the agent, once per booking, and only on a
    * paid (captured) booking: any other status is refused and nothing is saved, logged or announced. It calls
-   * no payment API: the agent reacts to the event by proposing a new date (see refundReason). It queues with the booking's money steps (#serial), so it never lands inside a capture or refund that
-   * is waiting on PayPal, and two racing calls can't both post.
+   * no payment API: the agent reacts to the event by proposing a new date (see refundReason). It queues
+   * with the booking's money steps (#serial), so it never lands inside a capture or refund that is waiting
+   * on PayPal, and two racing calls can't both post.
    */
   async simulateCyclone(bookingId: string): Promise<{ posted: boolean; booking: Booking }> {
     return this.#serial(bookingId, async () => this.#simulateNow(bookingId));
