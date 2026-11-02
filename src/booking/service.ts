@@ -135,6 +135,16 @@ function settledReason(b: Booking): { decided: true; reason?: string } | { decid
   return { decided: false };
 }
 
+/** Money has started coming back: a refund operation in any status but `failed` (sending, pending, done, in review). */
+export function refundStarted(b: Booking): boolean {
+  return b.refund_ops.some((o) => o.status !== "failed");
+}
+
+/** Whether the guide can answer a proposed move now: the booking is captured and no refund has started. */
+export function rescheduleAnswerable(b: Booking): boolean {
+  return b.reschedule?.status === "proposed" && b.status === "captured" && !refundStarted(b);
+}
+
 /** What a refused refund says about this booking, on which no refund rule holds. */
 function refundRefusal(b: Booking): string {
   if (b.status === "refunded") return "The deposit was already refunded; there is nothing left to refund.";
@@ -668,11 +678,15 @@ export class BookingService {
     return next;
   }
 
-  /** The guide answers a proposed move; only while the booking is still paid and not refunded (captured). */
+  /**
+   * The guide answers a proposed move; only while the booking is still paid and not refunded (captured)
+   * and no refund has started (one being sent or pending leaves the booking captured until PayPal answers).
+   */
   answerReschedule(token: string, accept: boolean): Booking {
     const b = this.#byTokenOrThrow(token);
     if (b.reschedule?.status !== "proposed") throw new ServiceError("no_reschedule", "No reschedule is waiting.");
     if (b.status !== "captured") throw new ServiceError("wrong_state", `The booking is ${b.status}, so the trip can no longer be moved.`);
+    if (refundStarted(b)) throw new ServiceError("wrong_state", "A refund of the deposit has started, so the trip can no longer be moved.");
     const to = b.reschedule.new_date;
     const next = this.#save(accept ? { ...b, date: to, reschedule: { new_date: to, status: "accepted" } } : { ...b, reschedule: { new_date: to, status: "declined" } });
     this.#log(next, accept ? "reschedule.accepted" : "reschedule.declined", { from: b.date, to });
