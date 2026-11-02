@@ -1,5 +1,6 @@
-// The HTTP app: chat page and API, the guide's operator page, PayPal's return URL and webhook, MCP, and
-// (fake mode only) a stand-in PayPal checkout page and the demo cyclone control. No framework.
+// The HTTP app: chat page and API, the guide's operator page, PayPal's return URL and webhook, MCP, the
+// demo cyclone control (fake and sandbox mode; live PayPal is refused at startup) and, in fake mode only, a
+// stand-in PayPal checkout page. No framework.
 
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -188,9 +189,13 @@ export function createApp(opts: AppOptions): App {
   const secureCookie = config.publicUrl.startsWith("https://");
   const newConversationId = () => `cv_${randomBytes(12).toString("hex")}`;
   const sidHash = (sid: string) => createHash("sha256").update(`session:${sid}`).digest("hex");
-  function session(req: IncomingMessage, res: ServerResponse): { id: string; conversations: string[] } {
+  /** The caller's session if its cookie names one; never creates one. */
+  function existingSession(req: IncomingMessage): { id: string; conversations: string[] } | undefined {
     const sid = parseCookies(req.headers.cookie)[SESSION_COOKIE];
-    let rec = sid && /^[A-Za-z0-9_-]{43}$/.test(sid) ? sessions.get(sidHash(sid)) : undefined;
+    return sid && /^[A-Za-z0-9_-]{43}$/.test(sid) ? sessions.get(sidHash(sid)) : undefined;
+  }
+  function session(req: IncomingMessage, res: ServerResponse): { id: string; conversations: string[] } {
+    let rec = existingSession(req);
     if (!rec) {
       const fresh = randomBytes(32).toString("base64url");
       rec = sessions.put({ id: sidHash(fresh), conversations: [] });
@@ -308,7 +313,27 @@ export function createApp(opts: AppOptions): App {
       }
     }
     if (path === "/api/demo/cyclone" && method === "POST") {
-      if (!fake) return sendJson(res, 404, { error: "demo controls run only with the fake PayPal" });
+      // The demo cyclone control, past the Origin and Content-Type checks above. It needs an existing
+      // session (it never creates one) and never calls PayPal. Live PayPal can't get here: config and the
+      // REST client refuse any base URL but the sandbox's, before the server starts.
+      const s = existingSession(req);
+      if (!s) return sendJson(res, 401, { error: "No session: open the page first." });
+      if (!fake) {
+        // Sandbox (the hosted demo): a simulated warning for one booking the caller's session owns, once.
+        const body = await readJson(req);
+        const id = body?.booking_id;
+        const b = typeof id === "string" && /^bk_[0-9a-f]{12}$/.test(id) ? service.get(id) : undefined;
+        if (!b || !s.conversations.includes(b.conversation_id)) return sendJson(res, 404, { error: "No such booking." });
+        try {
+          const r = service.simulateCyclone(b.id);
+          log({ event: "demo_cyclone", booking: b.id, posted: r.posted });
+          return sendJson(res, 200, { ok: true, simulated: true, posted: r.posted, booking_id: b.id, date: r.booking.simulated_alert!.from, bookings_warned: r.posted ? 1 : 0 });
+        } catch (e) {
+          if (e instanceof ServiceError) return sendJson(res, 409, { ok: false, error: e.message, reason: e.code });
+          throw e;
+        }
+      }
+      // Fake mode (offline demo), unchanged: a demo-feed warning around every booking of the tab's conversation.
       const conv = ownedConversation(req, res, (await readJson(req))?.conversation_id);
       if (!conv) return noConversation();
       const dates = service.forConversation(conv).map((b) => b.date).sort();

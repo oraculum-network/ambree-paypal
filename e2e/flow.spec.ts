@@ -49,7 +49,7 @@ test("happy path: request → guide price → mandate → PayPal → capture →
 
 test("refund path: cyclone → reschedule declined → deposit refunded", async ({ page }) => {
   const { guide, link, balance: paid } = await requestAndPay(page);
-  await page.getByRole("button", { name: "Raise a cyclone warning for my booking date" }).click();
+  await page.getByRole("button", { name: "Simulate a cyclone warning (demo)" }).click();
   await expect(page.locator("#transcript")).toContainText("move the trip to 2026-11-08");
 
   await guide.goto(link);

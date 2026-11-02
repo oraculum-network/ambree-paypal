@@ -1,6 +1,6 @@
 // The chat page: talks to /api/chat and /api/state, renders the approval card, pay button, guide's
 // phone, inbox and ledger. Polls state so guide answers and webhooks show up without a reload.
-import { paymentLine } from "/labels.js";
+import { demoMessage, demoView, paymentLine } from "/labels.js";
 
 // The session cookie (HttpOnly) is the traveller's authority. Each tab keeps its own conversation id in
 // sessionStorage and sends it with every request; the server checks the session owns it.
@@ -45,7 +45,9 @@ async function api(path, body, withConv = true) {
 function render(s) {
   last = s;
   $("mode").textContent = `PayPal: ${s.mode.paypal === "fake" ? "offline fake (same JSON as the sandbox)" : "sandbox"} · model: ${s.mode.model}`;
-  $("demo-controls").hidden = s.mode.paypal !== "fake";
+  const demo = demoView(s.mode.paypal);
+  $("demo-controls").hidden = !demo.controls;
+  $("raise-cyclone").disabled = !s.bookings.length;
 
   const t = $("transcript");
   t.replaceChildren(...s.transcript.map((m) => el("li", { class: m.role, "data-role": m.role }, m.role === "event" ? m.text.replace(/^\[event\] \w+ bk_[0-9a-f]+: /, "◆ ") : m.text)));
@@ -84,8 +86,9 @@ function render(s) {
     const pay = paymentLine(b);
     if (pay) c.append(el("p", { "data-testid": pay.testid }, pay.text));
     if (b.refunded && b.refunded.value !== "0.00") c.append(el("p", { "data-testid": "refunded" }, `Refunded ${money(b.refunded)}.`));
+    if (b.simulated_warning) c.append(el("p", { class: "small", "data-testid": "simulated-warning" }, `Simulated cyclone warning (demo) for ${b.simulated_warning.date}: not a real warning.`));
     if (b.reschedule) c.append(el("p", { class: "small" }, `Reschedule to ${b.reschedule.new_date}: ${b.reschedule.status}`));
-    if (b.guide_balance !== null) c.append(el("p", { class: "small", "data-testid": "guide-balance" }, `Guide's sandbox balance (fake): ${(b.guide_balance / 100).toFixed(2)}`));
+    if (demo.guideBalance && b.guide_balance !== null) c.append(el("p", { class: "small", "data-testid": "guide-balance" }, `Guide's sandbox balance (fake): ${(b.guide_balance / 100).toFixed(2)}`));
     cards.push(c);
   }
   $("cards").replaceChildren(...cards);
@@ -119,10 +122,14 @@ $("chat-form").onsubmit = async (e) => {
   }
 };
 $("raise-cyclone").onclick = async () => {
-  await api("/api/demo/cyclone", {});
+  // The newest booking in this tab (the sandbox server acts on that one booking only; the fake ignores it).
+  const newest = last?.bookings.at(-1);
+  const r = await api("/api/demo/cyclone", newest ? { booking_id: newest.booking_id } : {});
+  $("demo-msg").textContent = demoMessage(r);
   void tick(true);
 };
 $("new-conv").onclick = async () => {
+  $("demo-msg").textContent = "";
   render(await newConversation());
 };
 

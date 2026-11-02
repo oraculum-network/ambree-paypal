@@ -20,3 +20,24 @@ export function paymentLine(b) {
       return { testid: "payment-review", text: `Payment needs review: PayPal's reply did not match the approved mandate (status ${b.capture.status ?? "unknown"}).` };
   }
 }
+
+/**
+ * What the Demo controls show in each PayPal mode. The controls (simulate a cyclone warning, Start over)
+ * show in fake and sandbox mode. The guide's balance only with the fake: it is the fake's own bookkeeping,
+ * and in sandbox mode the guide's balance lives in PayPal's sandbox dashboard. Live mode never runs.
+ * @returns {{ controls: boolean, guideBalance: boolean }}
+ */
+export function demoView(mode) {
+  return { controls: mode === "fake" || mode === "sandbox", guideBalance: mode === "fake" };
+}
+
+/** The line under the Demo controls after "Simulate a cyclone warning (demo)". */
+export function demoMessage(r) {
+  if (!r || r.error) return r?.error ?? "That didn't work.";
+  if (r.simulated) {
+    return r.posted
+      ? `Simulated cyclone warning (demo) posted for ${r.date}, for your booking only. Ambree will react; no money moves by itself.`
+      : `A simulated warning was already posted for this booking (${r.date}).`;
+  }
+  return `Demo warning raised for ${r.bookings_warned} booking${r.bookings_warned === 1 ? "" : "s"}.`;
+}

@@ -1,6 +1,8 @@
 // Cyclone warnings for a booking date. The production source is GDACS (tropical cyclone events near
 // Mauritius); its API shape is UNVERIFIED here (gdacs.org was not on this build's allowed fetch list), so only
-// the interface and the demo feed exist. The demo feed is what the "raise cyclone" control drives.
+// the interface and the demo feed exist. The page's "Simulate a cyclone warning (demo)" control drives the
+// demo feed in fake mode; in sandbox mode it puts a "simulated" alert on the caller's own booking instead
+// (BookingService.simulateCyclone), so no other booking sees it.
 
 export type AlertLevel = "green" | "orange" | "red";
 
@@ -11,7 +13,8 @@ export interface CycloneAlert {
   /** Inclusive ISO dates (YYYY-MM-DD) the warning covers in Mauritius. */
   from: string;
   to: string;
-  source: "GDACS" | "demo";
+  /** "simulated": the demo control's per-booking warning, never from a real agency. */
+  source: "GDACS" | "demo" | "simulated";
   summary: string;
 }
 

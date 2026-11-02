@@ -70,6 +70,11 @@ export interface Booking {
   refund_ops: RefundOp[];
   reschedule?: { new_date: string; status: "proposed" | "accepted" | "declined" };
   refund_offered: boolean;
+  /**
+   * The demo control's simulated cyclone warning (source "simulated") for this booking only, set once. It
+   * lives on the booking, not in the shared feed, so no other booking (or session) on that day sees it.
+   */
+  simulated_alert?: CycloneAlert;
   created_at: string;
   updated_at: string;
 }
@@ -99,6 +104,8 @@ export interface ServiceDeps {
 }
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+/** The statuses a cyclone warning is announced for: under way but not yet paid, or paid and not refunded. */
+const WARNABLE: readonly BookingStatus[] = ["captured", "order_created", "mandate_approved", "priced", "mandate_proposed"];
 const NOT_FOUND = "No such booking in this conversation.";
 
 function hashToken(token: string): string {
@@ -540,23 +547,55 @@ export class BookingService {
 
   // ---------- 5. weather, reschedule, refund ----------
 
+  /** The feed's alerts for the booking's date, plus the booking's own simulated warning if it covers that date. */
+  async #alertsFor(b: Booking): Promise<CycloneAlert[]> {
+    const feed = await this.#d.weather.alertsFor(b.date);
+    const sim = b.simulated_alert;
+    return sim && sim.from <= b.date && b.date <= sim.to ? [...feed, sim] : feed;
+  }
+
   async weatherFor(bookingId: string): Promise<{ alerts: CycloneAlert[]; explanation: string }> {
     const b = this.must(bookingId);
-    const alerts = await this.#d.weather.alertsFor(b.date);
+    const alerts = await this.#alertsFor(b);
     return { alerts, explanation: alerts.length ? alerts.map(explainRisk).join(" ") : `No cyclone warning covers ${b.date}.` };
   }
 
-  /** Tells every booking in a conversation whose date an alert covers (the demo control calls this). */
+  /** Tells every booking in a conversation whose date an alert covers (the fake-mode demo control calls this). */
   async announceCyclone(conversationId: string): Promise<number> {
     let n = 0;
     for (const b of this.forConversation(conversationId)) {
       const { alerts, explanation } = await this.weatherFor(b.id);
-      if (!alerts.length || !["captured", "order_created", "mandate_approved", "priced", "mandate_proposed"].includes(b.status)) continue;
+      if (!alerts.length || !WARNABLE.includes(b.status)) continue;
       this.#log(b, "weather.alert", { alerts: alerts.map((a) => ({ id: a.id, level: a.level, from: a.from, to: a.to, source: a.source })) });
       this.#d.channels.emit(conversationId, { type: "cyclone", booking_id: b.id, text: `Cyclone warning for ${b.date}: ${explanation}` });
       n++;
     }
     return n;
+  }
+
+  /**
+   * The hosted demo's control: one simulated cyclone warning for this booking's day only, saved on the
+   * booking, logged (`weather.simulated_alert`) and announced to the agent, once per booking. It calls no
+   * payment API: the agent reacts to the event, and the refund rules decide exactly as for a real warning.
+   * Synchronous, so two racing calls can't both post.
+   */
+  simulateCyclone(bookingId: string): { posted: boolean; booking: Booking } {
+    const b = this.must(bookingId);
+    if (b.simulated_alert) return { posted: false, booking: b };
+    if (!WARNABLE.includes(b.status)) throw new ServiceError("wrong_state", `This booking can't take a warning now (it is ${b.status}); try again once the guide has priced it.`);
+    const alert: CycloneAlert = {
+      id: `SIM-${b.id}`,
+      name: "Demo cyclone (simulated)",
+      level: "orange",
+      from: b.date,
+      to: b.date,
+      source: "simulated",
+      summary: "Simulated from the page's demo control; not a real warning from any weather service.",
+    };
+    const next = this.#save({ ...b, simulated_alert: alert });
+    this.#log(next, "weather.simulated_alert", { simulated: true, label: "Simulated cyclone warning (demo)", alert: { id: alert.id, level: alert.level, from: alert.from, to: alert.to, source: alert.source } });
+    this.#d.channels.emit(b.conversation_id, { type: "cyclone", booking_id: b.id, text: `Simulated cyclone warning (demo) for ${b.date}, not a real warning: ${explainRisk(alert)}` });
+    return { posted: true, booking: next };
   }
 
   proposeReschedule(bookingId: string, newDate: string): Booking {
@@ -598,7 +637,9 @@ export class BookingService {
     if (b.status !== "captured" && b.status !== "partially_refunded") return undefined;
     if (b.refund_offered) return "the guide offered it";
     if (b.reschedule?.status === "declined") return "the guide declined the reschedule";
-    if ((await this.#d.weather.alertsFor(b.date)).some((a) => a.level !== "green")) return "a cyclone warning covers the date";
+    const alerts = (await this.#alertsFor(b)).filter((a) => a.level !== "green");
+    if (alerts.some((a) => a.source !== "simulated")) return "a cyclone warning covers the date";
+    if (alerts.length) return "a simulated cyclone warning (demo) covers the date";
     return undefined;
   }
 
@@ -737,6 +778,7 @@ export class BookingService {
       refund_pending: b.captured && pending ? { currency_code: b.captured.currency_code, value: fromMinor(pending) } : null,
       reschedule: b.reschedule ?? null,
       refund_offered: b.refund_offered,
+      simulated_warning: b.simulated_alert ? { name: b.simulated_alert.name, level: b.simulated_alert.level, date: b.simulated_alert.from } : null,
     };
   }
 }

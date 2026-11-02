@@ -147,12 +147,27 @@ export class ScriptedModel implements ChatModel {
         return call("propose_reschedule", { booking_id: b, new_date: addDays(date ?? this.#today(), 3) });
       }
       case "propose_reschedule":
-        return say(`A cyclone warning covers the day, so trails won't be safe. I've asked the guide to move the trip to ${r.reschedule?.new_date}; if they can't, I'll refund your deposit.`);
+        return say(`${this.#simulatedWarning(messages) ? "A simulated cyclone warning (demo)" : "A cyclone warning"} covers the day, so trails won't be safe. I've asked the guide to move the trip to ${r.reschedule?.new_date}; if they can't, I'll refund your deposit.`);
       case "refund_payment":
         return say(`Done: ${r.refunded?.currency_code} ${r.refunded?.value} refunded to you from the guide's PayPal (booking ${r.status}).`);
       default:
         return say("Done.");
     }
+  }
+
+  /** Whether the latest check_weather result was the demo control's simulated warning. */
+  #simulatedWarning(messages: ChatMessage[]): boolean {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = messages[i]!;
+      if (m.role === "tool" && m.name === "check_weather") {
+        try {
+          return ((JSON.parse(m.content) as { alerts?: Array<{ source?: string }> }).alerts ?? []).some((a) => a.source === "simulated");
+        } catch {
+          return false;
+        }
+      }
+    }
+    return false;
   }
 
   #bookingDate(messages: ChatMessage[]): string | undefined {
