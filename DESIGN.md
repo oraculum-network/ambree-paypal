@@ -19,7 +19,7 @@ the risky items.
 | Booking service | `src/booking/`: the rules. The mandate check, payee pinning, refund policy and ledger writes live here, not in the prompt |
 | PayPal tier | `src/paypal/`: the `PaymentsApi` interface, the REST client (sandbox only) and an in-process fake that speaks the same JSON |
 | Ledger | `src/ledger/`: an append-only table in `node:sqlite`, where each row's `hash` = sha256 of the row + `prev_hash` |
-| Weather | `src/weather/`: the cyclone feed interface. GDACS later (**UNVERIFIED** API shape); a fake feed for tests and the demo |
+| Weather | `src/weather/`: the cyclone feed interface. GDACS later (**UNVERIFIED** API shape); a demo feed for tests and the offline demo, and per-booking simulated warnings on the hosted sandbox (§14) |
 | MCP | `POST /mcp`: the same tools for any MCP client (stateless Streamable HTTP, as in ambree-qloo) |
 
 ## 2. Flows
@@ -223,7 +223,7 @@ only on network errors or 5xx, and only for calls that carry a `PayPal-Request-I
 
 | Route | What |
 |---|---|
-| `GET /` | Chat page with these panels: the conversation, the approval card, the ledger (with "verify chain"), the guide's phone (operator link), the demo inbox (step-up code), and demo controls (fake mode: approve in the fake checkout, raise a cyclone) |
+| `GET /` | Chat page with these panels: the conversation, the approval card, the ledger (the page shows the chain status by itself, "Chain OK" or where it broke; there is no button), the guide's phone (operator link), the demo inbox (step-up code), and Demo controls in fake and sandbox mode: "Simulate a cyclone warning (demo)" and "Start over" (§14). Fake mode also has the stand-in checkout and shows the guide's fake balance |
 | `POST /api/chat` | `{message?}` → the agent loop's reply plus the booking snapshot, for the **session's** current conversation (see §11) |
 | `GET /api/state` | The session's bookings, mandates, ledger rows, inbox; a `conversation_id` parameter is ignored |
 | `POST /api/conversations` | Starts a new conversation in this session ("Start over") |
@@ -234,7 +234,7 @@ only on network errors or 5xx, and only for calls that carry a `PayPal-Request-I
 | `POST /webhooks/paypal` | Verify via call 7, log to the ledger once, process. Only completed processing makes a redelivery a duplicate; a processing failure answers 500 |
 | `POST /mcp` | The tools over MCP (stateless). Off unless `MCP_DEMO_PASSCODE` is set (Bearer); scoped to the conversation `mcp` |
 | `GET /fake-paypal/checkout?token=` | **Fake mode only**: a stand-in buyer approval page |
-| `POST /api/demo/cyclone` | **Fake mode only**: raises a cyclone alert for a date |
+| `POST /api/demo/cyclone` | Fake and sandbox mode (live is refused at startup). Needs an existing session (401, and it never creates one). **Sandbox:** `{booking_id}` of a booking the session owns (else 404); posts one simulated warning for that booking's day, once, and calls no payment API (§14). **Fake:** unchanged, a demo-feed alert around every booking of the tab's conversation |
 | `GET /healthz` | `{ok, mode}` |
 
 ## 8. Three-minute demo script (from the report, §6 B)
@@ -244,14 +244,18 @@ only on network errors or 5xx, and only for calls that carry a `PayPal-Request-I
 - **0:20** The chat request: "Find me a hiking guide for Le Morne on Thursday and hold the spot." Ambree lists 2
   guides, picks one and asks for a price.
 - **0:50** The guide's phone: the operator link shows the request. The guide types EUR 80 total and EUR 30 deposit.
-- **1:20** The approval card: EUR 30.00 to "Tamarin Trails (sandbox)", quote hash, expiry 15:00, step-up code from
-  the inbox, Approve.
+- **1:20** The approval card: EUR 30.00 to "Lantern Ridge Walks (demo)" (on the hosted sandbox, the payee is the
+  one sandbox business account that plays every guide), quote hash, expiry 15:00, step-up code from the inbox,
+  Approve.
 - **1:40** The agent creates the order (payee = the guide). Then the PayPal sandbox checkout, logged in as the
   sandbox traveller, pays the guide.
 - **2:05** The return capture lands, and the webhook is verified. The ledger rows appear with their hashes, and
-  "verify chain" shows OK. The guide's sandbox balance goes up (shown in the PayPal sandbox dashboard).
-- **2:25** A cyclone alert for Thursday. Ambree explains the risk and proposes Saturday. The guide declines, so
-  Ambree refunds the deposit (partially, if the guide keeps a fee), and the refund webhook is logged.
+  the chain status under the ledger says "Chain OK" by itself. The guide's sandbox balance goes up (shown in the
+  PayPal sandbox dashboard).
+- **2:25** "Simulate a cyclone warning (demo)" puts a simulated warning on Thursday for this booking only (a real
+  GDACS warning can't be triggered on demand). Ambree explains the risk, says it is simulated, and proposes
+  Saturday. The guide declines, so Ambree refunds the deposit (partially, if the guide keeps a fee), and the
+  refund webhook is logged.
 - **2:50** Architecture slide: never custody. The order's payee is the guide, our account is never the payee, and
   the mandate is enforced in code.
 
@@ -263,8 +267,9 @@ only on network errors or 5xx, and only for calls that carry a `PayPal-Request-I
 4. Click "Pay the guide". On the hosted sandbox instance, log in with the sandbox buyer account listed in the
    README (the CEO creates it; the credentials are published for judges as the rules ask). On the fake, click
    approve.
-5. Watch the ledger, and press "verify chain".
-6. Press "raise cyclone" (demo control), follow Ambree's reschedule, decline it as the guide, and see the refund.
+5. Watch the ledger fill in; the chain status under it says "Chain OK" by itself.
+6. Press "Simulate a cyclone warning (demo)" (Demo controls), follow Ambree's reschedule, decline it as the guide,
+   and see the refund.
 
 ## 10. Deploy shape (as hosted; the steps are in DEPLOY.md)
 
@@ -401,3 +406,39 @@ that changed:
     reports `operator_identity: "config-only (unconfirmed)"`. Use it only if S11 shows the call can't
     confirm the owner, until a documented call is found.
   - **UNVERIFIED: S11** (the spike's "a2 identity" row).
+
+## 14. The hosted demo (2 Nov)
+
+On the hosted site (PayPal mode `sandbox`), `POST /api/demo/cyclone` answered 404 and the page hid the Demo
+controls, so the cyclone → reschedule-or-refund scene (§8 2:25, README judge step 7) could not be shown. Real
+GDACS warnings can't be triggered on demand.
+
+- **The simulation, sandbox mode** (`BookingService.simulateCyclone`):
+  - It runs after the usual mutation checks (Origin, `Content-Type: application/json`). It needs an existing
+    session cookie (401 otherwise; the route never creates a session).
+  - It takes `{booking_id}`, which must belong to one of the session's conversations (404 otherwise, as for
+    a mandate approval).
+  - It saves one alert on the booking: `simulated_alert`, source `simulated`, from and to the booking's day,
+    level orange. It goes on the booking, not in the shared demo feed, so another booking (or another
+    judge's session) on the same day never sees it. The record field is optional, so `SCHEMA_VERSION` stays 2.
+  - It logs `weather.simulated_alert` and emits the agent event "Simulated cyclone warning (demo) for
+    {date}, not a real warning: …".
+  - It is idempotent: a second call (or a racing one) answers `posted: false` with no new row or event.
+  - A booking that isn't yet priced, or is already finished, answers 409 and records nothing.
+  - It calls no payment API. The agent reacts to the event (check_weather → propose_reschedule). The refund
+    rules (§2.2) see the simulated alert like any other, and the refund reason (and so PayPal's
+    `note_to_payer`) reads "a simulated cyclone warning (demo) covers the date".
+- **Fake mode** keeps its conversation-wide demo-feed raise (`weather.alert`, ±1 day).
+- **Live mode** can't run it: `loadConfig` and `PayPalRestClient` refuse any base URL but the sandbox's
+  before the server starts.
+- **The page** (`public/labels.js` `demoView`):
+  - Demo controls show in fake and sandbox mode: "Simulate a cyclone warning (demo)", which acts on the
+    tab's newest booking, and "Start over", which adds a new conversation to the caller's own session and
+    switches this tab to it.
+  - Only the guide's fake balance stays fake-only: it is the fake's own bookkeeping, and the server sends
+    `null` in sandbox mode.
+  - The stand-in checkout (`/fake-paypal/checkout`) exists only in fake mode.
+- **Tests:** `test/fix4-hosted.test.ts` runs the app in sandbox mode with no network
+  (`AppOptions.paypalFetch`, tests only: a stub that refuses every PayPal call, or the fake). The Playwright
+  project `sandbox-like` (`e2e/serve-sandbox.ts`) runs the whole hosted path in a browser, using a stand-in
+  buyer checkout on its own port.

@@ -65,6 +65,9 @@ Ambree never holds your money. PayPal sandbox only.
     Origin too.
   - These checks run before any session is looked up, so a cross-site request can't create or replace a
     session.
+  - The demo control "Simulate a cyclone warning (demo)" (`POST /api/demo/cyclone`) also needs an existing
+    session (401 otherwise). On the hosted sandbox it acts only on a booking the session owns (404
+    otherwise), once, and calls no payment API.
   - MCP is off unless `MCP_DEMO_PASSCODE` is set. MCP calls run in their own scope and can't see web
     bookings.
 
@@ -114,7 +117,7 @@ Open http://localhost:8080 and try the whole flow offline:
   refunds and webhook verification. It even sends webhooks to the app's own endpoint over HTTP.
 - **The scripted model** makes deterministic tool calls, so you don't need an LLM key.
 - **The page says which of the two is running.** Use the "Guide's phone" panel to answer as the guide, take
-  the step-up code from "Your inbox", and use "Raise a cyclone warning" to try the refund path.
+  the step-up code from "Your inbox", and use "Simulate a cyclone warning (demo)" to try the refund path.
 
 ### With the PayPal sandbox and a real model
 
@@ -151,7 +154,13 @@ PAYPAL_CLIENT_ID=... PAYPAL_CLIENT_SECRET=... node scripts/spike.ts --payee-merc
 5. Press **Pay the guide in PayPal**. On the hosted sandbox, log in as the sandbox buyer:
    `TODO-CHECK: buyer email / password, published here by the CEO` (the rules ask for sandbox login details).
 6. Watch the ledger fill in (order, capture, verified webhooks) and the chain say **Chain OK**.
-7. Press **Raise a cyclone warning**. Then, on the guide's link, answer "No, I can't" and see the refund.
+7. Under **Demo controls**, press **Simulate a cyclone warning (demo)**. A real cyclone warning can't be
+   triggered on demand, so this puts a simulated warning on your own newest booking's day, once. It is
+   labelled as simulated on the page, in the chat and in the ledger (`weather.simulated_alert`). No weather
+   service is called and the button itself moves no money. Ambree explains the risk and asks the guide to move
+   the trip. On the guide's link, answer "No, I can't": Ambree refunds the deposit from the guide's sandbox
+   capture back to you, and the refund webhook appears in the ledger. **Start over** opens a fresh conversation
+   in your tab only.
 
 ## The agent's tools (also over MCP at `POST /mcp`, with `MCP_DEMO_PASSCODE`)
 
@@ -189,15 +198,20 @@ npx playwright test
     - log redaction;
     - the ledger checkpoint;
     - spike run ids.
-- **Playwright** runs the happy path and the refund path in a browser.
+  - the hosted demo (`test/fix4-hosted.test.ts`), in sandbox mode with no network: the cyclone simulation on
+    the caller's own booking only, once, with no PayPal call; the page's Demo controls; Start over staying in
+    the caller's session.
+- **Playwright** runs the happy path and the refund path in a browser against the fake. A second project
+  (`sandbox-like`) runs the hosted sandbox-mode path, with the fake behind the REST client and a stand-in
+  buyer checkout: the Demo controls, the simulated warning, the refund and Start over.
 
 ## Built during the hackathon
 
 All of this repository was written from 31 Oct 2026, inside the PayPal AI Hackathon's submission period.
 
 - **The ideas** (a step-up mandate with a nonce and a quote hash, a hash-chained ledger, a tokenised operator
-  page, cyclone awareness) come from Ambree's private app. **The code** is new and smaller, and none of it is
-  copied.
+  page, cyclone awareness) came from our own earlier design notes for Ambree. **No code was copied:** all of it
+  is new.
 - **Before the hackathon** there was Ambree's concierge product and its design notes.
 - **During the hackathon** came the whole of this repository: the PayPal tier, the fake, the spike, the
   mandate and ledger, the guides, the agent, MCP, the pages and the tests.
@@ -207,4 +221,5 @@ All of this repository was written from 31 Oct 2026, inside the PayPal AI Hackat
 - **Sandbox only, made-up guides.** A real version would raise a regulatory question we have not settled:
   booking for someone may count as tour-operator work even without holding money.
 - **Conversations live in memory**; bookings and the ledger live in sqlite.
-- **The real GDACS cyclone feed is not wired yet**; the demo control raises the warning.
+- **The real GDACS cyclone feed is not wired yet.** The "Simulate a cyclone warning (demo)" control stands in
+  for it, labelled as simulated. On the hosted sandbox it marks only your own booking's day.

@@ -1,8 +1,9 @@
 # Notices
 
 Ambree "Book the guide" is MIT-licensed (see `LICENSE`). All of its code was written for the PayPal AI
-Hackathon during the submission period (from 31 Oct 2026). Nothing is copied from the private Ambree app;
-the mandate, ledger, operator page and cyclone ideas are rewritten from scratch here.
+Hackathon during the submission period (from 31 Oct 2026). The mandate, ledger, operator page and cyclone
+ideas came from our own earlier design notes for Ambree; no code was copied, and all of it is written from
+scratch here.
 
 ## Dependencies
 
@@ -21,8 +22,10 @@ offline demo; it contains no PayPal code or response data.
 ## Demo data
 
 Every guide in `src/guides/seed.ts` is invented and named "… (demo)"; none is a real business or person.
-Payee addresses use the reserved-style domain `business.sandbox.example`. Cyclone warnings in the demo come
-from the demo feed (`src/weather/cyclones.ts`), never from a real agency.
+Guides carry invented PayPal merchant ids only, never email addresses. On the hosted sandbox, one sandbox
+business account plays every guide. The fake's stand-in buyer uses the reserved-style domain
+`personal.sandbox.example`. Cyclone warnings in the demo come from the demo feed (`src/weather/cyclones.ts`)
+or from the page's per-booking simulation, which is labelled "simulated". They never come from a real agency.
 
 ## Brand
 
