@@ -84,3 +84,19 @@ export const kinds = (w: World, id: string) => w.ledger.list(id).map((e) => e.ki
 export const later = <T>(fn: () => T): Promise<Awaited<T>> => Promise.resolve().then(fn) as Promise<Awaited<T>>;
 /** POSTs to PayPal's refund endpoint (each one is money asked back from the guide). */
 export const refundPosts = (w: World) => w.fake.calls.filter((c) => c.method === "POST" && c.path.endsWith("/refund")).length;
+
+/** A webhook as PayPal would POST it. */
+export type Delivery = { raw: string; headers: Record<string, string> };
+/** Webhooks are kept, not delivered: the test hands each one to the service itself. */
+export function keepWebhooks(w: World): Delivery[] {
+  const got: Delivery[] = [];
+  w.fake.deliver = (raw, headers) => void got.push({ raw, headers });
+  return got;
+}
+export const deliver = (w: World, d: Delivery) => w.service.handleWebhook(d.raw, d.headers);
+export const eventType = (d: Delivery) => (JSON.parse(d.raw) as { event_type: string }).event_type;
+export const resourceOf = (d: Delivery) => (JSON.parse(d.raw) as { resource: { id: string; status: string; amount?: { value: string } } }).resource;
+/** Lets every chain of promises that isn't held by a gate run to its end (the fake and the service use no timers). */
+export const settle = async () => {
+  for (let i = 0; i < 3; i++) await new Promise((r) => setTimeout(r, 0));
+};

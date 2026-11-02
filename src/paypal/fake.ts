@@ -40,8 +40,15 @@ interface Failure {
   hang?: boolean;
   /** Throw like a dropped connection. */
   network?: boolean;
-  /** Process the request normally, then lose the reply (the client sees a network error). */
+  /**
+   * Process the request normally, then lose the reply: with `status` 0 the client sees a network error; with a
+   * 5xx `status` it gets that error instead (PayPal processed the request, then failed to say so).
+   */
   dropResponse?: boolean;
+  /** Answer as PayPal normally would (no failure); useful with `wait`. */
+  pass?: boolean;
+  /** Hold this request until the promise settles, then answer it as the other fields say. */
+  wait?: Promise<unknown>;
 }
 
 export const FAKE_CLIENT_ID = "fake-client-id";
@@ -80,6 +87,9 @@ export class FakePayPal {
   readonly #orders = new Map<string, StoredOrder>();
   readonly #captures = new Map<string, { capture: Capture; orderId: string; refundedMinor: number }>();
   readonly #refunds = new Map<string, Refund>();
+  /** Refunds created PENDING (pendNextRefund): what each holds on its capture until it settles. */
+  readonly #pendingRefunds = new Map<string, { captureId: string; minor: number }>();
+  #pendNext = 0;
   readonly #idem = new Map<string, { status: number; body: unknown }>();
   readonly #tokens = new Map<string, number>();
   readonly #balances = new Map<string, number>();
@@ -102,6 +112,46 @@ export class FakePayPal {
   /** The next request matching `path` (and `method`) fails this way. */
   failNext(f: Failure): void {
     this.#failures.push(f);
+  }
+
+  /**
+   * The next refund PayPal creates is PENDING: its amount is held on the capture (so a further refund can't
+   * exceed what's left) but no money moves until settleRefund. Its creation sends no webhook.
+   */
+  pendNextRefund(): void {
+    this.#pendNext++;
+  }
+
+  /**
+   * PayPal settles a PENDING refund: COMPLETED moves the money (PAYMENT.CAPTURE.REFUNDED), FAILED releases
+   * what it held on the capture (PAYMENT.REFUND.FAILED). GET then shows the new status; a replayed POST
+   * reply (same PayPal-Request-Id) still shows the PENDING one it first sent.
+   */
+  settleRefund(refundId: string, status: "COMPLETED" | "FAILED"): void {
+    const held = this.#pendingRefunds.get(refundId);
+    const r = this.#refunds.get(refundId);
+    if (!held || !r) throw new Error(`fake: no pending refund ${refundId}`);
+    this.#pendingRefunds.delete(refundId);
+    const c = this.#captures.get(held.captureId)!;
+    const capturedMinor = toMinor(c.capture.amount.value);
+    r.status = status;
+    if (status === "COMPLETED") {
+      const stored = this.#orders.get(c.orderId)!;
+      this.#balances.set(stored.payeeKey, (this.#balances.get(stored.payeeKey) ?? 0) - held.minor);
+      this.#emit("PAYMENT.CAPTURE.REFUNDED", "refund", structuredClone(r), `A ${r.amount!.currency_code} ${r.amount!.value} capture payment was refunded`);
+    } else {
+      c.refundedMinor -= held.minor;
+      c.capture.status = c.refundedMinor <= 0 ? "COMPLETED" : c.refundedMinor >= capturedMinor ? "REFUNDED" : "PARTIALLY_REFUNDED";
+      this.#emit("PAYMENT.REFUND.FAILED", "refund", structuredClone(r), `A ${r.amount!.currency_code} ${r.amount!.value} refund failed`);
+    }
+  }
+
+  /** Money refunded from a capture so far (completed refunds only), in minor units. */
+  refundedFrom(captureId: string): number {
+    const c = this.#captures.get(captureId);
+    if (!c) return 0;
+    const held = [...this.#pendingRefunds.values()].filter((p) => p.captureId === captureId).reduce((s, p) => s + p.minor, 0);
+    return c.refundedMinor - held;
   }
 
   /** Expires every issued token (the client should refresh on the 401). */
@@ -166,6 +216,12 @@ export class FakePayPal {
     const failure = this.#failures.findIndex((f) => f.path.test(url.pathname) && (!f.method || f.method === method));
     if (failure >= 0) {
       const f = this.#failures.splice(failure, 1)[0]!;
+      if (f.wait) await f.wait.catch(() => undefined);
+      if (f.pass) {
+        const res = await this.#route(method, url.pathname, headers, typeof init?.body === "string" ? init.body : undefined, requestId);
+        this.calls.push({ method, path: url.pathname, status: res.status, requestId });
+        return res;
+      }
       if (f.hang) {
         return new Promise<Response>((_, reject) => {
           const signal = init?.signal;
@@ -176,6 +232,7 @@ export class FakePayPal {
       if (f.dropResponse) {
         const lost = await this.#route(method, url.pathname, headers, typeof init?.body === "string" ? init.body : undefined, requestId);
         this.calls.push({ method, path: url.pathname, status: lost.status, requestId });
+        if (f.status >= 500) return json(f.status, f.body ?? { name: "INTERNAL_SERVER_ERROR", message: "An internal server error occurred.", debug_id: newId("D").toLowerCase(), details: [] });
         throw new TypeError("fetch failed");
       }
       this.calls.push({ method, path: url.pathname, status: f.status, requestId });
@@ -343,14 +400,16 @@ export class FakePayPal {
       }
       if (minor <= 0 || minor > left) return ppError(422, "UNPROCESSABLE_ENTITY", "REFUND_AMOUNT_EXCEEDED", "The refund amount must be less than or equal to the capture amount that has not yet been refunded.");
     }
+    const pending = this.#pendNext > 0;
+    if (pending) this.#pendNext--;
     c.refundedMinor += minor;
     c.capture.status = c.refundedMinor >= capturedMinor ? "REFUNDED" : "PARTIALLY_REFUNDED";
     const stored = this.#orders.get(c.orderId)!;
-    this.#balances.set(stored.payeeKey, (this.#balances.get(stored.payeeKey) ?? 0) - minor);
+    if (!pending) this.#balances.set(stored.payeeKey, (this.#balances.get(stored.payeeKey) ?? 0) - minor);
     const refundId = newId("R");
     const refund: Refund = {
       id: refundId,
-      status: "COMPLETED",
+      status: pending ? "PENDING" : "COMPLETED",
       amount: { currency_code: c.capture.amount.currency_code, value: fromMinor(minor) },
       ...(typeof body.custom_id === "string" ? { custom_id: body.custom_id } : c.capture.custom_id ? { custom_id: c.capture.custom_id } : {}),
       ...(typeof body.note_to_payer === "string" ? { note_to_payer: body.note_to_payer } : {}),
@@ -361,7 +420,8 @@ export class FakePayPal {
       ],
     };
     this.#refunds.set(refundId, refund);
-    this.#emit("PAYMENT.CAPTURE.REFUNDED", "refund", structuredClone(refund), `A ${refund.amount!.currency_code} ${refund.amount!.value} capture payment was refunded`);
+    if (pending) this.#pendingRefunds.set(refundId, { captureId, minor });
+    else this.#emit("PAYMENT.CAPTURE.REFUNDED", "refund", structuredClone(refund), `A ${refund.amount!.currency_code} ${refund.amount!.value} capture payment was refunded`);
     return json(201, refund);
   }
 
