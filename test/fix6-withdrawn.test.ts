@@ -3,6 +3,7 @@
 // closed in the same save as the refund: reschedule status `withdrawn`, a `reschedule.withdrawn` ledger row,
 // and the card says it was withdrawn because the deposit was refunded. The status is additive, so records
 // written before it still load (SCHEMA_VERSION stays 2).
+// Round 7 (S2) extends it to a partial refund; see test/fix7-serial.test.ts.
 
 import { describe, expect, it } from "vitest";
 import { type Booking, ServiceError } from "../src/booking/service.ts";
@@ -53,11 +54,13 @@ describe("R4: a full refund withdraws a move still waiting for the guide", () =>
     expect(kinds(w, id).filter((x) => x === WITHDRAWN)).toHaveLength(1);
   });
 
-  it("a partial refund leaves it proposed; the refund that completes the deposit withdraws it", async () => {
+  // Since round 7 (S2) a partial refund withdraws it too (fix7-serial): a partially refunded booking can't
+  // answer a move, so it would stay "proposed" forever. The refund that completes the deposit adds nothing.
+  it("a partial refund withdraws it already; the refund that completes the deposit withdraws nothing more", async () => {
     const { w, id } = await proposed();
     realAlert(w);
-    expect(await w.service.refund(id, "10.00")).toMatchObject({ status: "partially_refunded", reschedule: { status: "proposed" } });
-    expect(kinds(w, id)).not.toContain(WITHDRAWN);
+    expect(await w.service.refund(id, "10.00")).toMatchObject({ status: "partially_refunded", reschedule: { status: "withdrawn" } });
+    expect(w.ledger.list(id).find((e) => e.kind === WITHDRAWN)!.data).toEqual({ from: DATE, to: MOVED, reason: "part of the deposit was refunded" });
     expect(await w.service.refund(id)).toMatchObject({ status: "refunded", reschedule: { status: "withdrawn" } });
     expect(kinds(w, id).filter((x) => x === WITHDRAWN)).toHaveLength(1);
   });

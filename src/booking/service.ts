@@ -68,7 +68,10 @@ export interface Booking {
   refunded_minor: number;
   refund_ids: string[];
   refund_ops: RefundOp[];
-  /** `withdrawn`: the deposit was fully refunded while the guide hadn't answered (added in round 6; additive). */
+  /**
+   * `withdrawn`: a refund of the deposit (in part, since round 7, or in full) completed while the guide hadn't
+   * answered (added in round 6; additive).
+   */
   reschedule?: { new_date: string; status: "proposed" | "accepted" | "declined" | "withdrawn" };
   refund_offered: boolean;
   /**
@@ -723,12 +726,17 @@ export class BookingService {
     return { posted: true, booking: next };
   }
 
-  /** The agent asks the guide to move a paid booking. Queued. */
+  /**
+   * The agent asks the guide to move a paid booking. Queued. Refused once a refund has started (sending,
+   * pending, done or in review): the guide couldn't answer it (see answerReschedule). A refund PayPal
+   * refused (`failed`) blocks nothing.
+   */
   async proposeReschedule(bookingId: string, newDate: string): Promise<Booking> {
     return this.#serial(bookingId, () => {
       const b = this.must(bookingId);
       if (!DATE_RE.test(newDate) || newDate === b.date) throw new ServiceError("bad_date", "new_date must be YYYY-MM-DD and differ from the booking date.");
       if (b.status !== "captured") throw new ServiceError("wrong_state", `Only a paid booking can be moved (it is ${b.status}).`);
+      if (refundStarted(b)) throw new ServiceError("wrong_state", "A refund of the deposit has started, so the trip can't be moved.");
       if (b.reschedule?.status === "proposed") throw new ServiceError("pending", "A reschedule is already waiting for the guide.");
       const next = this.#save({ ...b, reschedule: { new_date: newDate, status: "proposed" } });
       this.#log(next, "reschedule.proposed", { from: b.date, to: newDate });
@@ -929,13 +937,14 @@ export class BookingService {
       // Another operation in review keeps the whole booking in review: a later success never clears it.
       const inReview = b.refund_ops.some((o) => o.n !== n && o.status === "needs_review");
       const status: BookingStatus = inReview ? "needs_review" : refunded >= capturedMinor ? "refunded" : "partially_refunded";
-      // A full refund closes a move still waiting for the guide (it can't be answered any more): withdrawn
-      // in the same save, and logged after the refund.
-      const pendingMove = status === "refunded" && b.reschedule?.status === "proposed" ? b.reschedule : undefined;
+      // A refund that completes, in part or in full, closes a move still waiting for the guide (it can't be
+      // answered any more: the booking is no longer `captured`): withdrawn in the same save, and logged
+      // after the refund. A booking held for review keeps its move as it was.
+      const pendingMove = (status === "refunded" || status === "partially_refunded") && b.reschedule?.status === "proposed" ? b.reschedule : undefined;
       const closed = pendingMove ? { reschedule: { new_date: pendingMove.new_date, status: "withdrawn" as const } } : {};
       const next = this.#setOp({ ...b, refunded_minor: refunded, refund_ids: [...b.refund_ids, refund.id], status, ...closed }, n, { status: "completed", refund_id: refund.id, amount_minor: actual });
       this.#log(next, "refund.completed", { n, refund_id: refund.id, status: refund.status, amount: { currency_code: cur, value: fromMinor(actual) }, reason: op.reason });
-      if (pendingMove) this.#log(next, "reschedule.withdrawn", { from: b.date, to: pendingMove.new_date, reason: "the deposit was refunded" });
+      if (pendingMove) this.#log(next, "reschedule.withdrawn", { from: b.date, to: pendingMove.new_date, reason: status === "refunded" ? "the deposit was refunded" : "part of the deposit was refunded" });
       this.#d.channels.emit(b.conversation_id, { type: "refunded", booking_id: b.id, text: `Refunded ${cur} ${fromMinor(actual)} from ${b.guide_name} to the traveller (${op.reason}).` });
       return next;
     }

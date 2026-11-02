@@ -22,14 +22,17 @@ export function paymentLine(b) {
 }
 
 /**
- * The card's line for a move the agent proposed. "withdrawn": the deposit was fully refunded before the
- * guide answered, so the move was closed (the guide's page no longer asks).
+ * The card's line for a move the agent proposed. "withdrawn": a refund of the deposit (part or all of it)
+ * completed before the guide answered, so the move was closed (the guide's page no longer asks).
  * @returns {{ testid: string, text: string } | null}
  */
 export function rescheduleLine(b) {
   const r = b.reschedule;
   if (!r) return null;
-  if (r.status === "withdrawn") return { testid: "reschedule", text: `Reschedule to ${r.new_date}: withdrawn, because the deposit was refunded.` };
+  if (r.status === "withdrawn") {
+    const why = b.status === "partially_refunded" ? "part of the deposit was refunded" : "the deposit was refunded";
+    return { testid: "reschedule", text: `Reschedule to ${r.new_date}: withdrawn, because ${why}.` };
+  }
   return { testid: "reschedule", text: `Reschedule to ${r.new_date}: ${r.status}` };
 }
 
