@@ -81,7 +81,7 @@ export const TOOLS = [
     moneyMoving: false,
     run: async (a, ctx) => {
       own(ctx, a.booking_id);
-      const m = ctx.service.proposeMandate(a.booking_id);
+      const m = await ctx.service.proposeMandate(a.booking_id);
       return { mandate_id: m.id, status: m.status, amount: m.amount, payee: m.payee_name, quote_hash: m.quote_hash, expires_at: m.expires_at, next: "Wait for the traveller to approve with their code." };
     },
   }),
@@ -141,7 +141,7 @@ export const TOOLS = [
     moneyMoving: false,
     run: async (a, ctx) => {
       own(ctx, a.booking_id);
-      const b = ctx.service.proposeReschedule(a.booking_id, a.new_date);
+      const b = await ctx.service.proposeReschedule(a.booking_id, a.new_date);
       return { booking_id: b.id, reschedule: b.reschedule, sent: "The guide was asked on their page." };
     },
   }),

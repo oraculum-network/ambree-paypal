@@ -80,6 +80,8 @@ export interface Booking {
   updated_at: string;
 }
 
+export type CaptureResult = { booking: Booking; captured: boolean; order_status: string; capture_status?: string };
+
 export class ServiceError extends Error {
   override name = "ServiceError";
   readonly code: string;
@@ -231,14 +233,26 @@ export class BookingService {
   }
 
   /**
-   * Runs one booking's money steps one at a time (return URL, webhook and agent may race). Other changes
-   * (the guide's page, the mandate) don't queue here, so a step that saves after an await merges onto a
-   * fresh `must(id)`, never onto the copy it read before the await.
+   * The booking's queue: every step that changes a booking, or decides money on it, runs its whole
+   * read-decide-write here, one at a time per booking (the guide's page, the agent's tools, the traveller's
+   * approval, the return URL, the webhook and the demo control may all race). A step sent while another
+   * waits on PayPal or the weather feed waits for it, then reads the booking as that step left it.
+   * Different bookings don't wait for each other. A queued step must never call another queued public
+   * method for the same booking (it would wait for itself): it calls the unqueued `#…Now` variant.
+   * Saves after an await still merge onto a fresh `must(id)`, so a write made outside the service (another
+   * process on the same file) isn't wiped either.
    */
-  async #serial<T>(bookingId: string, fn: () => Promise<T>): Promise<T> {
+  #serial<T>(bookingId: string, fn: () => T | Promise<T>): Promise<T> {
     const prior = this.#locks.get(bookingId) ?? Promise.resolve();
     const run = prior.then(fn, fn);
-    this.#locks.set(bookingId, run.catch(() => undefined));
+    const tail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.#locks.set(bookingId, tail);
+    void tail.then(() => {
+      if (this.#locks.get(bookingId) === tail) this.#locks.delete(bookingId);
+    });
     return run;
   }
 
@@ -287,9 +301,14 @@ export class BookingService {
     return b;
   }
 
-  /** The guide sets the price on the operator page. The quote is then frozen and hashed. */
-  priceQuote(token: string, input: { total: string; deposit: string; note?: string }): Booking {
-    const b = this.#byTokenOrThrow(token);
+  /** The guide sets the price on the operator page. The quote is then frozen and hashed. Queued. */
+  async priceQuote(token: string, input: { total: string; deposit: string; note?: string }): Promise<Booking> {
+    const id = this.#byTokenOrThrow(token).id;
+    return this.#serial(id, () => this.#priceNow(id, input));
+  }
+
+  #priceNow(bookingId: string, input: { total: string; deposit: string; note?: string }): Booking {
+    const b = this.must(bookingId);
     if (b.status !== "requested") throw new ServiceError("already_answered", "This request already has an answer.");
     const g = this.guide(b.guide_id)!;
     let total: number;
@@ -323,19 +342,27 @@ export class BookingService {
     return next;
   }
 
-  declineRequest(token: string): Booking {
-    const b = this.#byTokenOrThrow(token);
-    if (b.status !== "requested") throw new ServiceError("already_answered", "This request already has an answer.");
-    const next = this.#save({ ...b, status: "declined" });
-    this.#log(next, "quote.declined", {});
-    this.#d.channels.emit(b.conversation_id, { type: "guide_declined", booking_id: b.id, text: `${b.guide_name} can't do ${b.date}.` });
-    return next;
+  /** The guide can't do the date. Queued. */
+  async declineRequest(token: string): Promise<Booking> {
+    const id = this.#byTokenOrThrow(token).id;
+    return this.#serial(id, () => {
+      const b = this.must(id);
+      if (b.status !== "requested") throw new ServiceError("already_answered", "This request already has an answer.");
+      const next = this.#save({ ...b, status: "declined" });
+      this.#log(next, "quote.declined", {});
+      this.#d.channels.emit(b.conversation_id, { type: "guide_declined", booking_id: b.id, text: `${b.guide_name} can't do ${b.date}.` });
+      return next;
+    });
   }
 
   // ---------- 2. the mandate ----------
 
-  /** Builds the mandate from the frozen quote; the code goes to the traveller's inbox, not to the caller. */
-  proposeMandate(bookingId: string): MandateView {
+  /** Builds the mandate from the frozen quote; the code goes to the traveller's inbox, not to the caller. Queued. */
+  async proposeMandate(bookingId: string): Promise<MandateView> {
+    return this.#serial(bookingId, () => this.#proposeMandateNow(bookingId));
+  }
+
+  #proposeMandateNow(bookingId: string): MandateView {
     const b = this.must(bookingId);
     if (b.status !== "priced" && b.status !== "mandate_proposed") throw new ServiceError("wrong_state", `The booking is ${b.status}; a mandate needs a priced quote.`);
     if (!b.quote) throw new ServiceError("no_quote", "The guide has not priced this yet.");
@@ -352,10 +379,19 @@ export class BookingService {
     return view(mandate);
   }
 
-  /** The traveller approves with the step-up code. Only the web route calls this (after its session check); no tool does. */
-  approveMandate(mandateId: string, code: string): Booking {
-    const m = this.#d.mandates.get(mandateId);
-    if (!m) throw new ServiceError("not_found", "No such mandate.");
+  /**
+   * The traveller approves with the step-up code. Only the web route calls this (after its session check);
+   * no tool does. Queued on the mandate's booking; the mandate is read again inside, as an earlier queued
+   * attempt (a wrong code, a newer mandate) may have changed it.
+   */
+  async approveMandate(mandateId: string, code: string): Promise<Booking> {
+    const found = this.#d.mandates.get(mandateId);
+    if (!found) throw new ServiceError("not_found", "No such mandate.");
+    return this.#serial(found.booking_id, () => this.#approveMandateNow(mandateId, code));
+  }
+
+  #approveMandateNow(mandateId: string, code: string): Booking {
+    const m = this.#d.mandates.get(mandateId)!;
     const b = this.must(m.booking_id);
     if (b.mandate_id !== m.id) throw new ServiceError("stale_mandate", "A newer mandate replaced this one.");
     const r = this.#d.mandates.approve(mandateId, code);
@@ -482,32 +518,35 @@ export class BookingService {
    * the capture. Only a COMPLETED capture of the mandate's amount counts as paid. A PENDING capture is
    * refreshed by GET on the next call (the PAYMENT.CAPTURE.* webhooks make that call). Idempotent.
    */
-  async captureIfApproved(bookingId: string): Promise<{ booking: Booking; captured: boolean; order_status: string; capture_status?: string }> {
-    return this.#serial(bookingId, async () => {
-      const b = this.must(bookingId);
-      if (b.status === "captured" || b.status === "partially_refunded" || b.status === "refunded") return { booking: b, captured: true, order_status: "COMPLETED", capture_status: b.capture_status };
-      if (b.status === "needs_review" || b.status === "capture_failed") return { booking: b, captured: false, order_status: b.status, capture_status: b.capture_status };
-      if (!b.order_id) throw new ServiceError("no_order", "No PayPal order yet.");
-      const m = this.#d.mandates.get(b.mandate_id!)!;
-      let order = await this.#d.payments.getOrder(b.order_id);
-      const before = this.orderProblem(order, b, m);
-      if (before) {
-        const next = this.#save({ ...this.must(bookingId), status: "needs_review" });
-        this.#log(next, "order.mismatch", { order_id: order.id, problem: before, stage: "before_capture" });
-        throw new ServiceError("order_mismatch", `The PayPal order no longer matches the mandate (${before}); not capturing.`);
+  async captureIfApproved(bookingId: string): Promise<CaptureResult> {
+    return this.#serial(bookingId, () => this.#captureNow(bookingId));
+  }
+
+  /** captureIfApproved's body, unqueued: only for a caller already on this booking's queue (the webhook). */
+  async #captureNow(bookingId: string): Promise<CaptureResult> {
+    const b = this.must(bookingId);
+    if (b.status === "captured" || b.status === "partially_refunded" || b.status === "refunded") return { booking: b, captured: true, order_status: "COMPLETED", capture_status: b.capture_status };
+    if (b.status === "needs_review" || b.status === "capture_failed") return { booking: b, captured: false, order_status: b.status, capture_status: b.capture_status };
+    if (!b.order_id) throw new ServiceError("no_order", "No PayPal order yet.");
+    const m = this.#d.mandates.get(b.mandate_id!)!;
+    let order = await this.#d.payments.getOrder(b.order_id);
+    const before = this.orderProblem(order, b, m);
+    if (before) {
+      const next = this.#save({ ...this.must(bookingId), status: "needs_review" });
+      this.#log(next, "order.mismatch", { order_id: order.id, problem: before, stage: "before_capture" });
+      throw new ServiceError("order_mismatch", `The PayPal order no longer matches the mandate (${before}); not capturing.`);
+    }
+    if (b.status !== "capture_pending" && order.status === "APPROVED") {
+      try {
+        order = await this.#d.payments.captureOrder(order.id, `capture-${order.id}`);
+      } catch (e) {
+        if (!(e instanceof PayPalError && e.issue === "ORDER_ALREADY_CAPTURED")) throw e;
+        order = await this.#d.payments.getOrder(b.order_id);
       }
-      if (b.status !== "capture_pending" && order.status === "APPROVED") {
-        try {
-          order = await this.#d.payments.captureOrder(order.id, `capture-${order.id}`);
-        } catch (e) {
-          if (!(e instanceof PayPalError && e.issue === "ORDER_ALREADY_CAPTURED")) throw e;
-          order = await this.#d.payments.getOrder(b.order_id);
-        }
-      }
-      const cap = firstCapture(order);
-      if (!cap) return { booking: this.must(bookingId), captured: false, order_status: order.status };
-      return this.#reconcileCapture(bookingId, m, order, cap);
-    });
+    }
+    const cap = firstCapture(order);
+    if (!cap) return { booking: this.must(bookingId), captured: false, order_status: order.status };
+    return this.#reconcileCapture(bookingId, m, order, cap);
   }
 
   /**
@@ -575,34 +614,42 @@ export class BookingService {
     }
     if (!verified) return { status: 400, result: "signature not verified" };
     const at = this.#now().toISOString();
-    const begun = beginWebhook(this.#d.db, event.id, event.event_type, at);
-    if (begun.duplicate) return { status: 200, result: "duplicate" };
-    const b = this.#findForResource(event.resource);
-    if (!b) {
+    const found = this.#findForResource(event.resource);
+    if (!found) {
+      const begun = beginWebhook(this.#d.db, event.id, event.event_type, at);
+      if (begun.duplicate) return { status: 200, result: "duplicate" };
       finishWebhook(this.#d.db, event.id, "completed", at);
       return { status: 200, result: "no matching booking" };
     }
-    const r = event.resource as { id?: string; status?: string; amount?: Money };
-    if (!begun.logged) {
-      this.#log(b, `webhook.${event.event_type}`, { event_id: event.id, resource_type: event.resource_type, resource_id: r.id, status: r.status, amount: r.amount, verified: true });
-      markWebhookLogged(this.#d.db, event.id);
-    }
-    try {
-      // Refund events (PAYMENT.CAPTURE.REFUNDED and PAYMENT.REFUND.*, e.g. PAYMENT.REFUND.FAILED) refresh
-      // every pending refund by GET, so a failed one releases its reservation; capture events refresh the capture.
-      const refundEvent = event.event_type === "PAYMENT.CAPTURE.REFUNDED" || event.event_type.startsWith("PAYMENT.REFUND.");
-      if (refundEvent) {
-        await this.refreshRefunds(b.id);
-      } else if (event.event_type === "CHECKOUT.ORDER.APPROVED" || event.event_type.startsWith("PAYMENT.CAPTURE.")) {
-        if (b.order_id) await this.captureIfApproved(b.id);
+    // The rest is one step on the booking's queue: the dedupe, the ledger row and the reaction, so a
+    // redelivery queued behind it sees it completed, and its row lands in the booking's order of steps.
+    return this.#serial(found.id, async () => {
+      const begun = beginWebhook(this.#d.db, event.id, event.event_type, at);
+      if (begun.duplicate) return { status: 200, result: "duplicate" };
+      const b = this.must(found.id);
+      const r = event.resource as { id?: string; status?: string; amount?: Money };
+      if (!begun.logged) {
+        this.#log(b, `webhook.${event.event_type}`, { event_id: event.id, resource_type: event.resource_type, resource_id: r.id, status: r.status, amount: r.amount, verified: true });
+        markWebhookLogged(this.#d.db, event.id);
       }
-      finishWebhook(this.#d.db, event.id, "completed", this.#now().toISOString());
-      return { status: 200, result: "logged" };
-    } catch (e) {
-      finishWebhook(this.#d.db, event.id, "failed", this.#now().toISOString());
-      this.#log(b, "webhook.processing_failed", { event_id: event.id, attempt: begun.attempts, error: e instanceof PayPalError ? e.summary() : e instanceof ServiceError ? e.code : "unknown" });
-      return { status: 500, result: "processing failed; PayPal will redeliver" };
-    }
+      try {
+        // Refund events (PAYMENT.CAPTURE.REFUNDED and PAYMENT.REFUND.*, e.g. PAYMENT.REFUND.FAILED) refresh
+        // every pending refund by GET, so a failed one releases its reservation; capture events refresh the
+        // capture. Already on the queue, so the unqueued variants.
+        const refundEvent = event.event_type === "PAYMENT.CAPTURE.REFUNDED" || event.event_type.startsWith("PAYMENT.REFUND.");
+        if (refundEvent) {
+          await this.#refreshNow(b.id);
+        } else if (event.event_type === "CHECKOUT.ORDER.APPROVED" || event.event_type.startsWith("PAYMENT.CAPTURE.")) {
+          if (b.order_id) await this.#captureNow(b.id);
+        }
+        finishWebhook(this.#d.db, event.id, "completed", this.#now().toISOString());
+        return { status: 200, result: "logged" };
+      } catch (e) {
+        finishWebhook(this.#d.db, event.id, "failed", this.#now().toISOString());
+        this.#log(b, "webhook.processing_failed", { event_id: event.id, attempt: begun.attempts, error: e instanceof PayPalError ? e.summary() : e instanceof ServiceError ? e.code : "unknown" });
+        return { status: 500, result: "processing failed; PayPal will redeliver" };
+      }
+    });
   }
 
   // ---------- 5. weather, reschedule, refund ----------
@@ -620,16 +667,23 @@ export class BookingService {
     return { alerts, explanation: alerts.length ? alerts.map(explainRisk).join(" ") : `No cyclone warning covers ${b.date}.` };
   }
 
-  /** Tells every booking in a conversation whose date an alert covers (the fake-mode demo control calls this). */
+  /**
+   * Tells every booking in a conversation whose date an alert covers (the fake-mode demo control calls this).
+   * Each booking's lookup and announcement is one step on that booking's queue, so it is decided on the
+   * booking as a refund or capture in progress leaves it, and its row lands in the booking's order of steps.
+   */
   async announceCyclone(conversationId: string): Promise<number> {
     let n = 0;
     for (const listed of this.forConversation(conversationId)) {
-      const { alerts, explanation } = await this.weatherFor(listed.id);
-      const b = this.must(listed.id); // its status as it is after the feed answered
-      if (!alerts.length || !WARNABLE.includes(b.status)) continue;
-      this.#log(b, "weather.alert", { alerts: alerts.map((a) => ({ id: a.id, level: a.level, from: a.from, to: a.to, source: a.source })) });
-      this.#d.channels.emit(conversationId, { type: "cyclone", booking_id: b.id, text: `Cyclone warning for ${b.date}: ${explanation}` });
-      n++;
+      const warned = await this.#serial(listed.id, async () => {
+        const { alerts, explanation } = await this.weatherFor(listed.id);
+        const b = this.must(listed.id); // its status as it is after the feed answered
+        if (!alerts.length || !WARNABLE.includes(b.status)) return false;
+        this.#log(b, "weather.alert", { alerts: alerts.map((a) => ({ id: a.id, level: a.level, from: a.from, to: a.to, source: a.source })) });
+        this.#d.channels.emit(conversationId, { type: "cyclone", booking_id: b.id, text: `Cyclone warning for ${b.date}: ${explanation}` });
+        return true;
+      });
+      if (warned) n++;
     }
     return n;
   }
@@ -639,7 +693,7 @@ export class BookingService {
    * booking, logged (`weather.simulated_alert`) and announced to the agent, once per booking, and only on a
    * paid (captured) booking: any other status is refused and nothing is saved, logged or announced. It calls
    * no payment API: the agent reacts to the event by proposing a new date (see refundReason). It queues
-   * with the booking's money steps (#serial), so it never lands inside a capture or refund that is waiting
+   * with the booking's other steps (#serial), so it never lands inside a capture or refund that is waiting
    * on PayPal, and two racing calls can't both post.
    */
   async simulateCyclone(bookingId: string): Promise<{ posted: boolean; booking: Booking }> {
@@ -669,22 +723,31 @@ export class BookingService {
     return { posted: true, booking: next };
   }
 
-  proposeReschedule(bookingId: string, newDate: string): Booking {
-    const b = this.must(bookingId);
-    if (!DATE_RE.test(newDate) || newDate === b.date) throw new ServiceError("bad_date", "new_date must be YYYY-MM-DD and differ from the booking date.");
-    if (b.status !== "captured") throw new ServiceError("wrong_state", `Only a paid booking can be moved (it is ${b.status}).`);
-    if (b.reschedule?.status === "proposed") throw new ServiceError("pending", "A reschedule is already waiting for the guide.");
-    const next = this.#save({ ...b, reschedule: { new_date: newDate, status: "proposed" } });
-    this.#log(next, "reschedule.proposed", { from: b.date, to: newDate });
-    return next;
+  /** The agent asks the guide to move a paid booking. Queued. */
+  async proposeReschedule(bookingId: string, newDate: string): Promise<Booking> {
+    return this.#serial(bookingId, () => {
+      const b = this.must(bookingId);
+      if (!DATE_RE.test(newDate) || newDate === b.date) throw new ServiceError("bad_date", "new_date must be YYYY-MM-DD and differ from the booking date.");
+      if (b.status !== "captured") throw new ServiceError("wrong_state", `Only a paid booking can be moved (it is ${b.status}).`);
+      if (b.reschedule?.status === "proposed") throw new ServiceError("pending", "A reschedule is already waiting for the guide.");
+      const next = this.#save({ ...b, reschedule: { new_date: newDate, status: "proposed" } });
+      this.#log(next, "reschedule.proposed", { from: b.date, to: newDate });
+      return next;
+    });
   }
 
   /**
    * The guide answers a proposed move; only while the booking is still paid and not refunded (captured)
    * and no refund has started (one being sent or pending leaves the booking captured until PayPal answers).
+   * Queued: an answer sent while a refund is deciding or waiting on PayPal is decided after it.
    */
-  answerReschedule(token: string, accept: boolean): Booking {
-    const b = this.#byTokenOrThrow(token);
+  async answerReschedule(token: string, accept: boolean): Promise<Booking> {
+    const id = this.#byTokenOrThrow(token).id;
+    return this.#serial(id, () => this.#answerNow(id, accept));
+  }
+
+  #answerNow(bookingId: string, accept: boolean): Booking {
+    const b = this.must(bookingId);
     if (b.reschedule?.status !== "proposed") throw new ServiceError("no_reschedule", "No reschedule is waiting.");
     if (b.status !== "captured") throw new ServiceError("wrong_state", `The booking is ${b.status}, so the trip can no longer be moved.`);
     if (refundStarted(b)) throw new ServiceError("wrong_state", "A refund of the deposit has started, so the trip can no longer be moved.");
@@ -699,14 +762,17 @@ export class BookingService {
     return next;
   }
 
-  /** The guide offers a refund from the operator page (e.g. they fell ill). */
-  offerRefund(token: string): Booking {
-    const b = this.#byTokenOrThrow(token);
-    if (b.status !== "captured" && b.status !== "partially_refunded") throw new ServiceError("wrong_state", "Nothing to refund.");
-    const next = this.#save({ ...b, refund_offered: true });
-    this.#log(next, "refund.offered", {});
-    this.#d.channels.emit(b.conversation_id, { type: "refund_offered", booking_id: b.id, text: `${b.guide_name} offered to refund the deposit.` });
-    return next;
+  /** The guide offers a refund from the operator page (e.g. they fell ill). Queued. */
+  async offerRefund(token: string): Promise<Booking> {
+    const id = this.#byTokenOrThrow(token).id;
+    return this.#serial(id, () => {
+      const b = this.must(id);
+      if (b.status !== "captured" && b.status !== "partially_refunded") throw new ServiceError("wrong_state", "Nothing to refund.");
+      const next = this.#save({ ...b, refund_offered: true });
+      this.#log(next, "refund.offered", {});
+      this.#d.channels.emit(b.conversation_id, { type: "refund_offered", booking_id: b.id, text: `${b.guide_name} offered to refund the deposit.` });
+      return next;
+    });
   }
 
   /**
@@ -726,24 +792,58 @@ export class BookingService {
   }
 
   /**
-   * The refund's reason on the booking as stored once the feed has answered, with that booking. The status,
-   * the guide's offer and a declined reschedule are read on it; a feed warning counts only if its date is
-   * still the date that was looked up. A date moved meanwhile (the guide accepted a reschedule) is looked up
-   * once more; if it moves again, the request is refused (`date_changed`, nothing reserved) and can simply
-   * be retried. So a refund never goes out for a reason that doesn't hold on the booking it reserves on.
+   * The refund operation to send: the one an earlier attempt left `sending` (resent unchanged), or a new one.
+   * A new one's reason is decided, and the operation reserved, on one fresh read of the booking with no
+   * await in between (S3): only the weather lookup awaits, and each pass reads the booking again after it.
+   * The status, the guide's offer and a declined reschedule are read on that booking; a feed warning counts
+   * only if its date is still the date that was looked up. On the queue nothing else can move the date
+   * meanwhile; a date moved anyway (by a writer outside the service) is looked up once more, and a second
+   * move refuses the request (`date_changed`, nothing reserved), which can simply be retried.
    */
-  async #reasonNow(bookingId: string): Promise<{ booking: Booking; reason?: string }> {
-    let b = this.must(bookingId);
+  async #reserveRefund(bookingId: string, amount: string | undefined): Promise<{ booking: Booking; op: RefundOp }> {
+    let looked: { date: string; warned: boolean } | undefined;
     for (let lookups = 0; ; lookups++) {
-      const settled = settledReason(b);
-      if (settled.decided) return { booking: b, reason: settled.reason };
-      if (lookups === MAX_LOOKUPS) {
-        throw new ServiceError("date_changed", "The booking's date changed while the weather was being checked, so nothing was refunded; ask for the refund again.");
+      const b = this.must(bookingId);
+      // A refund whose PayPal reply didn't match stops every further refund and retry for this booking
+      // until a person has reconciled it.
+      if (b.refund_ops.some((o) => o.status === "needs_review")) {
+        throw new ServiceError("refund_under_review", "A refund on this booking needs review (PayPal's reply didn't match what was sent); no further refunds or retries until it is reconciled.");
       }
-      const date = b.date;
-      const warned = await this.#realWarning(date);
-      b = this.must(bookingId);
-      if (b.date === date && !settledReason(b).decided) return { booking: b, reason: warned ? WARNING_REASON : undefined };
+      const sending = b.refund_ops.find((o) => o.status === "sending");
+      if (sending) {
+        this.#log(b, "refund.retry", { n: sending.n, request_id: sending.request_id, amount_minor: sending.amount_minor, requested: amount ?? null });
+        return { booking: b, op: sending };
+      }
+      const settled = settledReason(b);
+      let reason: string | undefined;
+      if (settled.decided) reason = settled.reason;
+      else if (looked && looked.date === b.date) reason = looked.warned ? WARNING_REASON : undefined;
+      else {
+        if (lookups === MAX_LOOKUPS) {
+          throw new ServiceError("date_changed", "The booking's date changed while the weather was being checked, so nothing was refunded; ask for the refund again.");
+        }
+        looked = { date: b.date, warned: await this.#realWarning(b.date) };
+        continue;
+      }
+      // From here to the save: synchronous, on `b` as just read.
+      if (!reason) throw new ServiceError("refund_not_allowed", refundRefusal(b));
+      const capturedMinor = toMinor(b.captured!.value);
+      const reserved = BookingService.reservedMinor(b);
+      const left = capturedMinor - reserved;
+      let minor = left;
+      if (amount !== undefined) {
+        try {
+          minor = toMinor(amount);
+        } catch {
+          throw new ServiceError("bad_amount", "amount must look like 10.00.");
+        }
+      }
+      if (minor <= 0 || minor > left) throw new ServiceError("bad_amount", `At most ${fromMinor(Math.max(0, left))} can be refunded now${reserved ? " (other refunds are pending or done)" : ""}.`);
+      const n = b.refund_ops.length + 1;
+      const op: RefundOp = { n, request_id: `refund-${b.id}-${n}`, amount_minor: minor, full: minor === capturedMinor, reason, status: "sending" };
+      const next = this.#save({ ...b, refund_ops: [...b.refund_ops, op] });
+      this.#log(next, "refund.requested", { n, request_id: op.request_id, amount: { currency_code: next.captured!.currency_code, value: fromMinor(minor) }, reason });
+      return { booking: next, op };
     }
   }
 
@@ -753,43 +853,14 @@ export class BookingService {
   }
 
   /**
-   * Refunds part or all of the capture. Each refund is persisted (amount + PayPal-Request-Id) before it is
-   * sent; if a send has no definitive answer, the next call resends that same operation unchanged.
+   * Refunds part or all of the capture. Queued: the reason is decided and the operation reserved (persisted
+   * with its amount and PayPal-Request-Id) before it is sent; if a send has no definitive answer, the next
+   * call resends that same operation unchanged.
    */
   async refund(bookingId: string, amount?: string): Promise<Booking> {
     return this.#serial(bookingId, async () => {
-      let b = this.must(bookingId);
-      // A refund whose PayPal reply didn't match stops every further refund and retry for this booking
-      // until a person has reconciled it.
-      if (b.refund_ops.some((o) => o.status === "needs_review")) {
-        throw new ServiceError("refund_under_review", "A refund on this booking needs review (PayPal's reply didn't match what was sent); no further refunds or retries until it is reconciled.");
-      }
-      let op = b.refund_ops.find((o) => o.status === "sending");
-      if (op) {
-        this.#log(b, "refund.retry", { n: op.n, request_id: op.request_id, amount_minor: op.amount_minor, requested: amount ?? null });
-      } else {
-        // The reason may wait on the weather feed: it is decided on, and the refund reserved on, the
-        // booking as stored once the feed answered.
-        let reason: string | undefined;
-        ({ booking: b, reason } = await this.#reasonNow(bookingId));
-        if (!reason) throw new ServiceError("refund_not_allowed", refundRefusal(b));
-        const capturedMinor = toMinor(b.captured!.value);
-        const reserved = BookingService.reservedMinor(b);
-        const left = capturedMinor - reserved;
-        let minor = left;
-        if (amount !== undefined) {
-          try {
-            minor = toMinor(amount);
-          } catch {
-            throw new ServiceError("bad_amount", "amount must look like 10.00.");
-          }
-        }
-        if (minor <= 0 || minor > left) throw new ServiceError("bad_amount", `At most ${fromMinor(Math.max(0, left))} can be refunded now${reserved ? " (other refunds are pending or done)" : ""}.`);
-        const n = b.refund_ops.length + 1;
-        op = { n, request_id: `refund-${b.id}-${n}`, amount_minor: minor, full: minor === capturedMinor, reason, status: "sending" };
-        b = this.#save({ ...b, refund_ops: [...b.refund_ops, op] });
-        this.#log(b, "refund.requested", { n, request_id: op.request_id, amount: { currency_code: b.captured!.currency_code, value: fromMinor(minor) }, reason });
-      }
+      // `b` serves only fields fixed once captured (id, capture_id, the currency) and the PayPal call.
+      const { booking: b, op } = await this.#reserveRefund(bookingId, amount);
       const cur = b.captured!.currency_code;
       const body = op.full ? {} : { amount: { currency_code: cur, value: fromMinor(op.amount_minor) } };
       let refund: Refund;
@@ -808,16 +879,19 @@ export class BookingService {
     });
   }
 
-  /** Asks PayPal about every pending refund (the PAYMENT.CAPTURE.REFUNDED webhook calls this). */
+  /** Asks PayPal about every pending refund (the PAYMENT.CAPTURE.REFUNDED webhook does this too). Queued. */
   async refreshRefunds(bookingId: string): Promise<Booking> {
-    return this.#serial(bookingId, async () => {
-      let b = this.must(bookingId);
-      for (const op of b.refund_ops.filter((o) => o.status === "pending" && o.refund_id)) {
-        const refund = await this.#d.payments.getRefund(op.refund_id!);
-        b = this.#applyRefund(bookingId, op.n, refund);
-      }
-      return b;
-    });
+    return this.#serial(bookingId, () => this.#refreshNow(bookingId));
+  }
+
+  /** refreshRefunds' body, unqueued: only for a caller already on this booking's queue (the webhook). */
+  async #refreshNow(bookingId: string): Promise<Booking> {
+    let b = this.must(bookingId);
+    for (const op of b.refund_ops.filter((o) => o.status === "pending" && o.refund_id)) {
+      const refund = await this.#d.payments.getRefund(op.refund_id!);
+      b = this.#applyRefund(bookingId, op.n, refund);
+    }
+    return b;
   }
 
   #setOp(b: Booking, n: number, patch: Partial<RefundOp>): Booking {

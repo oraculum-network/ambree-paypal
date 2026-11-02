@@ -57,24 +57,27 @@ export function renderInvalidLink(): string {
   return shell("Link not valid", `<h1>This link is not valid</h1><p>Ask Ambree for a new one.</p>`);
 }
 
-/** Applies a form post from the operator page. Returns the flash message to show. */
-export function applyOperatorAction(service: BookingService, token: string, form: URLSearchParams): { ok: boolean; text: string } {
+/**
+ * Applies a form post from the operator page. Returns the flash message to show. Each step queues behind
+ * whatever else is changing this booking (a refund waiting on PayPal, say) and is decided after it.
+ */
+export async function applyOperatorAction(service: BookingService, token: string, form: URLSearchParams): Promise<{ ok: boolean; text: string }> {
   try {
     switch (form.get("action")) {
       case "price":
-        service.priceQuote(token, { total: form.get("total") ?? "", deposit: form.get("deposit") ?? "", note: form.get("note") ?? "" });
+        await service.priceQuote(token, { total: form.get("total") ?? "", deposit: form.get("deposit") ?? "", note: form.get("note") ?? "" });
         return { ok: true, text: "Price sent to the traveller." };
       case "decline":
-        service.declineRequest(token);
+        await service.declineRequest(token);
         return { ok: true, text: "Declined. The traveller will be told." };
       case "accept_reschedule":
-        service.answerReschedule(token, true);
+        await service.answerReschedule(token, true);
         return { ok: true, text: "Moved. Thank you." };
       case "decline_reschedule":
-        service.answerReschedule(token, false);
+        await service.answerReschedule(token, false);
         return { ok: true, text: "Noted: the traveller may get the deposit back." };
       case "offer_refund":
-        service.offerRefund(token);
+        await service.offerRefund(token);
         return { ok: true, text: "Refund offered." };
       default:
         return { ok: false, text: "Unknown action." };

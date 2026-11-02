@@ -35,6 +35,8 @@ async function expectNoAnswer(w: World, id: string, token: string) {
 }
 
 describe("R3: no answer to a move once a refund is under way", () => {
+  // Since round 7 an answer sent while the refund's POST is in flight waits for the refund (the booking's
+  // queue) and is then refused: the full refund has withdrawn the move (fix6-withdrawn), so nothing waits.
   it("a full refund whose POST is in flight: the move can't be accepted, and the booking ends refunded on its own date", async () => {
     const g = gate();
     const w = makeWorld({ payments: (p) => slow(p, "refundCapture", g) });
@@ -46,9 +48,15 @@ describe("R3: no answer to a move once a refund is under way", () => {
     const refunding = w.service.refund(id);
     await g.entered; // PayPal refunded; the operation is still `sending` and the booking `captured`
     expect(w.service.get(id)).toMatchObject({ status: "captured", refund_ops: [{ status: "sending", full: true }] });
-    await expectNoAnswer(w, id, token);
+    expect(renderOperatorPage(token, w.service.get(id)!)).not.toContain(QUESTION);
+    const refused = (p: Promise<unknown>) => p.then(() => undefined, (e: unknown) => e);
+    const answering = [true, false].map((accept) => refused(later(() => w.service.answerReschedule(token, accept))));
+    const posting = later(() => applyOperatorAction(w.service, token, new URLSearchParams({ action: "accept_reschedule" })));
     g.release();
-    expect(await refunding).toMatchObject({ status: "refunded", date: DATE });
+    expect(await refunding).toMatchObject({ status: "refunded", date: DATE, reschedule: { status: "withdrawn" } });
+    for (const e of await Promise.all(answering)) expect(e).toMatchObject({ code: "no_reschedule" });
+    expect((await posting).ok).toBe(false);
+    expect(w.service.get(id)!.date).toBe(DATE);
     expect(answers(w, id)).toEqual([]);
   });
 

@@ -314,7 +314,7 @@ export function createApp(opts: AppOptions): App {
       const booking = mandate ? service.get(mandate.booking_id) : undefined;
       if (!booking || !s.conversations.includes(booking.conversation_id)) return sendJson(res, 404, { error: "No such mandate." });
       try {
-        service.approveMandate(m[1]!, String(body?.code ?? ""));
+        await service.approveMandate(m[1]!, String(body?.code ?? ""));
         return sendJson(res, 200, { ok: true, ...state(booking.conversation_id) });
       } catch (e) {
         if (e instanceof ServiceError) return sendJson(res, 422, { ok: false, error: e.message, reason: e.code });
@@ -359,7 +359,7 @@ export function createApp(opts: AppOptions): App {
       if (!booking) return send(res, 404, renderInvalidLink(), "text/html; charset=utf-8");
       if (method === "POST") {
         const raw = await readBody(req, JSON_LIMIT);
-        const flash = applyOperatorAction(service, token, new URLSearchParams(raw ?? ""));
+        const flash = await applyOperatorAction(service, token, new URLSearchParams(raw ?? ""));
         return send(res, flash.ok ? 200 : 422, renderOperatorPage(token, service.get(booking.id)!, flash), "text/html; charset=utf-8");
       }
       return send(res, 200, renderOperatorPage(token, booking), "text/html; charset=utf-8");

@@ -4,6 +4,9 @@
 // again on the fresh booking: its status, the guide's offer and a declined move first; a feed warning counts
 // only for the date that was looked up (a moved date is looked up once more; a second move is refused with
 // a retryable error).
+// Since round 7 no step of the service can change the booking while the refund waits on the feed: the
+// guide's answer queues behind the refund (fix7-serial). These tests now change the booking straight in the
+// store during the lookup, as another process on the same file would, so the re-read stays covered.
 
 import { describe, expect, it } from "vitest";
 import { type Booking, ServiceError } from "../src/booking/service.ts";
@@ -34,20 +37,27 @@ function world(...gates: Gate[]): { w: World; looked: string[] } {
   return { w, looked };
 }
 
+/** Changes the booking in the store, outside the service and its queue. */
+function outside(w: World, id: string, patch: Partial<Booking>) {
+  const records = new Records<Booking>(w.db, "booking");
+  records.put({ ...records.get(id)!, ...patch });
+}
+const accepted = (to: string): Partial<Booking> => ({ date: to, reschedule: { new_date: to, status: "accepted" } });
+
 const alert = (w: World, to: string) => w.weather.raise({ id: `TC-R1-${to}`, name: "Cyclone R1", level: "orange", from: DATE, to, summary: "" });
 const refundRows = (w: World, id: string) => kinds(w, id).filter((k) => k.startsWith("refund."));
 
 describe("R1: the refund's reason is derived again on the booking as it is after the feed answered", () => {
-  it("the guide accepts a move to a day no warning covers while the feed answers: no refund goes out", async () => {
+  it("the date moves to a day no warning covers while the feed answers: no refund goes out", async () => {
     const g = gate();
     const { w, looked } = world(g);
-    const { id, token } = await paid(w);
+    const { id } = await paid(w);
     alert(w, DATE); // a real orange warning on 11-05 only
     await w.service.proposeReschedule(id, MOVED);
     g.arm();
     const refunding = w.service.refund(id);
     await g.entered; // the feed said 11-05 is covered; nothing is reserved yet
-    await w.service.answerReschedule(token, true);
+    outside(w, id, accepted(MOVED));
     g.release();
     await expect(refunding).rejects.toMatchObject({ code: "refund_not_allowed" });
     expect(refundPosts(w)).toBe(0);
@@ -59,13 +69,13 @@ describe("R1: the refund's reason is derived again on the booking as it is after
   it("a warning that also covers the new day: the new day is looked up and the refund goes out for it", async () => {
     const g = gate();
     const { w, looked } = world(g);
-    const { id, token } = await paid(w);
+    const { id } = await paid(w);
     alert(w, MOVED); // covers 11-05 to 11-08
     await w.service.proposeReschedule(id, MOVED);
     g.arm();
     const refunding = w.service.refund(id);
     await g.entered;
-    await w.service.answerReschedule(token, true);
+    outside(w, id, accepted(MOVED));
     g.release();
     expect(await refunding).toMatchObject({ status: "refunded", date: MOVED });
     expect(looked).toEqual([DATE, MOVED]);
@@ -77,20 +87,19 @@ describe("R1: the refund's reason is derived again on the booking as it is after
     const first = gate();
     const second = gate();
     const { w, looked } = world(first, second);
-    const { id, token } = await paid(w);
+    const { id } = await paid(w);
     alert(w, MOVED_AGAIN); // covers 11-05 to 11-11
     await w.service.proposeReschedule(id, MOVED);
     first.arm();
     const refunding = w.service.refund(id);
     await first.entered;
-    await w.service.answerReschedule(token, true);
+    outside(w, id, accepted(MOVED));
     second.arm();
     first.release();
     // The lookup for 11-08 (fails fast, rather than timing out, if the refund settles without it).
     const next = await Promise.race([second.entered.then(() => "looked up again"), refunding.then(() => "refunded", () => "refused")]);
     expect(next).toBe("looked up again");
-    await w.service.proposeReschedule(id, MOVED_AGAIN);
-    await w.service.answerReschedule(token, true);
+    outside(w, id, accepted(MOVED_AGAIN));
     second.release();
     const e = await refunding.then(
       () => undefined,
@@ -107,16 +116,16 @@ describe("R1: the refund's reason is derived again on the booking as it is after
     expect(looked).toEqual([DATE, MOVED, MOVED_AGAIN]);
   });
 
-  it("the guide declines the move while the feed answers: the refund reads the guide's decline", async () => {
+  it("the move is declined while the feed answers: the refund reads the decline", async () => {
     const g = gate();
     const { w } = world(g);
-    const { id, token } = await paid(w);
+    const { id } = await paid(w);
     alert(w, DATE);
     await w.service.proposeReschedule(id, MOVED);
     g.arm();
     const refunding = w.service.refund(id);
     await g.entered;
-    await w.service.answerReschedule(token, false);
+    outside(w, id, { reschedule: { new_date: MOVED, status: "declined" } });
     g.release();
     expect((await refunding).status).toBe("refunded");
     expect(w.ledger.list(id).find((e) => e.kind === "refund.requested")!.data).toMatchObject({ reason: "the guide declined the reschedule" });

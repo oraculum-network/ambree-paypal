@@ -267,7 +267,9 @@ describe("F2: a change made while PayPal is answering is never wiped", () => {
     expect(w.service.get(id)).toMatchObject({ status: "needs_review", simulated_alert: ALERT });
   });
 
-  it("refund refresh: the guide's refund offer made while PayPal answers the GET survives", async () => {
+  // Since round 7 the offer queues behind the refresh (the booking's queue) instead of landing inside it;
+  // it still survives, and is saved after the refund's own save.
+  it("refund refresh: the guide's refund offer sent while PayPal answers the GET waits for it and survives", async () => {
     const g = gate();
     const w = makeWorld({ payments: (p) => slow(p, "getRefund", g) });
     const { id, token } = await paid(w);
@@ -278,15 +280,15 @@ describe("F2: a change made while PayPal is answering is never wiped", () => {
     g.arm();
     const refreshing = w.service.refreshRefunds(id);
     await g.entered;
-    await w.service.offerRefund(token);
+    const offering = later(() => w.service.offerRefund(token));
     g.release();
-    const after = await refreshing;
-    expect(after).toMatchObject({ status: "partially_refunded", refunded_minor: 1000, refund_offered: true });
+    expect(await refreshing).toMatchObject({ status: "partially_refunded", refunded_minor: 1000, refund_offered: false });
+    expect(await offering).toMatchObject({ status: "partially_refunded", refunded_minor: 1000, refund_offered: true });
     expect(w.service.get(id)).toMatchObject({ status: "partially_refunded", refunded_minor: 1000, refund_offered: true });
-    expect(kinds(w, id)).toEqual(expect.arrayContaining(["refund.offered", "refund.completed"]));
+    expect(kinds(w, id).slice(-2)).toEqual(["refund.completed", "refund.offered"]);
   });
 
-  it("refund request: the guide's refund offer made while the weather feed answers survives", async () => {
+  it("refund request: the guide's refund offer sent while the weather feed answers waits for it and survives", async () => {
     const g = gate();
     const w = makeWorld({ weather: (feed) => ({ alertsFor: (d) => g.pass(() => feed.alertsFor(d)) }) });
     const { id, token } = await paid(w);
@@ -294,10 +296,13 @@ describe("F2: a change made while PayPal is answering is never wiped", () => {
     g.arm();
     const refunding = w.service.refund(id, "10.00");
     await g.entered;
-    await w.service.offerRefund(token);
+    const offering = later(() => w.service.offerRefund(token));
     g.release();
-    expect(await refunding).toMatchObject({ status: "partially_refunded", refunded_minor: 1000, refund_offered: true });
+    expect(await refunding).toMatchObject({ status: "partially_refunded", refunded_minor: 1000 });
+    expect(await offering).toMatchObject({ status: "partially_refunded", refund_offered: true });
     expect(w.service.get(id)).toMatchObject({ status: "partially_refunded", refund_offered: true });
+    // The refund was asked first, so it was decided (for the warning) before the offer existed.
+    expect(w.ledger.list(id).find((e) => e.kind === "refund.requested")!.data).toMatchObject({ reason: "a cyclone warning covers the date" });
   });
 });
 
