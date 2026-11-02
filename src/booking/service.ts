@@ -38,9 +38,30 @@ export interface RefundOp {
   /** An empty body (full refund) rather than an amount. */
   full: boolean;
   reason: string;
-  /** `needs_review`: PayPal's reply didn't match this operation; it stays reserved. */
+  /** `needs_review`: held for a person (`review_cause` says why); it stays reserved. */
   status: "sending" | "pending" | "completed" | "failed" | "needs_review";
   refund_id?: string;
+  /**
+   * An attempt of this operation may have reached PayPal: a send ended without a definitive answer, the
+   * client reported an earlier attempt that did (PayPalError.maybeDelivered), or it is being resent. Saved
+   * as soon as it is known, and sticky: from then on a definitive refusal holds it for review, never
+   * `failed` (round 9, I1).
+   */
+  maybe_sent?: boolean;
+  /**
+   * Why it is held (`needs_review`). `unknown`: PayPal's answer about it is unknown (a refusal after an
+   * attempt that may have reached PayPal); the refund's own webhook can still settle it. `mismatch`: PayPal's
+   * reply about it didn't match what was sent. `already_refunded`: PayPal refused its first send saying the
+   * money had already moved. Only `unknown` ever clears; an operation held before round 9 has no cause and
+   * counts as `mismatch`.
+   */
+  review_cause?: "unknown" | "mismatch" | "already_refunded";
+  /**
+   * `false`: evidence (the refund's webhook, read back by GET) settled it while its outcome was unknown, so
+   * the refund_payment call that sent it never heard. The next refund_payment call reports it instead of
+   * sending anything, and sets it `true` (round 9, I3).
+   */
+  acknowledged?: boolean;
 }
 
 export interface Booking {
@@ -143,6 +164,56 @@ function settledReason(b: Booking): { decided: true; reason?: string } | { decid
   if (b.reschedule?.status === "declined") return { decided: true, reason: "the guide declined the reschedule" };
   return { decided: false };
 }
+
+/**
+ * The refund operations whose outcome is unknown: sent with no definitive answer yet (`sending`), or held
+ * for review only because of that (`review_cause` "unknown"). At most one per booking (assertOneUnknown).
+ */
+function unknownOps(b: Booking): RefundOp[] {
+  return b.refund_ops.filter((o) => o.status === "sending" || (o.status === "needs_review" && o.review_cause === "unknown"));
+}
+
+/** The booking's one refund operation whose outcome is unknown, if any. */
+export function unknownOp(b: Booking): RefundOp | undefined {
+  assertOneUnknown(b);
+  return unknownOps(b)[0];
+}
+
+/**
+ * "One intended refund, one operation": a new operation is reserved only when none is unknown, so at most
+ * one ever is. Checked on every read that decides on it and every save that changes the operations; a
+ * booking that breaks it (only a writer outside the service could) is refused before anything is sent.
+ */
+function assertOneUnknown(b: Booking): void {
+  const n = unknownOps(b).length;
+  if (n > 1) throw new Error(`refund invariant broken on ${b.id}: at most one refund operation may have an unknown outcome, found ${n}; nothing was sent`);
+}
+
+/** Why a held refund operation is held; one held before round 9 has no cause and counts as a mismatch. */
+function reviewCause(o: RefundOp): NonNullable<RefundOp["review_cause"]> {
+  return o.review_cause ?? "mismatch";
+}
+
+/**
+ * A captured booking's status as its refunds leave it: held for review while any operation is; otherwise
+ * by what was refunded (refunded, partially_refunded, or captured when nothing was).
+ */
+function statusFromRefunds(b: Booking): BookingStatus {
+  if (b.refund_ops.some((o) => o.status === "needs_review")) return "needs_review";
+  const captured = toMinor(b.captured!.value);
+  return b.refunded_minor >= captured ? "refunded" : b.refunded_minor > 0 ? "partially_refunded" : "captured";
+}
+
+/** Why no refund or retry is sent while an operation is held, by the hold's cause. */
+const UNDER_REVIEW: Record<NonNullable<RefundOp["review_cause"]>, string> = {
+  unknown:
+    "A refund on this booking is held for review: PayPal gave no definitive answer about it, so it may already have gone through. Nothing more is refunded or resent until PayPal's notice settles it or a person reconciles it; get_booking shows the current state.",
+  mismatch: "A refund on this booking needs review (PayPal's reply didn't match what was sent); no further refunds or retries until it is reconciled.",
+  already_refunded: "A refund on this booking needs review (PayPal said the deposit was already refunded, which this booking doesn't show); no further refunds or retries until it is reconciled.",
+};
+
+/** PayPal refusing a refund's first send for these says money already moved off the capture. */
+const ALREADY_REFUNDED_ISSUES: readonly string[] = ["CAPTURE_FULLY_REFUNDED", "REFUND_AMOUNT_EXCEEDED"];
 
 /** Money has started coming back: a refund operation in any status but `failed` (sending, pending, done, in review). */
 export function refundStarted(b: Booking): boolean {
@@ -660,13 +731,14 @@ export class BookingService {
       }
       try {
         // Refund events (PAYMENT.CAPTURE.REFUNDED and PAYMENT.REFUND.*, e.g. PAYMENT.REFUND.FAILED) refresh
-        // every pending refund by GET, so a failed one releases its reservation, and record the event's
-        // refund on a refund whose reply was lost (#recoverSendingNow); capture events refresh the
-        // capture. Already on the queue, so the unqueued variants. A GET that fails answers 500 below.
+        // every pending refund by GET, so a failed one releases its reservation, and settle the booking's
+        // one refund whose outcome is unknown with the event's refund, whatever its status
+        // (#resolveUnknownNow); capture events refresh the capture. Already on the queue, so the unqueued
+        // variants. A GET that fails answers 500 below, so PayPal redelivers.
         const refundEvent = event.event_type === "PAYMENT.CAPTURE.REFUNDED" || event.event_type.startsWith("PAYMENT.REFUND.");
         if (refundEvent) {
-          await this.#refreshNow(b.id);
-          await this.#recoverSendingNow(b.id, event.resource, event.id);
+          await this.#refreshNow(b.id, { lenient: false });
+          await this.#resolveUnknownNow(b.id, event.resource, event.id);
         } else if (event.event_type === "CHECKOUT.ORDER.APPROVED" || event.event_type.startsWith("PAYMENT.CAPTURE.")) {
           if (b.order_id) await this.#captureNow(b.id);
         }
@@ -834,27 +906,44 @@ export class BookingService {
   }
 
   /**
-   * The refund operation to send: the one an earlier attempt left `sending` (resent unchanged), or a new one.
-   * A new one's reason is decided, and the operation reserved, on one fresh read of the booking with no
-   * await in between (S3): only the weather lookup awaits, and each pass reads the booking again after it.
-   * The status, the guide's offer and a declined reschedule are read on that booking; a feed warning counts
-   * only if its date is still the date that was looked up. On the queue nothing else can move the date
-   * meanwhile; a date moved anyway (by a writer outside the service) is looked up once more, and a second
-   * move refuses the request (`date_changed`, nothing reserved), which can simply be retried.
+   * What a refund call does, decided on one fresh read of the booking: refused while an operation is held
+   * for review; the one an earlier attempt left `sending` resent unchanged (marked maybe_sent first: it may
+   * have reached PayPal); an operation evidence settled after its own call ended without an answer
+   * (`acknowledged: false`) reported instead of sending anything, or, if it failed, acknowledged and a new
+   * one reserved (I3); otherwise a new one. A new one's reason is decided, and the operation reserved, on
+   * one fresh read of the booking with no await in between (S3): only the weather lookup awaits, and each
+   * pass reads the booking again after it. The status, the guide's offer and a declined reschedule are read
+   * on that booking; a feed warning counts only if its date is still the date that was looked up. On the
+   * queue nothing else can move the date meanwhile; a date moved anyway (by a writer outside the service)
+   * is looked up once more, and a second move refuses the request (`date_changed`, nothing reserved), which
+   * can simply be retried.
    */
-  async #reserveRefund(bookingId: string, amount: string | undefined): Promise<{ booking: Booking; op: RefundOp; resend: boolean }> {
+  async #reserveRefund(bookingId: string, amount: string | undefined): Promise<{ kind: "send"; booking: Booking; op: RefundOp; resend: boolean } | { kind: "acknowledged"; booking: Booking; op: RefundOp }> {
     let looked: { date: string; warned: boolean } | undefined;
     for (let lookups = 0; ; lookups++) {
-      const b = this.must(bookingId);
-      // A refund whose PayPal reply didn't match stops every further refund and retry for this booking
-      // until a person has reconciled it.
-      if (b.refund_ops.some((o) => o.status === "needs_review")) {
-        throw new ServiceError("refund_under_review", "A refund on this booking needs review (PayPal's reply didn't match what was sent); no further refunds or retries until it is reconciled.");
+      let b = this.must(bookingId);
+      assertOneUnknown(b);
+      // A held refund stops every further refund and retry for this booking: until its own webhook settles
+      // it (cause "unknown") or a person has reconciled it (any other cause).
+      const held = b.refund_ops.find((o) => o.status === "needs_review");
+      if (held) {
+        throw new ServiceError("refund_under_review", UNDER_REVIEW[reviewCause(held)]);
       }
       const sending = b.refund_ops.find((o) => o.status === "sending");
       if (sending) {
-        this.#log(b, "refund.retry", { n: sending.n, request_id: sending.request_id, amount_minor: sending.amount_minor, requested: amount ?? null });
-        return { booking: b, op: sending, resend: true };
+        // Sent before with no definitive answer: it may have reached PayPal (I1), saved before it is resent.
+        const next = sending.maybe_sent ? b : this.#setOp(b, sending.n, { maybe_sent: true });
+        this.#log(next, "refund.retry", { n: sending.n, request_id: sending.request_id, amount_minor: sending.amount_minor, requested: amount ?? null });
+        return { kind: "send", booking: next, op: { ...sending, maybe_sent: true }, resend: true };
+      }
+      const unacked = b.refund_ops.find((o) => o.acknowledged === false);
+      if (unacked) {
+        // I3: this call is the agent's answer to a call that ended without one; the refund it asked for was
+        // settled meanwhile by its webhook. Done or pending: report it and send nothing. Failed: the money
+        // never moved, so a new operation is reserved below as usual.
+        b = this.#setOp(b, unacked.n, { acknowledged: true });
+        this.#log(b, "refund.acknowledged", { n: unacked.n, refund_id: unacked.refund_id ?? null, status: unacked.status, amount_minor: unacked.amount_minor, requested: amount ?? null });
+        if (unacked.status !== "failed") return { kind: "acknowledged", booking: b, op: b.refund_ops.find((o) => o.n === unacked.n)! };
       }
       const settled = settledReason(b);
       let reason: string | undefined;
@@ -883,9 +972,11 @@ export class BookingService {
       if (minor <= 0 || minor > left) throw new ServiceError("bad_amount", `At most ${fromMinor(Math.max(0, left))} can be refunded now${reserved ? " (other refunds are pending or done)" : ""}.`);
       const n = b.refund_ops.length + 1;
       const op: RefundOp = { n, request_id: `refund-${b.id}-${n}`, amount_minor: minor, full: minor === capturedMinor, reason, status: "sending" };
-      const next = this.#save({ ...b, refund_ops: [...b.refund_ops, op] });
+      const reservedNext = { ...b, refund_ops: [...b.refund_ops, op] };
+      assertOneUnknown(reservedNext);
+      const next = this.#save(reservedNext);
       this.#log(next, "refund.requested", { n, request_id: op.request_id, amount: { currency_code: next.captured!.currency_code, value: fromMinor(minor) }, reason });
-      return { booking: next, op, resend: false };
+      return { kind: "send", booking: next, op, resend: false };
     }
   }
 
@@ -894,94 +985,161 @@ export class BookingService {
     return b.refund_ops.filter((o) => o.status !== "failed").reduce((s, o) => s + o.amount_minor, 0);
   }
 
-  /**
-   * Refunds part or all of the capture. Queued: the reason is decided and the operation reserved (persisted
-   * with its amount and PayPal-Request-Id) before it is sent; if a send has no definitive answer, the next
-   * call resends that same operation unchanged (or the refund's webhook records it: #recoverSendingNow).
-   * PayPal refusing a first send releases the reservation (`failed`). PayPal refusing a resend doesn't: the
-   * first send may have refunded already, its reply lost (once the request id is no longer deduped, a
-   * resend of a full refund is answered e.g. 422 CAPTURE_FULLY_REFUNDED), so the operation and the booking
-   * are held for review, still reserved.
-   */
+  /** refundPayment's booking only. */
   async refund(bookingId: string, amount?: string): Promise<Booking> {
+    return (await this.refundPayment(bookingId, amount)).booking;
+  }
+
+  /**
+   * Refunds part or all of the capture. Queued. First every pending refund is read back by GET (I4: GET is
+   * truth, so a refund whose terminal webhook was lost or consumed still settles; a GET that fails changes
+   * nothing). Then #reserveRefund decides: refused, resend, report an earlier refund (`acknowledged`, nothing
+   * sent: I3), or reserve a new operation (persisted with its amount and PayPal-Request-Id before it is
+   * sent). A send that ends without a definitive answer leaves the operation `sending` and maybe_sent (I1),
+   * and the caller gets the PayPalError; the next call resends it, or the refund's webhook settles it (I2).
+   * PayPal refusing it outright frees the reservation (`failed`) only if no attempt of it may have reached
+   * PayPal and PayPal doesn't say the money already moved; otherwise the operation and the booking are held
+   * for review, still reserved (`refund_under_review`).
+   */
+  async refundPayment(bookingId: string, amount?: string): Promise<{ booking: Booking; acknowledged?: RefundOp }> {
     return this.#serial(bookingId, async () => {
+      await this.#refreshNow(bookingId, { lenient: true });
+      const decided = await this.#reserveRefund(bookingId, amount);
+      if (decided.kind === "acknowledged") return { booking: decided.booking, acknowledged: decided.op };
       // `b` serves only fields fixed once captured (id, capture_id, the currency) and the PayPal call.
-      const { booking: b, op, resend } = await this.#reserveRefund(bookingId, amount);
+      const { booking: b, op, resend } = decided;
       const cur = b.captured!.currency_code;
       const body = op.full ? {} : { amount: { currency_code: cur, value: fromMinor(op.amount_minor) } };
       let refund: Refund;
       try {
         refund = await this.#d.payments.refundCapture(b.capture_id!, { ...body, custom_id: b.id, note_to_payer: `Ambree: ${op.reason}.` }, op.request_id);
       } catch (e) {
-        if (isDefinitive(e) && resend) {
-          const held = this.#setOp({ ...this.must(bookingId), status: "needs_review" }, op.n, { status: "needs_review" });
-          this.#log(held, "refund.resend_refused", { n: op.n, request_id: op.request_id, error: (e as PayPalError).summary() });
-          throw new ServiceError(
-            "refund_under_review",
-            "PayPal refused the resend of a refund whose first reply was lost, so it may already have been refunded; the booking is held for review and nothing more is refunded until a person has reconciled it.",
-          );
-        }
+        // I1, before anything else: an error that isn't a plain refusal, or one the client says followed an
+        // attempt that may have reached PayPal, makes the operation maybe_sent, saved now.
+        const maybe = !isDefinitive(e) || (e instanceof PayPalError && e.maybeDelivered);
+        const stored = this.must(bookingId);
+        const now = maybe && !stored.refund_ops.find((o) => o.n === op.n)?.maybe_sent ? this.#setOp(stored, op.n, { maybe_sent: true }) : stored;
+        const maybeSent = maybe || op.maybe_sent === true;
         if (isDefinitive(e)) {
-          const failed = this.#setOp(this.must(bookingId), op.n, { status: "failed" });
-          this.#log(failed, "refund.failed", { n: op.n, error: (e as PayPalError).summary() });
+          const pe = e as PayPalError;
+          if (maybeSent) {
+            const held = this.#setOp({ ...now, status: "needs_review" }, op.n, { status: "needs_review", review_cause: "unknown" });
+            this.#log(held, resend ? "refund.resend_refused" : "refund.retry_refused", { n: op.n, request_id: op.request_id, cause: "unknown", error: pe.summary() });
+            throw new ServiceError(
+              "refund_under_review",
+              `PayPal refused ${resend ? "the resend of a refund whose first reply was lost" : "the client's retry of a refund whose first attempt got no answer"}, so it may already have been refunded; the booking is held for review and nothing more is refunded until PayPal's notice settles it or a person reconciles it. get_booking shows the current state.`,
+            );
+          }
+          if (pe.issue && ALREADY_REFUNDED_ISSUES.includes(pe.issue)) {
+            const held = this.#setOp({ ...now, status: "needs_review" }, op.n, { status: "needs_review", review_cause: "already_refunded" });
+            this.#log(held, "refund.already_refunded", { n: op.n, request_id: op.request_id, cause: "already_refunded", error: pe.summary() });
+            throw new ServiceError(
+              "refund_under_review",
+              `PayPal refused the refund saying the deposit was already refunded (${pe.issue}), which this booking doesn't show; it is held for review and nothing more is refunded until a person reconciles it.`,
+            );
+          }
+          const failed = this.#setOp(now, op.n, { status: "failed" });
+          this.#log(failed, "refund.failed", { n: op.n, error: pe.summary() });
         } else {
-          this.#log(b, "refund.ambiguous", { n: op.n, error: e instanceof PayPalError ? e.kind : "unknown" });
+          this.#log(now, "refund.ambiguous", { n: op.n, error: e instanceof PayPalError ? e.kind : "unknown" });
         }
         throw e;
       }
-      return this.#applyRefund(bookingId, op.n, refund);
+      return { booking: this.#applyRefund(bookingId, op.n, refund) };
     });
   }
 
-  /** Asks PayPal about every pending refund (the PAYMENT.CAPTURE.REFUNDED webhook does this too). Queued. */
+  /**
+   * Reads every pending refund from PayPal (I4: GET is truth; get_booking calls this). A GET that fails
+   * changes nothing: that refund stays as stored and the others are still read. Queued.
+   */
   async refreshRefunds(bookingId: string): Promise<Booking> {
-    return this.#serial(bookingId, () => this.#refreshNow(bookingId));
+    return this.#serial(bookingId, () => this.#refreshNow(bookingId, { lenient: true }));
   }
 
-  /** refreshRefunds' body, unqueued: only for a caller already on this booking's queue (the webhook). */
-  async #refreshNow(bookingId: string): Promise<Booking> {
-    let b = this.must(bookingId);
-    for (const op of b.refund_ops.filter((o) => o.status === "pending" && o.refund_id)) {
-      const refund = await this.#d.payments.getRefund(op.refund_id!);
-      b = this.#applyRefund(bookingId, op.n, refund);
+  /**
+   * refreshRefunds' body, unqueued: only for a caller already on this booking's queue (refundPayment, the
+   * webhook). `lenient: false` (the webhook) throws on the first GET that fails, so the webhook answers 500.
+   */
+  async #refreshNow(bookingId: string, opts: { lenient: boolean }): Promise<Booking> {
+    for (const op of this.must(bookingId).refund_ops.filter((o) => o.status === "pending" && o.refund_id)) {
+      let refund: Refund;
+      try {
+        refund = await this.#d.payments.getRefund(op.refund_id!);
+      } catch (e) {
+        if (opts.lenient) continue;
+        throw e;
+      }
+      this.#applyRefund(bookingId, op.n, refund);
     }
-    return b;
+    return this.must(bookingId);
   }
 
   /**
-   * A refund event about a refund this booking doesn't know, naming this booking (custom_id), while one of
-   * its refunds is still `sending` (sent, its reply lost; at most one is, as #reserveRefund resends it
-   * rather than reserve another): that refund is taken as the lost reply's. It is read back by GET (nothing
-   * is sent, so nothing can be refunded twice) and recorded on the sending operation by #applyRefund, which
-   * fails closed (an amount or currency other than the operation's holds the booking for review). Only a
-   * COMPLETED or PENDING refund is recorded: a failed one that can't be tied to the operation leaves it
-   * `sending`, and the next refund call resends it and PayPal's reply to that request id decides. A GET
-   * that fails throws, so the webhook answers 500 and PayPal redelivers. Unqueued: the webhook's step.
+   * I2: a refund event about a refund this booking doesn't know, naming this booking (custom_id), while one
+   * of its refund operations has an unknown outcome (`sending`, or held for review only for that; at most
+   * one does): the event's refund is read back by GET (nothing is sent, so nothing can be refunded twice).
+   * If the refund names this booking and carries the operation's amount and currency, it settles that
+   * operation through #applyRefund, whatever its status: COMPLETED → completed, PENDING → pending, FAILED or
+   * CANCELLED → failed and the reservation released; the booking leaves review if nothing else holds it.
+   * A COMPLETED or PENDING refund of another amount or currency holds the operation for review for good
+   * (`mismatch`), as before. A FAILED or CANCELLED one of another amount moved no money and isn't this
+   * operation's: it is logged (`refund.evidence_unmatched`) and the operation stays unknown. A GET that fails
+   * throws, so the webhook answers 500 and PayPal redelivers. Unqueued: the webhook's step.
    */
-  async #recoverSendingNow(bookingId: string, resource: Record<string, unknown>, eventId: string): Promise<void> {
+  async #resolveUnknownNow(bookingId: string, resource: Record<string, unknown>, eventId: string): Promise<void> {
     const b = this.must(bookingId);
-    const sending = b.refund_ops.find((o) => o.status === "sending");
+    const op = unknownOp(b);
     const refundId = typeof resource.id === "string" ? resource.id : undefined;
-    if (!sending || !refundId || resource.custom_id !== b.id || b.refund_ops.some((o) => o.refund_id === refundId)) return;
+    if (!op || !refundId || resource.custom_id !== b.id || b.refund_ops.some((o) => o.refund_id === refundId)) return;
     const refund = await this.#d.payments.getRefund(refundId);
-    if (refund.id !== refundId || (refund.status !== "COMPLETED" && refund.status !== "PENDING")) return;
-    this.#log(this.must(bookingId), "refund.recovered", { n: sending.n, request_id: sending.request_id, refund_id: refundId, status: refund.status, event_id: eventId });
-    this.#applyRefund(bookingId, sending.n, refund);
+    if (refund.id !== refundId || (refund.custom_id !== undefined && refund.custom_id !== b.id)) return;
+    const now = this.must(bookingId);
+    if (unknownOp(now)?.n !== op.n) return; // settled meanwhile (only a writer outside the service could)
+    const cur = now.captured!.currency_code;
+    let got = -1;
+    try {
+      got = refund.amount && refund.amount.currency_code === cur ? toMinor(refund.amount.value) : -1;
+    } catch {
+      got = -1;
+    }
+    if (refund.status !== "COMPLETED" && refund.status !== "PENDING" && got !== op.amount_minor) {
+      this.#log(now, "refund.evidence_unmatched", { n: op.n, refund_id: refundId, status: refund.status, amount: refund.amount ?? null, expected: { currency_code: cur, value: fromMinor(op.amount_minor) }, event_id: eventId });
+      return;
+    }
+    this.#log(now, "refund.recovered", { n: op.n, request_id: op.request_id, refund_id: refundId, status: refund.status, from: op.status, event_id: eventId });
+    this.#applyRefund(bookingId, op.n, refund, { evidence: true });
   }
 
+  /** Saves a patch to operation `n` (and whatever else `b` carries), keeping at most one unknown operation. */
   #setOp(b: Booking, n: number, patch: Partial<RefundOp>): Booking {
-    return this.#save({ ...b, refund_ops: b.refund_ops.map((o) => (o.n === n ? { ...o, ...patch } : o)) });
+    const next = { ...b, refund_ops: b.refund_ops.map((o) => (o.n === n ? { ...o, ...patch } : o)) };
+    assertOneUnknown(next);
+    return this.#save(next);
   }
 
   /**
-   * Records PayPal's reply for refund operation `n`. It runs after a PayPal call, so it merges the refund's
-   * own fields (refund_ops, refunded_minor, refund_ids, status) onto the booking as stored now.
+   * Records PayPal's word on refund operation `n`: a reply to its send, a GET, or (`evidence`) the refund's
+   * webhook read back by GET while its outcome was unknown. It runs after a PayPal call, so it merges the
+   * refund's own fields (refund_ops, refunded_minor, refund_ids, status) onto the booking as stored now. The
+   * booking's status follows its refunds (statusFromRefunds), so an operation held only because its outcome
+   * was unknown takes the booking out of review once it is settled and nothing else holds it.
    */
-  #applyRefund(bookingId: string, n: number, refund: Refund): Booking {
+  #applyRefund(bookingId: string, n: number, refund: Refund, opts: { evidence?: boolean } = {}): Booking {
     const b = this.must(bookingId);
     const op = b.refund_ops.find((o) => o.n === n)!;
     const cur = b.captured!.currency_code;
     const actual = op.amount_minor;
+    // Held for review by something other than its refunds (after capture only a writer outside the service
+    // could do that): it stays held whatever the refund says.
+    const heldElsewhere = b.status === "needs_review" && !b.refund_ops.some((o) => o.status === "needs_review");
+    // Settled by evidence its own call never heard of: the next refund call reports it (I3).
+    const ack: Partial<RefundOp> = opts.evidence ? { acknowledged: false } : {};
+    /** Operation `n` patched, and the booking's status as its refunds then leave it. */
+    const settle = (patch: Partial<RefundOp>, extra: Partial<Booking> = {}): Booking => {
+      const next: Booking = { ...b, ...extra, refund_ops: b.refund_ops.map((o) => (o.n === n ? { ...o, review_cause: undefined, ...patch } : o)) };
+      return { ...next, status: heldElsewhere ? "needs_review" : statusFromRefunds(next) };
+    };
     if (refund.status === "COMPLETED" || refund.status === "PENDING") {
       // Fail closed: PayPal's reply must carry exactly the persisted operation's currency and amount.
       // Anything else stops the booking for review: nothing is counted as refunded, nothing is announced,
@@ -993,36 +1151,38 @@ export class BookingService {
         got = -1;
       }
       if (got !== op.amount_minor) {
-        const next = this.#setOp({ ...b, status: "needs_review" }, n, { status: "needs_review", refund_id: refund.id });
+        const next = this.#setOp({ ...b, status: "needs_review" }, n, { status: "needs_review", review_cause: "mismatch", refund_id: refund.id });
         this.#log(next, "refund.reconcile_failed", { n, refund_id: refund.id, status: refund.status, expected: { currency_code: cur, value: fromMinor(op.amount_minor) }, got: refund.amount ?? null });
         return next;
       }
     }
     if (refund.status === "COMPLETED") {
-      const capturedMinor = toMinor(b.captured!.value);
-      const refunded = b.refunded_minor + actual;
       // Another operation in review keeps the whole booking in review: a later success never clears it.
-      const inReview = b.refund_ops.some((o) => o.n !== n && o.status === "needs_review");
-      const status: BookingStatus = inReview ? "needs_review" : refunded >= capturedMinor ? "refunded" : "partially_refunded";
+      const done = settle({ status: "completed", refund_id: refund.id, amount_minor: actual, ...ack }, { refunded_minor: b.refunded_minor + actual, refund_ids: [...b.refund_ids, refund.id] });
       // A refund that completes, in part or in full, closes a move still waiting for the guide (it can't be
       // answered any more: the booking is no longer `captured`): withdrawn in the same save, and logged
       // after the refund. A booking held for review keeps its move as it was.
-      const pendingMove = (status === "refunded" || status === "partially_refunded") && b.reschedule?.status === "proposed" ? b.reschedule : undefined;
+      const pendingMove = (done.status === "refunded" || done.status === "partially_refunded") && b.reschedule?.status === "proposed" ? b.reschedule : undefined;
       const closed = pendingMove ? { reschedule: { ...pendingMove, status: "withdrawn" as const } } : {};
-      const next = this.#setOp({ ...b, refunded_minor: refunded, refund_ids: [...b.refund_ids, refund.id], status, ...closed }, n, { status: "completed", refund_id: refund.id, amount_minor: actual });
+      assertOneUnknown(done);
+      const next = this.#save({ ...done, ...closed });
       this.#log(next, "refund.completed", { n, refund_id: refund.id, status: refund.status, amount: { currency_code: cur, value: fromMinor(actual) }, reason: op.reason });
-      if (pendingMove) this.#log(next, "reschedule.withdrawn", { from: b.date, to: pendingMove.new_date, reason: status === "refunded" ? "the deposit was refunded" : "part of the deposit was refunded" });
+      if (pendingMove) this.#log(next, "reschedule.withdrawn", { from: b.date, to: pendingMove.new_date, reason: next.status === "refunded" ? "the deposit was refunded" : "part of the deposit was refunded" });
       const withdrawn = pendingMove ? ` The move to ${pendingMove.new_date} is withdrawn: the guide is no longer asked.` : "";
       this.#d.channels.emit(b.conversation_id, { type: "refunded", booking_id: b.id, text: `Refunded ${cur} ${fromMinor(actual)} from ${b.guide_name} to the traveller (${op.reason}).${withdrawn}` });
       return next;
     }
     if (refund.status === "PENDING") {
-      const next = this.#setOp(b, n, { status: "pending", refund_id: refund.id, amount_minor: actual });
+      const pending = settle({ status: "pending", refund_id: refund.id, amount_minor: actual, ...ack });
+      assertOneUnknown(pending);
+      const next = this.#save(pending);
       if (op.status !== "pending") this.#log(next, "refund.pending", { n, refund_id: refund.id, amount: { currency_code: cur, value: fromMinor(actual) } });
       return next;
     }
     // FAILED, CANCELLED or any other terminal status: the money didn't move, so the reservation is released.
-    const next = this.#setOp(b, n, { status: "failed", refund_id: refund.id });
+    const failed = settle({ status: "failed", refund_id: refund.id, ...ack });
+    assertOneUnknown(failed);
+    const next = this.#save(failed);
     this.#log(next, "refund.failed", { n, refund_id: refund.id, status: refund.status });
     return next;
   }
@@ -1031,7 +1191,10 @@ export class BookingService {
   summary(b: Booking): Record<string, unknown> {
     const m = this.mandateView(b);
     const pending = b.refund_ops.filter((o) => o.status === "pending" || o.status === "sending").reduce((s, o) => s + o.amount_minor, 0);
-    const review = b.refund_ops.filter((o) => o.status === "needs_review").reduce((s, o) => s + o.amount_minor, 0);
+    const heldOps = b.refund_ops.filter((o) => o.status === "needs_review");
+    const review = heldOps.reduce((s, o) => s + o.amount_minor, 0);
+    const causes = new Set(heldOps.map(reviewCause));
+    const reviewWhy = !heldOps.length ? null : causes.has("mismatch") ? "mismatch" : causes.has("already_refunded") ? "already_refunded" : "unknown";
     return {
       booking_id: b.id,
       status: b.status,
@@ -1046,8 +1209,14 @@ export class BookingService {
       capture: b.capture_id && b.captured ? { id: b.capture_id, amount: b.captured, status: b.capture_status ?? null } : b.capture_id ? { id: b.capture_id, amount: null, status: b.capture_status ?? null } : null,
       refunded: b.captured ? { currency_code: b.captured.currency_code, value: fromMinor(b.refunded_minor) } : null,
       refund_pending: b.captured && pending ? { currency_code: b.captured.currency_code, value: fromMinor(pending) } : null,
-      /** Refunds held for review (PayPal's reply about them didn't match what was sent); still reserved. */
+      /** Refunds held for review; still reserved. */
       refund_review: b.captured && review ? { currency_code: b.captured.currency_code, value: fromMinor(review) } : null,
+      /**
+       * Why (round 9): "unknown" when every held refund is held only because PayPal's answer about it is
+       * unknown (its webhook may still settle it); "mismatch" when a PayPal reply didn't match what was sent;
+       * "already_refunded" when PayPal refused a refund saying the money had already moved. Null when none is.
+       */
+      refund_review_cause: reviewWhy,
       reschedule: b.reschedule ? { new_date: b.reschedule.new_date, status: b.reschedule.status } : null,
       reschedule_hold: rescheduleHold(b) ?? null,
       refund_offered: b.refund_offered,

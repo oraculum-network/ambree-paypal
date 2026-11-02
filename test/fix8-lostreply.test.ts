@@ -69,8 +69,11 @@ describe("D3: the refund event of a refund whose reply was lost is recorded on i
     // The agent hears of it, and the traveller's card no longer says only "Paid".
     expect(w.channels.drain(CONV).filter((e) => e.type === "refunded").map((e) => e.text)).toEqual([expect.stringMatching(/^Refunded EUR 30\.00 .*withdrawn/)]);
     expect(w.service.summary(w.service.get(id)!)).toMatchObject({ refunded: { value: "30.00" }, refund_pending: null });
-    // PayPal's redelivery is a duplicate; a refund_payment call now says there is nothing left.
+    // PayPal's redelivery is a duplicate. Round 9 (I3): the agent's next refund_payment, its answer to the
+    // call that lost the reply, reports that refund and sends nothing; a call after that says there is
+    // nothing left.
     expect(await deliver(w, got[0]!)).toEqual({ status: 200, result: "duplicate" });
+    expect(await w.service.refundPayment(id)).toMatchObject({ booking: { status: "refunded" }, acknowledged: { n: 1, status: "completed" } });
     await expect(w.service.refund(id)).rejects.toMatchObject({ code: "refund_not_allowed" });
     expect(refundPosts(w)).toBe(2);
     expect(w.ledger.verify().ok).toBe(true);
