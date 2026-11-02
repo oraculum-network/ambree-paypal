@@ -2,8 +2,14 @@
 // captured / refunded); pending, failed and mismatched captures say so instead. Pure, so it is unit-tested.
 
 const money = (m) => (m ? `${m.currency_code} ${m.value}` : "");
+const cents = (m) => Math.round(Number(m.value) * 100);
 
-/** @returns {{ testid: string, text: string } | null} */
+/**
+ * A booking held for review because of a refund (`refund_review`: PayPal's reply about it didn't match
+ * what was sent) says that, and that the deposit was paid; one held because the order or capture didn't
+ * match the mandate says that instead.
+ * @returns {{ testid: string, text: string } | null}
+ */
 export function paymentLine(b) {
   if (!b.capture) return null;
   const amount = money(b.capture.amount ?? b.mandate?.amount);
@@ -17,21 +23,28 @@ export function paymentLine(b) {
     case "capture_failed":
       return { testid: "payment-failed", text: `Payment failed: PayPal reported ${b.capture.status ?? "a failure"}; nothing was paid to ${b.guide.name}.` };
     default:
+      if (b.refund_review) {
+        return { testid: "refund-review", text: `A refund needs review: PayPal's reply about the refund of ${money(b.refund_review)} didn't match what was sent, so nothing more is refunded until a person checks it. The deposit, ${amount} to ${b.guide.name}, was paid (capture ${b.capture.id}).` };
+      }
       return { testid: "payment-review", text: `Payment needs review: PayPal's reply did not match the approved mandate (status ${b.capture.status ?? "unknown"}).` };
   }
 }
 
 /**
  * The card's line for a move the agent proposed. "withdrawn": a refund of the deposit (part or all of it)
- * completed before the guide answered, so the move was closed (the guide's page no longer asks). A
- * proposed move the guide can't answer now (`reschedule_hold`: a refund under way, or a review) says why.
+ * completed before the guide answered, so the move was closed (the guide's page no longer asks); the
+ * reason follows what was refunded against what was captured (by the status only when the amounts aren't
+ * given), since a booking held for review afterwards is neither status. A proposed move the guide can't
+ * answer now (`reschedule_hold`: a refund under way, or a review) says why.
  * @returns {{ testid: string, text: string } | null}
  */
 export function rescheduleLine(b) {
   const r = b.reschedule;
   if (!r) return null;
   if (r.status === "withdrawn") {
-    const why = b.status === "partially_refunded" ? "part of the deposit was refunded" : "the deposit was refunded";
+    const amounts = b.refunded && b.capture?.amount;
+    const part = amounts ? cents(b.refunded) < cents(b.capture.amount) : b.status === "partially_refunded";
+    const why = part ? "part of the deposit was refunded" : "the deposit was refunded";
     return { testid: "reschedule", text: `Reschedule to ${r.new_date}: withdrawn, because ${why}.` };
   }
   if (r.status === "proposed" && b.reschedule_hold) return { testid: "reschedule", text: `Reschedule to ${r.new_date}: proposed, but the guide can't answer it while ${b.reschedule_hold}.` };

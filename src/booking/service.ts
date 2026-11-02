@@ -996,6 +996,7 @@ export class BookingService {
   summary(b: Booking): Record<string, unknown> {
     const m = this.mandateView(b);
     const pending = b.refund_ops.filter((o) => o.status === "pending" || o.status === "sending").reduce((s, o) => s + o.amount_minor, 0);
+    const review = b.refund_ops.filter((o) => o.status === "needs_review").reduce((s, o) => s + o.amount_minor, 0);
     return {
       booking_id: b.id,
       status: b.status,
@@ -1010,6 +1011,8 @@ export class BookingService {
       capture: b.capture_id && b.captured ? { id: b.capture_id, amount: b.captured, status: b.capture_status ?? null } : b.capture_id ? { id: b.capture_id, amount: null, status: b.capture_status ?? null } : null,
       refunded: b.captured ? { currency_code: b.captured.currency_code, value: fromMinor(b.refunded_minor) } : null,
       refund_pending: b.captured && pending ? { currency_code: b.captured.currency_code, value: fromMinor(pending) } : null,
+      /** Refunds held for review (PayPal's reply about them didn't match what was sent); still reserved. */
+      refund_review: b.captured && review ? { currency_code: b.captured.currency_code, value: fromMinor(review) } : null,
       reschedule: b.reschedule ? { new_date: b.reschedule.new_date, status: b.reschedule.status } : null,
       reschedule_hold: rescheduleHold(b) ?? null,
       refund_offered: b.refund_offered,
