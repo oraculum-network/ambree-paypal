@@ -359,21 +359,22 @@ describe("I5: no refund evidence is dropped silently", () => {
     expect(await tool(w, "get_booking", { booking_id: id })).toMatchObject({ ok: true, value: { status: "needs_review", refund_review: eur("5.00"), refund_review_cause: "unexplained" } });
   });
 
-  it("one refund, one entry: a refund held unexplained that the operation's own resend reply then names is folded into it", async () => {
+  it("an unexplained hold refuses even the resend of an operation still being sent; that operation's own event still settles it", async () => {
     const { w, id, got } = await offered({ totals: false });
     loseReply(w);
     loseReply(w);
-    await expect(w.service.refund(id, "10.00")).rejects.toMatchObject({ kind: "network" });
+    await expect(w.service.refund(id, "10.00")).rejects.toMatchObject({ kind: "network" }); // op 1: R1 made, both replies lost
     const odd = { id: "RODDAMOUNT000096", status: "COMPLETED", amount: eur("5.00"), custom_id: id };
     getAnswers(w, odd);
     w.fake.emitWebhook("PAYMENT.CAPTURE.REFUNDED", "refund", odd);
     await w.fake.flush();
     await deliver(w, got.at(-1)!);
-    expect(ops(w, id)).toMatchObject([{ n: 1, status: "sending" }, { review_cause: "unexplained", refund_id: odd.id }]);
-    // The resend is answered with that very refund (PayPal refunded 5.00 for a 10.00 request).
-    w.fake.failNext({ method: "POST", path: /\/refund$/, status: 201, body: odd });
-    expect(await w.service.refund(id, "10.00")).toMatchObject({ status: "needs_review" });
-    expect(ops(w, id)).toMatchObject([{ n: 1, status: "needs_review", review_cause: "mismatch", refund_id: odd.id }]);
+    expect(ops(w, id)).toMatchObject([{ n: 1, status: "sending" }, { n: 2, review_cause: "unexplained", refund_id: odd.id, evidence: true }]);
+    await expect(w.service.refund(id, "10.00")).rejects.toMatchObject({ code: "refund_under_review" });
+    expect(refundPosts(w)).toBe(2);
+    expect(await deliver(w, got[0]!)).toEqual({ status: 200, result: "logged" });
+    expect(w.service.get(id)).toMatchObject({ status: "needs_review", refunded_minor: 1000, refund_ops: [{ status: "completed", refund_id: w.fake.refundIds()[0] }, { review_cause: "unexplained" }] });
+    expect(heldMinor(w, id)).toBe(500);
   });
 
   it("a GET of a pending refund that answers another refund id is held as a mismatch, not recorded under the new id", async () => {

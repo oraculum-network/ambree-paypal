@@ -116,7 +116,9 @@ describe("D3: the refund event of a refund whose reply was lost is recorded on i
     w.fake.emitWebhook("PAYMENT.CAPTURE.REFUNDED", "refund", other);
     await w.fake.flush();
     expect(results).toEqual([{ status: 200, result: "logged" }]);
-    expect(w.service.get(id)).toMatchObject({ status: "needs_review", refunded_minor: 0, refund_ops: [{ status: "needs_review", refund_id: other.id }] });
+    // Round 10 (I5): another amount doesn't match the operation, so the refund is held as its own unexplained
+    // entry, and the operation's outcome stays unknown (its own event can still settle it).
+    expect(w.service.get(id)).toMatchObject({ status: "needs_review", refunded_minor: 0, refund_ops: [{ n: 1, status: "sending" }, { status: "needs_review", review_cause: "unexplained", refund_id: other.id }] });
     expect(w.channels.drain(CONV).some((e) => e.type === "refunded")).toBe(false);
     await expect(w.service.refund(id)).rejects.toMatchObject({ code: "refund_under_review" });
   });

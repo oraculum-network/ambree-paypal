@@ -30,7 +30,10 @@ export type BookingStatus =
   | "partially_refunded"
   | "refunded";
 
-/** One refund, persisted before it is sent, so a retry resends exactly the same request. */
+/**
+ * One refund, persisted before it is sent, so a retry resends exactly the same request. Or (round 10, I5:
+ * `evidence`) a refund PayPal reported on this booking that no operation accounts for, recorded held.
+ */
 export interface RefundOp {
   n: number;
   request_id: string;
@@ -52,16 +55,25 @@ export interface RefundOp {
    * Why it is held (`needs_review`). `unknown`: PayPal's answer about it is unknown (a refusal after an
    * attempt that may have reached PayPal); the refund's own webhook can still settle it. `mismatch`: PayPal's
    * reply about it didn't match what was sent. `already_refunded`: PayPal refused its first send saying the
-   * money had already moved. Only `unknown` ever clears; an operation held before round 9 has no cause and
+   * money had already moved. `unexplained` (round 10, I5): an `evidence` entry, a refund PayPal reported that
+   * no operation accounts for. Only `unknown` ever clears; an operation held before round 9 has no cause and
    * counts as `mismatch`.
    */
-  review_cause?: "unknown" | "mismatch" | "already_refunded";
+  review_cause?: "unknown" | "mismatch" | "already_refunded" | "unexplained";
   /**
    * `false`: evidence (the refund's webhook, read back by GET) settled it while its outcome was unknown, so
    * the refund_payment call that sent it never heard. The next refund_payment call reports it instead of
    * sending anything, and sets it `true` (round 9, I3).
    */
   acknowledged?: boolean;
+  /**
+   * Round 10 (I5): not an operation this service sent. A refund webhook named this booking, and its refund,
+   * read back by GET as COMPLETED or PENDING, is on no operation and doesn't match the one whose outcome is
+   * unknown (if any). Recorded with that refund's id and amount, held for review (`review_cause`
+   * "unexplained") and reserved, so it counts as held and nothing is stacked on it. Never sent, resent or
+   * cleared automatically. Its `request_id` ("paypal-" + the refund id) is a label: nothing is sent with it.
+   */
+  evidence?: true;
 }
 
 export interface Booking {
@@ -89,6 +101,13 @@ export interface Booking {
   refunded_minor: number;
   refund_ids: string[];
   refund_ops: RefundOp[];
+  /**
+   * Round 10 (F1): the largest `seller_payable_breakdown.total_refunded_amount` (PayPal's running total
+   * refunded on the capture; UNVERIFIED) seen on any reply or GET of a refund of this booking. Whatever of it
+   * the booking doesn't account for holds the booking for review as unexplained (`refundTotalExcess`).
+   * Absent while PayPal has never sent the field.
+   */
+  paypal_refunded_minor?: number;
   /**
    * `withdrawn`: a refund of the deposit (in part, since round 7, or in full) completed while the guide hadn't
    * answered (added in round 6; additive). `n`: which proposal on this booking this is (1, 2, …), so an
@@ -195,17 +214,62 @@ function reviewCause(o: RefundOp): NonNullable<RefundOp["review_cause"]> {
 }
 
 /**
- * A captured booking's status as its refunds leave it: held for review while any operation is; otherwise
- * by what was refunded (refunded, partially_refunded, or captured when nothing was).
+ * What the booking accounts for (round 10, F1): every refund on it that isn't `failed`: completed, pending,
+ * being sent, or held (an operation whose outcome is unknown may already be in PayPal's total, and an
+ * unexplained entry is PayPal's own word). The same sum as `reservedMinor`.
+ */
+function accountedMinor(b: Booking): number {
+  return b.refund_ops.filter((o) => o.status !== "failed").reduce((s, o) => s + o.amount_minor, 0);
+}
+
+/**
+ * Round 10 (F1): how much more PayPal said was refunded on the capture (`paypal_refunded_minor`, the largest
+ * total_refunded_amount seen) than the booking accounts for. Above 0 it holds the booking for review as
+ * unexplained. It falls only when new unexplained evidence accounts for it, which holds the booking itself:
+ * no operation is reserved while the booking is held, and settling one never raises what it accounts for.
+ */
+function refundTotalExcess(b: Booking): number {
+  return Math.max(0, (b.paypal_refunded_minor ?? 0) - accountedMinor(b));
+}
+
+/** Whether the booking's refunds hold it for review: an operation or entry in review, or PayPal's total above what it accounts for. */
+function refundsHold(b: Booking): boolean {
+  return b.refund_ops.some((o) => o.status === "needs_review") || refundTotalExcess(b) > 0;
+}
+
+/** A Money's minor units if it is in `cur` and parses, else -1 (never equal to an amount that was sent). */
+function minorIn(m: Money | undefined, cur: CurrencyCode): number {
+  if (!m || m.currency_code !== cur) return -1;
+  try {
+    return toMinor(m.value);
+  } catch {
+    return -1;
+  }
+}
+
+/** PayPal's total refunded on the capture as a refund shows it (F1; UNVERIFIED), in minor units of `cur`, or -1. */
+function totalRefunded(r: Refund, cur: CurrencyCode): number {
+  return minorIn(r.seller_payable_breakdown?.total_refunded_amount, cur);
+}
+
+/** Whether `r` shows a larger total refunded on the capture than the booking has seen. */
+function raisesTotal(b: Booking, r: Refund): boolean {
+  return totalRefunded(r, b.captured!.currency_code) > (b.paypal_refunded_minor ?? -1);
+}
+
+/**
+ * A captured booking's status as its refunds leave it: held for review while any operation or entry is, or
+ * while PayPal's total is above what it accounts for; otherwise by what was refunded (refunded,
+ * partially_refunded, or captured when nothing was).
  */
 function statusFromRefunds(b: Booking): BookingStatus {
-  if (b.refund_ops.some((o) => o.status === "needs_review")) return "needs_review";
+  if (refundsHold(b)) return "needs_review";
   const captured = toMinor(b.captured!.value);
   return b.refunded_minor >= captured ? "refunded" : b.refunded_minor > 0 ? "partially_refunded" : "captured";
 }
 
 /** The capture a refund resource names by its `up` link (`/v2/payments/captures/{id}`), if any (F2; UNVERIFIED on webhook resources). */
-export function refundCaptureId(r: { links?: unknown }): string | undefined {
+function refundCaptureId(r: { links?: unknown }): string | undefined {
   if (!Array.isArray(r.links)) return undefined;
   for (const l of r.links as unknown[]) {
     const { rel, href } = (l && typeof l === "object" ? l : {}) as { rel?: unknown; href?: unknown };
@@ -244,6 +308,8 @@ const UNDER_REVIEW: Record<NonNullable<RefundOp["review_cause"]>, string> = {
     "A refund on this booking is held for review: PayPal gave no definitive answer about it, so it may already have gone through. Nothing more is refunded or resent until PayPal's notice settles it or a person reconciles it; get_booking shows the current state.",
   mismatch: "A refund on this booking needs review (PayPal's reply didn't match what was sent); no further refunds or retries until it is reconciled.",
   already_refunded: "A refund on this booking needs review (PayPal said the deposit was already refunded, which this booking doesn't show); no further refunds or retries until it is reconciled.",
+  unexplained:
+    "A refund on this booking needs review: PayPal reports money refunded on it that no refund this booking sent accounts for, so more may have been refunded than the booking shows. No further refunds or retries until a person reconciles it; get_booking shows the current state.",
 };
 
 /** PayPal refusing a refund's first send for these says money already moved off the capture. */
@@ -779,14 +845,15 @@ export class BookingService {
       }
       try {
         // Refund events (PAYMENT.CAPTURE.REFUNDED and PAYMENT.REFUND.*, e.g. PAYMENT.REFUND.FAILED) refresh
-        // every pending refund by GET, so a failed one releases its reservation, and settle the booking's
-        // one refund whose outcome is unknown with the event's refund, whatever its status
-        // (#resolveUnknownNow); capture events refresh the capture. Already on the queue, so the unqueued
-        // variants. A GET that fails answers 500 below, so PayPal redelivers.
+        // every pending refund by GET, so a failed one releases its reservation; then the event's refund, if
+        // no operation has it, is weighed (#refundEvidenceNow): it settles the booking's one refund whose
+        // outcome is unknown if it matches it, and is otherwise recorded (I5). Capture events refresh the
+        // capture. Already on the queue, so the unqueued variants. A GET that fails answers 500 below, so
+        // PayPal redelivers: a refund event is answered 200 only once its evidence is recorded.
         const refundEvent = event.event_type === "PAYMENT.CAPTURE.REFUNDED" || event.event_type.startsWith("PAYMENT.REFUND.");
         if (refundEvent) {
           await this.#refreshNow(b.id, { lenient: false });
-          await this.#resolveUnknownNow(b.id, event.resource, event.id);
+          await this.#refundEvidenceNow(b.id, event.resource, event.id);
         } else if (event.event_type === "CHECKOUT.ORDER.APPROVED" || event.event_type.startsWith("PAYMENT.CAPTURE.")) {
           if (b.order_id) await this.#captureNow(b.id);
         }
@@ -972,11 +1039,13 @@ export class BookingService {
       let b = this.must(bookingId);
       assertOneUnknown(b);
       // A held refund stops every further refund and retry for this booking: until its own webhook settles
-      // it (cause "unknown") or a person has reconciled it (any other cause).
+      // it (cause "unknown") or a person has reconciled it (any other cause). So does PayPal's total above
+      // what the booking accounts for (round 10, F1): nothing is stacked on money it can't explain.
       const held = b.refund_ops.find((o) => o.status === "needs_review");
       if (held) {
         throw new ServiceError("refund_under_review", UNDER_REVIEW[reviewCause(held)]);
       }
+      if (refundTotalExcess(b) > 0) throw new ServiceError("refund_under_review", UNDER_REVIEW.unexplained);
       const sending = b.refund_ops.find((o) => o.status === "sending");
       if (sending) {
         // Sent before with no definitive answer: it may have reached PayPal (I1), saved before it is resent.
@@ -1028,9 +1097,14 @@ export class BookingService {
     }
   }
 
-  /** Minor units completed, pending or still being sent: none of it may be refunded again. */
+  /** Minor units completed, pending, still being sent or held (an unexplained entry too): none of it may be refunded again. */
   static reservedMinor(b: Booking): number {
-    return b.refund_ops.filter((o) => o.status !== "failed").reduce((s, o) => s + o.amount_minor, 0);
+    return accountedMinor(b);
+  }
+
+  /** Minor units held for review: every operation or entry in review, plus PayPal's total above what the booking accounts for. */
+  static heldMinor(b: Booking): number {
+    return b.refund_ops.filter((o) => o.status === "needs_review").reduce((s, o) => s + o.amount_minor, 0) + refundTotalExcess(b);
   }
 
   /** refundPayment's booking only. */
@@ -1124,40 +1198,58 @@ export class BookingService {
   }
 
   /**
-   * I2: a refund event about a refund this booking doesn't know, naming this booking (custom_id, or with
-   * none its capture: round 10, F2), while one of its refund operations has an unknown outcome (`sending`,
-   * or held for review only for that; at most one does): the event's refund is read back by GET (nothing is
-   * sent, so nothing can be refunded twice). A GET naming another booking or capture is ignored.
-   * If the refund names this booking and carries the operation's amount and currency, it settles that
-   * operation through #applyRefund, whatever its status: COMPLETED → completed, PENDING → pending, FAILED or
-   * CANCELLED → failed and the reservation released; the booking leaves review if nothing else holds it.
-   * A COMPLETED or PENDING refund of another amount or currency holds the operation for review for good
-   * (`mismatch`), as before. A FAILED or CANCELLED one of another amount moved no money and isn't this
-   * operation's: it is logged (`refund.evidence_unmatched`) and the operation stays unknown. A GET that fails
+   * A refund event's refund that no operation of this booking has (its id is on none), and that names this
+   * booking (custom_id, or with none its capture: round 10, F2), is read back by GET (nothing is sent, so
+   * nothing can be refunded twice); a GET naming another booking or capture is ignored. Then, on the booking
+   * as stored after the GET:
+   * - I2: it **matches** the one operation whose outcome is unknown (`sending`, or held for review only for
+   *   that; at most one is) when it carries that operation's amount in the capture's currency. It then
+   *   settles that operation through #applyRefund, whatever its status: COMPLETED → completed, PENDING →
+   *   pending, FAILED or CANCELLED → failed and the reservation released (`refund.recovered`).
+   * - Otherwise FAILED or CANCELLED: it moved no money, so it is logged only: `refund.evidence_unmatched`
+   *   while an operation's outcome is unknown (round 9's answer, kept), else `refund.unexplained` with
+   *   `held: false`.
+   * - Otherwise (COMPLETED, PENDING, or anything else that may hold money), I5: no operation accounts for it,
+   *   so it is recorded as an `evidence` entry with its id and amount, held for review ("unexplained"),
+   *   reserved, and logged (`refund.unexplained`, `held: true`). The unknown operation, if any, stays
+   *   unknown: its own evidence can still settle it. The entry never clears automatically.
+   * Whatever it says, its GET's total_refunded_amount is counted (F1, #saveRefunds). A GET that fails
    * throws, so the webhook answers 500 and PayPal redelivers. Unqueued: the webhook's step.
    */
-  async #resolveUnknownNow(bookingId: string, resource: Record<string, unknown>, eventId: string): Promise<void> {
+  async #refundEvidenceNow(bookingId: string, resource: Record<string, unknown>, eventId: string): Promise<void> {
     const b = this.must(bookingId);
-    const op = unknownOp(b);
     const refundId = typeof resource.id === "string" ? resource.id : undefined;
-    if (!op || !refundId || !namesBooking(resource, b) || b.refund_ops.some((o) => o.refund_id === refundId)) return;
+    if (!refundId || !b.captured || !namesBooking(resource, b) || b.refund_ops.some((o) => o.refund_id === refundId)) return;
     const refund = await this.#d.payments.getRefund(refundId);
     if (refund.id !== refundId || namesOther(refund, b)) return;
     const now = this.must(bookingId);
-    if (unknownOp(now)?.n !== op.n) return; // settled meanwhile (only a writer outside the service could)
+    if (now.refund_ops.some((o) => o.refund_id === refundId)) return; // recorded meanwhile (only a writer outside the service could)
+    const op = unknownOp(now);
     const cur = now.captured!.currency_code;
-    let got = -1;
-    try {
-      got = refund.amount && refund.amount.currency_code === cur ? toMinor(refund.amount.value) : -1;
-    } catch {
-      got = -1;
-    }
-    if (refund.status !== "COMPLETED" && refund.status !== "PENDING" && got !== op.amount_minor) {
-      this.#log(now, "refund.evidence_unmatched", { n: op.n, refund_id: refundId, status: refund.status, amount: refund.amount ?? null, expected: { currency_code: cur, value: fromMinor(op.amount_minor) }, event_id: eventId });
+    const got = minorIn(refund.amount, cur);
+    if (op && got === op.amount_minor) {
+      this.#log(now, "refund.recovered", { n: op.n, request_id: op.request_id, refund_id: refundId, status: refund.status, from: op.status, event_id: eventId });
+      this.#applyRefund(bookingId, op.n, refund, { evidence: true });
       return;
     }
-    this.#log(now, "refund.recovered", { n: op.n, request_id: op.request_id, refund_id: refundId, status: refund.status, from: op.status, event_id: eventId });
-    this.#applyRefund(bookingId, op.n, refund, { evidence: true });
+    if (refund.status === "FAILED" || refund.status === "CANCELLED") {
+      if (op) this.#log(now, "refund.evidence_unmatched", { n: op.n, refund_id: refundId, status: refund.status, amount: refund.amount ?? null, expected: { currency_code: cur, value: fromMinor(op.amount_minor) }, event_id: eventId });
+      else this.#log(now, "refund.unexplained", { source: "webhook", refund_id: refundId, status: refund.status, amount: refund.amount ?? null, event_id: eventId, held: false });
+      if (raisesTotal(now, refund)) this.#saveRefunds(now, now, [], refund);
+      return;
+    }
+    const entry: RefundOp = {
+      n: now.refund_ops.length + 1,
+      request_id: `paypal-${refundId}`,
+      amount_minor: Math.max(0, got),
+      full: got === toMinor(now.captured!.value),
+      reason: "not sent by this service: PayPal reported it",
+      status: "needs_review",
+      review_cause: "unexplained",
+      refund_id: refundId,
+      evidence: true,
+    };
+    this.#saveRefunds(now, { ...now, refund_ops: [...now.refund_ops, entry] }, [["refund.unexplained", { source: "webhook", n: entry.n, refund_id: refundId, status: refund.status, amount: refund.amount ?? null, event_id: eventId, held: true }]], refund);
   }
 
   /** Saves a patch to operation `n` (and whatever else `b` carries), keeping at most one unknown operation. */
@@ -1181,57 +1273,65 @@ export class BookingService {
     const actual = op.amount_minor;
     // Settled by evidence its own call never heard of: the next refund call reports it (I3).
     const ack: Partial<RefundOp> = opts.evidence ? { acknowledged: false } : {};
+    // Round 10, fail closed: PayPal's word on an operation that has a refund id must be about that refund
+    // (a GET of a pending one answering another id). The service never applies one otherwise; defensive.
+    const otherId = op.refund_id !== undefined && refund.id !== op.refund_id;
     /** The operations with operation `n` patched. */
     const patched = (patch: Partial<RefundOp>): RefundOp[] => b.refund_ops.map((o) => (o.n === n ? { ...o, review_cause: undefined, ...patch } : o));
-    if (refund.status === "COMPLETED" || refund.status === "PENDING") {
+    if (otherId || refund.status === "COMPLETED" || refund.status === "PENDING") {
       // Fail closed: PayPal's reply must carry exactly the persisted operation's currency and amount.
       // Anything else stops the booking for review: nothing is counted as refunded, nothing is announced,
       // and the operation stays reserved so no further refund can be stacked on an unknown state.
-      let got = -1;
-      try {
-        got = refund.amount && refund.amount.currency_code === cur ? toMinor(refund.amount.value) : -1;
-      } catch {
-        got = -1;
-      }
-      if (got !== op.amount_minor) {
-        const held = { ...b, refund_ops: patched({ status: "needs_review", review_cause: "mismatch", refund_id: refund.id }) };
-        return this.#saveRefunds(b, held, [["refund.reconcile_failed", { n, refund_id: refund.id, status: refund.status, expected: { currency_code: cur, value: fromMinor(op.amount_minor) }, got: refund.amount ?? null }]]).booking;
+      const got = minorIn(refund.amount, cur);
+      if (otherId || got !== op.amount_minor) {
+        const held = { ...b, refund_ops: patched({ status: "needs_review", review_cause: "mismatch", refund_id: otherId ? op.refund_id : refund.id }) };
+        const row = { n, refund_id: refund.id, ...(otherId ? { recorded_refund_id: op.refund_id } : {}), status: refund.status, expected: { currency_code: cur, value: fromMinor(op.amount_minor) }, got: refund.amount ?? null };
+        return this.#saveRefunds(b, held, [["refund.reconcile_failed", row]], otherId ? undefined : refund).booking;
       }
     }
     if (refund.status === "COMPLETED") {
       // Another operation in review keeps the whole booking in review: a later success never clears it.
       const done = { ...b, refunded_minor: b.refunded_minor + actual, refund_ids: [...b.refund_ids, refund.id], refund_ops: patched({ status: "completed", refund_id: refund.id, amount_minor: actual, ...ack }) };
-      const { booking: next, withdrawn: move } = this.#saveRefunds(b, done, [["refund.completed", { n, refund_id: refund.id, status: refund.status, amount: { currency_code: cur, value: fromMinor(actual) }, reason: op.reason }]]);
+      const { booking: next, withdrawn: move } = this.#saveRefunds(b, done, [["refund.completed", { n, refund_id: refund.id, status: refund.status, amount: { currency_code: cur, value: fromMinor(actual) }, reason: op.reason }]], refund);
       const withdrawn = move ? ` The move to ${move.new_date} is withdrawn: the guide is no longer asked.` : "";
       this.#d.channels.emit(b.conversation_id, { type: "refunded", booking_id: b.id, text: `Refunded ${cur} ${fromMinor(actual)} from ${b.guide_name} to the traveller (${op.reason}).${withdrawn}` });
       return next;
     }
     if (refund.status === "PENDING") {
       const pending = { ...b, refund_ops: patched({ status: "pending", refund_id: refund.id, amount_minor: actual, ...ack }) };
-      return this.#saveRefunds(b, pending, op.status !== "pending" ? [["refund.pending", { n, refund_id: refund.id, amount: { currency_code: cur, value: fromMinor(actual) } }]] : []).booking;
+      return this.#saveRefunds(b, pending, op.status !== "pending" ? [["refund.pending", { n, refund_id: refund.id, amount: { currency_code: cur, value: fromMinor(actual) } }]] : [], refund).booking;
     }
     // FAILED, CANCELLED or any other terminal status: the money didn't move, so the reservation is released.
     const failed = { ...b, refund_ops: patched({ status: "failed", refund_id: refund.id, ...ack }) };
-    return this.#saveRefunds(b, failed, [["refund.failed", { n, refund_id: refund.id, status: refund.status }]]).booking;
+    return this.#saveRefunds(b, failed, [["refund.failed", { n, refund_id: refund.id, status: refund.status }]], refund).booking;
   }
 
   /**
-   * The one save for a booking whose refunds changed (`next`, built from `prev` as stored now): its status
-   * is derived from its refunds (statusFromRefunds), unless something other than its refunds holds it for
-   * review (after capture only a writer outside the service could do that: it stays held). Round 10, F3:
-   * whichever settle leaves it refunded or partially refunded withdraws a move still waiting for the guide
-   * in the same save (it can't be answered any more: the booking is no longer `captured`); a booking held
-   * for review keeps its move as it was. Then `rows` are logged in order, and `reschedule.withdrawn` after
-   * them.
+   * The one save for a booking whose refunds changed (`next`, built from `prev` as stored now). Round 10, F1:
+   * `refund` (the PayPal reply or GET the change came from) may carry PayPal's total refunded on the
+   * capture; the largest seen is kept (`paypal_refunded_minor`), and whatever of it the booking doesn't
+   * account for holds it for review (`refundTotalExcess`; logged `refund.unexplained` when it grows). No
+   * total, or one in another currency, changes nothing. The status is derived from the refunds
+   * (statusFromRefunds), unless something other than its refunds holds the booking for review (after
+   * capture only a writer outside the service could do that: it stays held). Round 10, F3: whichever settle
+   * leaves it refunded or partially refunded withdraws a move still waiting for the guide in the same save
+   * (it can't be answered any more: the booking is no longer `captured`); a booking held for review keeps
+   * its move as it was. Then `rows` are logged in order, the total's row, and `reschedule.withdrawn`.
    */
-  #saveRefunds(prev: Booking, next: Booking, rows: Array<[string, Record<string, unknown>]>): { booking: Booking; withdrawn?: NonNullable<Booking["reschedule"]> } {
-    const heldElsewhere = prev.status === "needs_review" && !prev.refund_ops.some((o) => o.status === "needs_review");
-    const status = heldElsewhere ? "needs_review" : statusFromRefunds(next);
-    const move = (status === "refunded" || status === "partially_refunded") && next.reschedule?.status === "proposed" ? next.reschedule : undefined;
-    const settled: Booking = { ...next, status, ...(move ? { reschedule: { ...move, status: "withdrawn" as const } } : {}) };
+  #saveRefunds(prev: Booking, next: Booking, rows: Array<[string, Record<string, unknown>]>, refund?: Refund): { booking: Booking; withdrawn?: NonNullable<Booking["reschedule"]> } {
+    const cur = prev.captured!.currency_code;
+    const counted = refund && raisesTotal(next, refund) ? { ...next, paypal_refunded_minor: totalRefunded(refund, cur) } : next;
+    const heldElsewhere = prev.status === "needs_review" && !refundsHold(prev);
+    const status = heldElsewhere ? "needs_review" : statusFromRefunds(counted);
+    const move = (status === "refunded" || status === "partially_refunded") && counted.reschedule?.status === "proposed" ? counted.reschedule : undefined;
+    const settled: Booking = { ...counted, status, ...(move ? { reschedule: { ...move, status: "withdrawn" as const } } : {}) };
     assertOneUnknown(settled);
     const saved = this.#save(settled);
     for (const [kind, data] of rows) this.#log(saved, kind, data);
+    if (refundTotalExcess(saved) > refundTotalExcess(prev)) {
+      const money = (minor: number) => ({ currency_code: cur, value: fromMinor(minor) });
+      this.#log(saved, "refund.unexplained", { source: "total_refunded_amount", refund_id: refund?.id ?? null, total_refunded: money(saved.paypal_refunded_minor ?? 0), accounted: money(accountedMinor(saved)), held: true });
+    }
     if (move) this.#log(saved, "reschedule.withdrawn", { from: prev.date, to: move.new_date, reason: status === "refunded" ? "the deposit was refunded" : "part of the deposit was refunded" });
     return { booking: saved, withdrawn: move };
   }
@@ -1240,10 +1340,10 @@ export class BookingService {
   summary(b: Booking): Record<string, unknown> {
     const m = this.mandateView(b);
     const pending = b.refund_ops.filter((o) => o.status === "pending" || o.status === "sending").reduce((s, o) => s + o.amount_minor, 0);
-    const heldOps = b.refund_ops.filter((o) => o.status === "needs_review");
-    const review = heldOps.reduce((s, o) => s + o.amount_minor, 0);
-    const causes = new Set(heldOps.map(reviewCause));
-    const reviewWhy = !heldOps.length ? null : causes.has("mismatch") ? "mismatch" : causes.has("already_refunded") ? "already_refunded" : "unknown";
+    const review = BookingService.heldMinor(b);
+    const causes = new Set(b.refund_ops.filter((o) => o.status === "needs_review").map(reviewCause));
+    if (refundTotalExcess(b) > 0) causes.add("unexplained");
+    const reviewWhy = !causes.size ? null : (["mismatch", "already_refunded", "unexplained", "unknown"] as const).find((c) => causes.has(c))!;
     return {
       booking_id: b.id,
       status: b.status,
@@ -1258,12 +1358,15 @@ export class BookingService {
       capture: b.capture_id && b.captured ? { id: b.capture_id, amount: b.captured, status: b.capture_status ?? null } : b.capture_id ? { id: b.capture_id, amount: null, status: b.capture_status ?? null } : null,
       refunded: b.captured ? { currency_code: b.captured.currency_code, value: fromMinor(b.refunded_minor) } : null,
       refund_pending: b.captured && pending ? { currency_code: b.captured.currency_code, value: fromMinor(pending) } : null,
-      /** Refunds held for review; still reserved. */
+      /** Refunds held for review (still reserved), plus PayPal's total above what the booking accounts for (round 10). */
       refund_review: b.captured && review ? { currency_code: b.captured.currency_code, value: fromMinor(review) } : null,
       /**
        * Why (round 9): "unknown" when every held refund is held only because PayPal's answer about it is
        * unknown (its webhook may still settle it); "mismatch" when a PayPal reply didn't match what was sent;
-       * "already_refunded" when PayPal refused a refund saying the money had already moved. Null when none is.
+       * "already_refunded" when PayPal refused a refund saying the money had already moved; "unexplained"
+       * (round 10) when PayPal reports a refund, or a total, that no refund this booking sent accounts for.
+       * The first that applies in that order: mismatch, already_refunded, unexplained, unknown. Null when
+       * nothing is held.
        */
       refund_review_cause: reviewWhy,
       reschedule: b.reschedule ? { new_date: b.reschedule.new_date, status: b.reschedule.status } : null,

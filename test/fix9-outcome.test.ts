@@ -204,12 +204,13 @@ describe("R8-2: the client's own retry of a refund whose first reply was lost is
     expect(b).toMatchObject({ status: "needs_review", refund_ops: [{ status: "needs_review", review_cause: "already_refunded" }] });
     expect(BookingService.reservedMinor(b)).toBe(3000);
     // A refund event naming the booking doesn't clear this hold: the refusal wasn't our refund's outcome.
+    // Round 10 (I5): that refund, which no operation accounts for, is recorded beside it, held as unexplained.
     const other = { id: "ROUTOFBAND000091", status: "COMPLETED", amount: { currency_code: "EUR", value: "30.00" }, custom_id: id };
     w.fake.failNext({ method: "GET", path: /^\/v2\/payments\/refunds\//, status: 200, body: other });
     w.fake.emitWebhook("PAYMENT.CAPTURE.REFUNDED", "refund", other);
     await w.fake.flush();
     await deliver(w, got.at(-1)!);
-    expect(w.service.get(id)).toMatchObject({ status: "needs_review", refunded_minor: 0, refund_ops: [{ status: "needs_review", review_cause: "already_refunded" }] });
+    expect(w.service.get(id)).toMatchObject({ status: "needs_review", refunded_minor: 0, refund_ops: [{ status: "needs_review", review_cause: "already_refunded" }, { status: "needs_review", review_cause: "unexplained", refund_id: other.id }] });
   });
 
   it("kept: a first send refused outright, with no earlier attempt and no sign money moved, is failed and frees the deposit", async () => {
@@ -338,7 +339,7 @@ describe("R8-4: a resend refused before the refund's event: the event still sett
     expect(w.service.summary(b)).toMatchObject({ refund_review: null, reschedule_hold: null });
   });
 
-  it("every other review cause still never clears: an event of another amount turns the unknown hold into a mismatch", async () => {
+  it("every other review cause still never clears: an event of another amount is held as unexplained (round 10, I5), not taken as the unknown refund's", async () => {
     const { w, id, got } = await offered();
     loseFirstReply(w);
     w.fake.failNext({ method: "POST", path: /\/refund$/, status: 422, body: FULLY_REFUNDED });
@@ -348,10 +349,10 @@ describe("R8-4: a resend refused before the refund's event: the event still sett
     w.fake.emitWebhook("PAYMENT.CAPTURE.REFUNDED", "refund", other);
     await w.fake.flush();
     await deliver(w, got.at(-1)!);
-    expect(w.service.get(id)).toMatchObject({ status: "needs_review", refunded_minor: 0, refund_ops: [{ status: "needs_review", review_cause: "mismatch", refund_id: other.id }] });
-    // Its own event no longer clears it either.
+    expect(w.service.get(id)).toMatchObject({ status: "needs_review", refunded_minor: 0, refund_ops: [{ status: "needs_review", review_cause: "unknown" }, { status: "needs_review", review_cause: "unexplained", refund_id: other.id }] });
+    // Its own event settles the unknown refund; the unexplained one keeps the booking in review for good.
     await deliver(w, got[0]!);
-    expect(w.service.get(id)).toMatchObject({ status: "needs_review", refund_ops: [{ review_cause: "mismatch" }] });
+    expect(w.service.get(id)).toMatchObject({ status: "needs_review", refunded_minor: 3000, refund_ops: [{ status: "completed" }, { review_cause: "unexplained" }] });
   });
 
   it("a FAILED refund of another amount is not this operation's: it stays unknown and its deposit stays reserved", async () => {
