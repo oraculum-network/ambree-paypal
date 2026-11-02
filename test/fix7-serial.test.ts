@@ -250,6 +250,25 @@ describe("S1: a step sent while another waits on the feed or PayPal waits for it
     agrees(w, id);
   });
 
+  it("fake mode's demo warning vs a refund whose POST is held: the announcement waits, then reads the refunded booking", async () => {
+    const g = gate();
+    const w = makeWorld({ payments: (p) => slow(p, "refundCapture", g) });
+    const { id, token } = await paid(w);
+    await w.service.offerRefund(token);
+    g.arm();
+    const refunding = track(w.service.refund(id));
+    await g.entered; // PayPal refunded; the booking is still `captured` with the operation `sending`
+    w.weather.raise({ id: "TC-R7-DEMO", name: "Cyclone Demo-1 (demo)", level: "orange", from: DATE, to: DATE, summary: "" });
+    const announcing = track(later(() => w.service.announceCyclone(CONV)));
+    await nextTask();
+    expect(announcing.settled, "the warning was announced while PayPal was answering the refund").toBe(false);
+    g.release();
+    expect(await refunding.done).toMatchObject({ ok: true, value: { status: "refunded" } });
+    expect(await announcing.done).toEqual({ ok: true, value: 0 });
+    expect(kinds(w, id)).not.toContain("weather.alert");
+    expect(w.channels.drain(CONV).filter((e) => e.type === "cyclone")).toEqual([]);
+  });
+
   it("price/confirm vs a money step: the guide's price and decline, a new mandate and the traveller's approval wait for the order", async () => {
     const g = gate();
     const w = makeWorld({ payments: (p) => slow(p, "createOrder", g) });
