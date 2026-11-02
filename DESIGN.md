@@ -370,8 +370,9 @@ that changed:
   - "Payment pending" for `capture_pending`;
   - "Payment failed" for `capture_failed`;
   - "Payment needs review" otherwise.
-- **Refund events.** `PAYMENT.CAPTURE.REFUNDED` and any `PAYMENT.REFUND.*` (e.g. `PAYMENT.REFUND.FAILED`;
-  the exact names are **UNVERIFIED**) call `refreshRefunds`. A terminal status other than COMPLETED/PENDING
+- **Refund events.** `PAYMENT.CAPTURE.REFUNDED`, any `PAYMENT.REFUND.*` (e.g. `PAYMENT.REFUND.FAILED`;
+  the exact names are **UNVERIFIED**) and, since §20, any event whose `resource_type` is `refund` (e.g.
+  `PAYMENT.CAPTURE.REVERSED`) call `refreshRefunds`. A terminal status other than COMPLETED/PENDING
   marks the op `failed`, which releases the reservation.
 - **Refund reconciliation fails closed.** For a COMPLETED or PENDING reply, the amount must exist and equal
   the op's currency and minor units. Otherwise the op and the booking go to `needs_review`: the op stays
@@ -673,7 +674,9 @@ The code now keeps four invariants whatever the order.
   is ignored, as for a resend: after a call that ended without an answer, the next call is its retry. The
   `refund_payment` tool turns a non-definitive PayPalError into `refund_unconfirmed`: "PayPal gave no
   definitive answer (...), so the refund may have gone through. Calling refund_payment again resends the
-  same refund and never refunds twice; get_booking shows the current state." An acknowledged call's result
+  same refund with the same PayPal-Request-Id, so PayPal can recognise it; if PayPal reports a second refund
+  anyway, the booking is held for review and nothing more is sent. get_booking shows the current state."
+  (Until §20 it said "never refunds twice", which holds only if PayPal dedupes.) An acknowledged call's result
   carries `acknowledged {n, status, amount}` and a `note` that nothing new was sent. The tool's description
   and the system prompt carry the same rule. One call made after a definitive answer is a new request. That
   includes two MCP calls for the same refund sent at once, if the first is answered: the second runs after
@@ -924,3 +927,31 @@ of an optional field.
   R9-3 and R9-4 (C2) rest on.
 - **The refusal issues.** Which 422 issue PayPal answers a refused retry or resend with (`CAPTURE_FULLY_REFUNDED`,
   `REFUND_AMOUNT_EXCEEDED`?). Either way, round 9's I1 holds it.
+
+## 20. After round 10: a reversal is refund evidence; the resend texts promise no dedupe (2 Nov)
+
+Round 10's two re-attacks closed R9-1..R9-4 and the code half of R9-5 (its other half, the refund failure event
+names, is DEPLOY.md's TODO-CHECK for spike S11). They found two more, both resting on unverified PayPal
+behaviour; the CTO fixed them inline (tests first: `test/fix11-reversed.test.ts`, 3 of 4 red at 1460608).
+
+- **A reversal's refund was dropped (medium, not reachable on the demo: a reversal needs a dispute).**
+  `PAYMENT.CAPTURE.REVERSED` is subscribed, and PayPal's event-names page lists a refund as its resource, but
+  the handler counted only `PAYMENT.CAPTURE.REFUNDED` and `PAYMENT.REFUND.*` as refund events. A reversal went
+  to the capture refresh, which returns for a captured booking: 200, nothing weighed, the card still "Paid" and
+  the move still answerable ("the deposit carries over"). Now any event whose `resource_type` is `refund` is a
+  refund event, so the reversal's refund, which no operation accounts for, holds the booking as `unexplained`
+  (I5), found by `custom_id` or by its capture link. A `REVERSED` whose resource is a capture still goes to the
+  capture refresh (the test keeps it).
+- **The resend texts over-promised (low).** `refund_unconfirmed`, `refund_payment`'s description and the system
+  prompt said a resend "never refunds twice". Without dedupe a resend can make a second refund; I5/F1 then hold
+  the booking, but only after the money moved. The three texts now say the resend carries the same
+  PayPal-Request-Id so PayPal can recognise it, and that a second refund PayPal reports anyway holds the booking
+  for review with nothing more sent. `test/fix9-outcome.test.ts`'s two wording checks changed with them.
+
+**Verify in spike S11** gains one line: **the reversal's resource**, i.e. that `PAYMENT.CAPTURE.REVERSED` carries
+`resource_type: refund` and a refund resource (if it carries the capture instead, a reversal still goes
+unnoticed until a person looks).
+
+Kept as decided by the round-10 builder: PayPal's running total is compared with every refund that isn't failed
+(completed, pending, being sent or unknown), not with completed ones only, so a lost reply's own refund is never
+counted twice.
