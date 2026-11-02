@@ -334,7 +334,7 @@ export function createApp(opts: AppOptions): App {
         const b = typeof id === "string" && /^bk_[0-9a-f]{12}$/.test(id) ? service.get(id) : undefined;
         if (!b || !s.conversations.includes(b.conversation_id)) return sendJson(res, 404, { error: "No such booking." });
         try {
-          const r = service.simulateCyclone(b.id);
+          const r = await service.simulateCyclone(b.id);
           log({ event: "demo_cyclone", booking: b.id, posted: r.posted });
           return sendJson(res, 200, { ok: true, simulated: true, posted: r.posted, booking_id: b.id, date: r.booking.simulated_alert!.from, bookings_warned: r.posted ? 1 : 0 });
         } catch (e) {

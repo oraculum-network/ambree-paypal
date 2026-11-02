@@ -179,7 +179,11 @@ export class BookingService {
     return this.#d.ledger.append(b.id, kind, data);
   }
 
-  /** Runs one booking's money steps one at a time (return URL, webhook and agent may race). */
+  /**
+   * Runs one booking's money steps one at a time (return URL, webhook and agent may race). Other changes
+   * (the guide's page, the mandate) don't queue here, so a step that saves after an await merges onto a
+   * fresh `must(id)`, never onto the copy it read before the await.
+   */
   async #serial<T>(bookingId: string, fn: () => Promise<T>): Promise<T> {
     const prior = this.#locks.get(bookingId) ?? Promise.resolve();
     const run = prior.then(fn, fn);
@@ -437,7 +441,7 @@ export class BookingService {
       let order = await this.#d.payments.getOrder(b.order_id);
       const before = this.orderProblem(order, b, m);
       if (before) {
-        const next = this.#save({ ...b, status: "needs_review" });
+        const next = this.#save({ ...this.must(bookingId), status: "needs_review" });
         this.#log(next, "order.mismatch", { order_id: order.id, problem: before, stage: "before_capture" });
         throw new ServiceError("order_mismatch", `The PayPal order no longer matches the mandate (${before}); not capturing.`);
       }
@@ -450,12 +454,17 @@ export class BookingService {
         }
       }
       const cap = firstCapture(order);
-      if (!cap) return { booking: b, captured: false, order_status: order.status };
-      return this.#reconcileCapture(b, m, order, cap);
+      if (!cap) return { booking: this.must(bookingId), captured: false, order_status: order.status };
+      return this.#reconcileCapture(bookingId, m, order, cap);
     });
   }
 
-  #reconcileCapture(b: Booking, m: Mandate, order: Order, cap: Capture): { booking: Booking; captured: boolean; order_status: string; capture_status: string } {
+  /**
+   * Records what PayPal's capture reply says. It runs after the PayPal calls, so it merges the capture's own
+   * fields (status, capture_id, capture_status, captured) onto the booking as stored now.
+   */
+  #reconcileCapture(bookingId: string, m: Mandate, order: Order, cap: Capture): { booking: Booking; captured: boolean; order_status: string; capture_status: string } {
+    const b = this.must(bookingId);
     const after = this.orderProblem(order, b, m);
     if (after || !sameMoney(cap.amount, m.amount)) {
       const next = this.#save({ ...b, status: "needs_review", capture_id: cap.id, capture_status: cap.status });
@@ -563,8 +572,9 @@ export class BookingService {
   /** Tells every booking in a conversation whose date an alert covers (the fake-mode demo control calls this). */
   async announceCyclone(conversationId: string): Promise<number> {
     let n = 0;
-    for (const b of this.forConversation(conversationId)) {
-      const { alerts, explanation } = await this.weatherFor(b.id);
+    for (const listed of this.forConversation(conversationId)) {
+      const { alerts, explanation } = await this.weatherFor(listed.id);
+      const b = this.must(listed.id); // its status as it is after the feed answered
       if (!alerts.length || !WARNABLE.includes(b.status)) continue;
       this.#log(b, "weather.alert", { alerts: alerts.map((a) => ({ id: a.id, level: a.level, from: a.from, to: a.to, source: a.source })) });
       this.#d.channels.emit(conversationId, { type: "cyclone", booking_id: b.id, text: `Cyclone warning for ${b.date}: ${explanation}` });
@@ -577,9 +587,14 @@ export class BookingService {
    * The hosted demo's control: one simulated cyclone warning for this booking's day only, saved on the
    * booking, logged (`weather.simulated_alert`) and announced to the agent, once per booking. It calls no
    * payment API: the agent reacts to the event, and the refund rules decide exactly as for a real warning.
-   * Synchronous, so two racing calls can't both post.
+   * It queues with the booking's money steps (#serial), so it never lands inside a capture or refund that
+   * is waiting on PayPal, and two racing calls can't both post.
    */
-  simulateCyclone(bookingId: string): { posted: boolean; booking: Booking } {
+  async simulateCyclone(bookingId: string): Promise<{ posted: boolean; booking: Booking }> {
+    return this.#serial(bookingId, async () => this.#simulateNow(bookingId));
+  }
+
+  #simulateNow(bookingId: string): { posted: boolean; booking: Booking } {
     const b = this.must(bookingId);
     if (b.simulated_alert) return { posted: false, booking: b };
     if (!WARNABLE.includes(b.status)) throw new ServiceError("wrong_state", `This booking can't take a warning now (it is ${b.status}); try again once the guide has priced it.`);
@@ -665,6 +680,8 @@ export class BookingService {
         this.#log(b, "refund.retry", { n: op.n, request_id: op.request_id, amount_minor: op.amount_minor, requested: amount ?? null });
       } else {
         const reason = await this.refundReason(b);
+        // The reason waited on the weather feed: reserve the refund on the booking as stored now.
+        b = this.must(bookingId);
         if (!reason) throw new ServiceError("refund_not_allowed", "A refund needs a cyclone warning (orange or red) on the date, a declined reschedule, or the guide's offer.");
         const capturedMinor = toMinor(b.captured!.value);
         const reserved = BookingService.reservedMinor(b);
@@ -697,7 +714,7 @@ export class BookingService {
         }
         throw e;
       }
-      return this.#applyRefund(this.must(bookingId), op.n, refund);
+      return this.#applyRefund(bookingId, op.n, refund);
     });
   }
 
@@ -706,7 +723,8 @@ export class BookingService {
     return this.#serial(bookingId, async () => {
       let b = this.must(bookingId);
       for (const op of b.refund_ops.filter((o) => o.status === "pending" && o.refund_id)) {
-        b = this.#applyRefund(b, op.n, await this.#d.payments.getRefund(op.refund_id!));
+        const refund = await this.#d.payments.getRefund(op.refund_id!);
+        b = this.#applyRefund(bookingId, op.n, refund);
       }
       return b;
     });
@@ -716,7 +734,12 @@ export class BookingService {
     return this.#save({ ...b, refund_ops: b.refund_ops.map((o) => (o.n === n ? { ...o, ...patch } : o)) });
   }
 
-  #applyRefund(b: Booking, n: number, refund: Refund): Booking {
+  /**
+   * Records PayPal's reply for refund operation `n`. It runs after a PayPal call, so it merges the refund's
+   * own fields (refund_ops, refunded_minor, refund_ids, status) onto the booking as stored now.
+   */
+  #applyRefund(bookingId: string, n: number, refund: Refund): Booking {
+    const b = this.must(bookingId);
     const op = b.refund_ops.find((o) => o.n === n)!;
     const cur = b.captured!.currency_code;
     const actual = op.amount_minor;
