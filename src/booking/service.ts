@@ -119,6 +119,21 @@ const CANNOT_SIMULATE: Record<Exclude<BookingStatus, NotPaid | "captured">, stri
   refunded: "the deposit was already refunded",
 };
 const NOT_FOUND = "No such booking in this conversation.";
+/** Refund rule (a): a real feed warning covers the date that was looked up. */
+const WARNING_REASON = "a cyclone warning covers the date";
+/** Feed lookups one refund request may make while the guide keeps moving the date. */
+const MAX_LOOKUPS = 2;
+
+/**
+ * The refund rules that need no weather feed, read on this booking: not refundable (decided, no reason),
+ * (c) the guide's offer, (b) a declined reschedule; otherwise only (a), a feed warning, is left to decide.
+ */
+function settledReason(b: Booking): { decided: true; reason?: string } | { decided: false } {
+  if (b.status !== "captured" && b.status !== "partially_refunded") return { decided: true };
+  if (b.refund_offered) return { decided: true, reason: "the guide offered it" };
+  if (b.reschedule?.status === "declined") return { decided: true, reason: "the guide declined the reschedule" };
+  return { decided: false };
+}
 
 function hashToken(token: string): string {
   return sha256Hex(`operator:${token}`);
@@ -672,11 +687,36 @@ export class BookingService {
    * allows one by itself: it only gets the agent to propose a new date, and the guide's answer decides.
    */
   async refundReason(b: Booking): Promise<string | undefined> {
-    if (b.status !== "captured" && b.status !== "partially_refunded") return undefined;
-    if (b.refund_offered) return "the guide offered it";
-    if (b.reschedule?.status === "declined") return "the guide declined the reschedule";
-    const real = (await this.#d.weather.alertsFor(b.date)).filter((a) => a.level !== "green" && a.source !== "simulated");
-    return real.length ? "a cyclone warning covers the date" : undefined;
+    const settled = settledReason(b);
+    if (settled.decided) return settled.reason;
+    return (await this.#realWarning(b.date)) ? WARNING_REASON : undefined;
+  }
+
+  /** Whether a real feed warning (orange or red, not the demo's simulated one) covers `date`. */
+  async #realWarning(date: string): Promise<boolean> {
+    return (await this.#d.weather.alertsFor(date)).some((a) => a.level !== "green" && a.source !== "simulated");
+  }
+
+  /**
+   * The refund's reason on the booking as stored once the feed has answered, with that booking. The status,
+   * the guide's offer and a declined reschedule are read on it; a feed warning counts only if its date is
+   * still the date that was looked up. A date moved meanwhile (the guide accepted a reschedule) is looked up
+   * once more; if it moves again, the request is refused (`date_changed`, nothing reserved) and can simply
+   * be retried. So a refund never goes out for a reason that doesn't hold on the booking it reserves on.
+   */
+  async #reasonNow(bookingId: string): Promise<{ booking: Booking; reason?: string }> {
+    let b = this.must(bookingId);
+    for (let lookups = 0; ; lookups++) {
+      const settled = settledReason(b);
+      if (settled.decided) return { booking: b, reason: settled.reason };
+      if (lookups === MAX_LOOKUPS) {
+        throw new ServiceError("date_changed", "The booking's date changed while the weather was being checked, so nothing was refunded; ask for the refund again.");
+      }
+      const date = b.date;
+      const warned = await this.#realWarning(date);
+      b = this.must(bookingId);
+      if (b.date === date && !settledReason(b).decided) return { booking: b, reason: warned ? WARNING_REASON : undefined };
+    }
   }
 
   /** Minor units completed, pending or still being sent: none of it may be refunded again. */
@@ -700,9 +740,10 @@ export class BookingService {
       if (op) {
         this.#log(b, "refund.retry", { n: op.n, request_id: op.request_id, amount_minor: op.amount_minor, requested: amount ?? null });
       } else {
-        const reason = await this.refundReason(b);
-        // The reason waited on the weather feed: reserve the refund on the booking as stored now.
-        b = this.must(bookingId);
+        // The reason may wait on the weather feed: it is decided on, and the refund reserved on, the
+        // booking as stored once the feed answered.
+        let reason: string | undefined;
+        ({ booking: b, reason } = await this.#reasonNow(bookingId));
         if (!reason) {
           const simulated = b.simulated_alert ? " A simulated cyclone warning (demo) doesn't allow a refund by itself: the guide has to decline the new date or offer the refund." : "";
           throw new ServiceError("refund_not_allowed", `A refund needs a cyclone warning (orange or red) on the date, a declined reschedule, or the guide's offer.${simulated}`);
