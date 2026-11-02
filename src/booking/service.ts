@@ -945,7 +945,8 @@ export class BookingService {
       const next = this.#setOp({ ...b, refunded_minor: refunded, refund_ids: [...b.refund_ids, refund.id], status, ...closed }, n, { status: "completed", refund_id: refund.id, amount_minor: actual });
       this.#log(next, "refund.completed", { n, refund_id: refund.id, status: refund.status, amount: { currency_code: cur, value: fromMinor(actual) }, reason: op.reason });
       if (pendingMove) this.#log(next, "reschedule.withdrawn", { from: b.date, to: pendingMove.new_date, reason: status === "refunded" ? "the deposit was refunded" : "part of the deposit was refunded" });
-      this.#d.channels.emit(b.conversation_id, { type: "refunded", booking_id: b.id, text: `Refunded ${cur} ${fromMinor(actual)} from ${b.guide_name} to the traveller (${op.reason}).` });
+      const withdrawn = pendingMove ? ` The move to ${pendingMove.new_date} is withdrawn: the guide is no longer asked.` : "";
+      this.#d.channels.emit(b.conversation_id, { type: "refunded", booking_id: b.id, text: `Refunded ${cur} ${fromMinor(actual)} from ${b.guide_name} to the traveller (${op.reason}).${withdrawn}` });
       return next;
     }
     if (refund.status === "PENDING") {

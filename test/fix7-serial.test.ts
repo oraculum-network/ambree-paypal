@@ -399,6 +399,21 @@ describe("S2: a refund that completes, partly or fully, withdraws a move still w
     agrees(w, id);
   });
 
+  it("the agent's refund event says the move was withdrawn, so it doesn't keep waiting for the guide", async () => {
+    const w = makeWorld();
+    const { id } = await paid(w);
+    realAlert(w);
+    await w.service.proposeReschedule(id, MOVED);
+    w.channels.drain(CONV);
+    await w.service.refund(id, "10.00");
+    const refunded = w.channels.drain(CONV).filter((e) => e.type === "refunded");
+    expect(refunded).toHaveLength(1);
+    expect(refunded[0]!.text).toMatch(new RegExp(`The move to ${MOVED} is withdrawn: the guide is no longer asked\\.$`));
+    // A refund with no waiting move says nothing about one.
+    await w.service.refund(id);
+    expect(w.channels.drain(CONV).find((e) => e.type === "refunded")!.text).not.toMatch(/withdrawn/);
+  });
+
   it("the traveller's card says why: part of the deposit, or the deposit", () => {
     const card = (status: string) => labels.rescheduleLine({ status, reschedule: { new_date: MOVED, status: "withdrawn" } });
     expect(card("partially_refunded")).toEqual({ testid: "reschedule", text: `Reschedule to ${MOVED}: withdrawn, because part of the deposit was refunded.` });
