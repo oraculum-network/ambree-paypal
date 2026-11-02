@@ -4,9 +4,10 @@
 
 import { z } from "zod";
 import type { Channels } from "../booking/channels.ts";
-import { type BookingService, ServiceError } from "../booking/service.ts";
+import { type BookingService, ServiceError, isDefinitive } from "../booking/service.ts";
 import { searchGuides } from "../guides/seed.ts";
 import { PayPalError } from "../paypal/errors.ts";
+import { fromMinor } from "../paypal/money.ts";
 import { firstCapture } from "../paypal/types.ts";
 
 export interface ToolContext {
@@ -68,10 +69,21 @@ export const TOOLS = [
     name: "get_booking",
     title: "Get a booking",
     description:
-      "The booking's status, the guide's quote, the mandate, the PayPal order, the capture and any refund or reschedule. reschedule.status is proposed (asked; the guide can answer it only while the booking is captured and no refund has started: reschedule_hold is null then, and otherwise says what the move waits on instead of the guide, a refund under way or a review), accepted (the date moved), declined (a refund is now allowed) or withdrawn (a refund of the deposit completed before the guide answered: the guide is no longer asked and the date stays).",
+      "The booking's status, the guide's quote, the mandate, the PayPal order, the capture and any refund or reschedule. Every refund pending at PayPal is read from PayPal first, so it shows what PayPal says now (refund_pending: being sent or pending; refund_review: held for review, refund_review_cause saying why). reschedule.status is proposed (asked; the guide can answer it only while the booking is captured and no refund has started: reschedule_hold is null then, and otherwise says what the move waits on instead of the guide, a refund under way or a review), accepted (the date moved), declined (a refund is now allowed) or withdrawn (a refund of the deposit completed before the guide answered: the guide is no longer asked and the date stays).",
     input: z.object({ booking_id: bookingId }),
     moneyMoving: false,
-    run: async (a, ctx) => ctx.service.summary(own(ctx, a.booking_id)),
+    run: async (a, ctx) => {
+      own(ctx, a.booking_id);
+      // GET is truth: pending refunds are read from PayPal first (queued with the booking's other steps). A
+      // GET that fails changes nothing, and the stored state is returned.
+      let b;
+      try {
+        b = await ctx.service.refreshRefunds(a.booking_id);
+      } catch {
+        b = ctx.service.must(a.booking_id);
+      }
+      return ctx.service.summary(b);
+    },
   }),
   define({
     name: "propose_mandate",
@@ -151,14 +163,33 @@ export const TOOLS = [
     name: "refund_payment",
     title: "Refund the deposit",
     description:
-      "Refund the deposit (all of it, or `amount`) from the guide's capture back to the traveller. Allowed only when a cyclone warning (orange/red) covers the date, the guide declined a reschedule, or the guide offered a refund. A simulated (demo) warning alone does not allow it. A completed refund withdraws a reschedule still waiting for the guide (status withdrawn); while a refund is pending or held for review, a waiting reschedule is on hold (get_booking's reschedule_hold). date_changed: the date changed while the weather was checked and nothing was refunded; call it once again.",
+      "Refund the deposit (all of it, or `amount`) from the guide's capture back to the traveller. Allowed only when a cyclone warning (orange/red) covers the date, the guide declined a reschedule, or the guide offered a refund. A simulated (demo) warning alone does not allow it. A completed refund withdraws a reschedule still waiting for the guide (status withdrawn); while a refund is pending or held for review, a waiting reschedule is on hold (get_booking's reschedule_hold). date_changed: the date changed while the weather was checked and nothing was refunded; call it once again. refund_unconfirmed: PayPal gave no definitive answer, so the refund may have gone through; call refund_payment again with the same arguments, which resends the same refund and never refunds twice (or, once PayPal has confirmed it, reports it as `acknowledged` and sends nothing); get_booking shows the current state.",
     input: z.object({ booking_id: bookingId, amount: z.string().regex(/^\d{1,4}(\.\d{1,2})?$/).optional() }),
     moneyMoving: true,
     run: async (a, ctx) => {
       own(ctx, a.booking_id);
-      const b = await ctx.service.refund(a.booking_id, a.amount);
+      let r: Awaited<ReturnType<BookingService["refundPayment"]>>;
+      try {
+        r = await ctx.service.refundPayment(a.booking_id, a.amount);
+      } catch (e) {
+        if (e instanceof PayPalError && !isDefinitive(e)) {
+          throw new ServiceError(
+            "refund_unconfirmed",
+            `PayPal gave no definitive answer (${e.summary()}), so the refund may have gone through. Calling refund_payment again resends the same refund and never refunds twice; get_booking shows the current state.`,
+          );
+        }
+        throw e;
+      }
+      const b = r.booking;
       const s = ctx.service.summary(b);
-      return { booking_id: b.id, status: b.status, refunded: s.refunded, refund_pending: s.refund_pending, refund_ids: b.refund_ids };
+      const out: Record<string, unknown> = { booking_id: b.id, status: b.status, refunded: s.refunded, refund_pending: s.refund_pending, refund_review: s.refund_review, refund_ids: b.refund_ids };
+      const ack = r.acknowledged;
+      if (ack) {
+        const amount = { currency_code: b.captured!.currency_code, value: fromMinor(ack.amount_minor) };
+        out.acknowledged = { n: ack.n, status: ack.status, amount };
+        out.note = `Nothing new was sent: your earlier refund_payment call for this booking ended without PayPal's answer, and PayPal has since ${ack.status === "completed" ? "completed that refund" : "accepted that refund, which is pending"} (${amount.currency_code} ${amount.value}). It is the refund you asked for; call refund_payment again only for a further refund.`;
+      }
+      return out;
     },
   }),
 ] as const;
