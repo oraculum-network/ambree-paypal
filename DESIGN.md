@@ -699,8 +699,12 @@ Also, regardless of severity:
   that a refund held only for an unknown outcome "may have gone through" and may still be settled by
   PayPal's notice, not that a reply didn't match.
 
-**Tests** (`test/fix9-*.test.ts`). `fix9-outcome` reproduces R8-1 to R8-6 and the card line and pins each
-invariant; 30 of its 34 tests failed at 11fd5fc. `fix9-matrix` is the ordering matrix: a full or
+**Tests** (`test/fix9-*.test.ts`). The red runs were at ba4d6d7: 11fd5fc's service, client, tools, agent and
+page code, plus only the fake's new controls (two test-infrastructure commits; the tests can't run without
+them). `fix9-outcome` reproduces R8-1 to R8-6 and the card line and pins each invariant. 30 of its first 34
+tests failed there; the 4 that passed are guards. A 35th, added after the fix, pins an I3 path the matrix
+can't reach (settled pending by its event, then completed with that webhook lost). `fix9-matrix` is the
+ordering matrix: a full or
 10.00-of-30.00 refund whose first attempt lost its reply, and three things PayPal may have done with it
 (completed it at once; created it PENDING, then completed it; created it PENDING, then failed it, at the
 moment its webhook is sent). The client's own retry is answered with a replayed 201, a 422
@@ -711,7 +715,8 @@ It asserts, at every step, at most one unknown operation. At the end it asserts:
 `refunded_minor` plus the amounts held for review (and nothing is held once the refund's own webhook
 arrived); PayPal refunded either nothing or the intended amount, with a second operation only after the
 first failed; nothing is left pending, sending or held; the status and the waiting move follow the money.
-144 of its 324 cases failed at 11fd5fc: R8-2 96, R8-1 24, R8-3 24. The fake gained a refund that is PENDING
+144 of its 324 cases failed at ba4d6d7: R8-2 96, R8-1 24, R8-3 24. A refused resend (R8-4) isn't in the
+matrix (the fake replays a repeated request id); its two tests in `fix9-outcome` cover it. The fake gained a refund that is PENDING
 and settles later (`pendNextRefund`, `settleRefund`), a 5xx after processing (`dropResponse` with a 5xx),
 and a held reply (`wait`, `pass`). **Earlier test whose meaning changed:** `fix8-lostreply`'s first D3 case:
 the `refund_payment` after the webhook recorded the lost-reply refund now reports it (`acknowledged`)
