@@ -43,6 +43,8 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: paypal-data
+        - name: tmp # SQLite's temp files (large sorts, VACUUM): the root filesystem is read-only
+          emptyDir: { sizeLimit: 16Mi }
       containers:
         - name: web
           # Built on the host by the deploy gate (`build ambree-paypal <sha7>`); the tag is the
@@ -94,6 +96,8 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data # the directory of DB_PATH (sqlite also writes its -wal/-shm files here)
+            - name: tmp
+              mountPath: /tmp
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
