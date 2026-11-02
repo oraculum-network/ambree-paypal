@@ -1,5 +1,12 @@
-# https://paypal.ambree.ai: HTTPS only, Let's Encrypt via Traefik's `le` resolver, the same annotations
-# as qloo.ambree.ai. The A record must resolve publicly before the first apply.
+# https://paypal.ambree.ai: HTTPS only (websecure), its own Let's Encrypt certificate from
+# Traefik's `le` resolver. The same annotations as qloo.ambree.ai and every Ingress on
+# oraculum-prod; like them, no `tls:` stanza: Traefik's router.tls annotation turns TLS on and
+# the resolver supplies the certificate. The deploy gate admits the host (INGRESS_HOST_RE:
+# any subdomain of ambree.ai).
+#
+# ORDER: the A record paypal.ambree.ai -> 130.61.238.6 (Cloudflare, DNS-only) must resolve
+# publicly BEFORE the first apply: Traefik tries a certificate once and doesn't retry a
+# failed one on its own.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:

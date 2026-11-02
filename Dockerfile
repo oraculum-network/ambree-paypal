@@ -1,7 +1,9 @@
 # Ambree "Book the guide": a small image that runs TypeScript directly (Node 22 type stripping).
-# The root filesystem can be read-only; sqlite writes only to /data (a mounted volume).
-# Built on the host, never on a laptop (see DEPLOY.md). Same digest-pinned node:22-alpine as ambree-qloo
-# (TODO-CHECK: that this digest's Node is >= 22.18 with node:sqlite, as qloo's is).
+# The root filesystem can be read-only; sqlite writes only to /data (the PVC paypal-data in k8s).
+# Built on the host by the deploy gate, never on a laptop (see DEPLOY.md). The base is the same
+# digest-pinned node:22-alpine as ambree-qloo (multi-arch index, linux/amd64 + arm64).
+# TODO-CHECK: this digest's Node is >= 22.18 (type stripping on by default; qloo runs `node src/server.ts`
+# on it, so it should be) and has node:sqlite unflagged (22.13+); the smoke's /healthz proves both.
 
 FROM node:22-alpine@sha256:0a7108bf6c7bf5de370ffb1a3ed6be93d405b43ff159f681a8d18c0e2bc2e402 AS deps
 WORKDIR /app

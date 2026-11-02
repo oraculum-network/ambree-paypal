@@ -1,7 +1,10 @@
-# DRAFT for the CTO (the infra is the CTO's; see DEPLOY.md). One small Node pod: the chat page, the
-# operator page, the PayPal webhook endpoint and MCP. The ledger lives in sqlite on /data; the root
-# filesystem is read-only. The label app.kubernetes.io/name: ambree-paypal is what the namespace's
-# NetworkPolicies should select (in from Traefik on :8080, out to DNS and public :443).
+# One small Node pod: the chat page, the operator page, the PayPal webhook endpoint and MCP. The
+# bookings and the ledger live in sqlite at DB_PATH on the PVC paypal-data (mounted at /data, the
+# only writable path; the root filesystem is read-only). The label app.kubernetes.io/name:
+# ambree-paypal is what the namespace's NetworkPolicies select (in from Traefik on :8080, out to DNS
+# and public :443). The namespace, the PVC, the Secret, the quota, the LimitRange and the paypal-low
+# PriorityClass come from the monorepo's ops/oracle/security.sh (the paypal block) and the admin,
+# never from here (DEPLOY.md).
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -10,10 +13,10 @@ metadata:
     app.kubernetes.io/name: ambree-paypal
     app.kubernetes.io/component: web
 spec:
-  replicas: 1 # sqlite + in-memory conversations: one replica only
+  replicas: 1 # sqlite has one writer, and conversations are in memory: one replica only
   revisionHistoryLimit: 3
   strategy:
-    type: Recreate # never two pods on one sqlite file
+    type: Recreate # never two pods on one sqlite file (and the RWO PVC)
   selector:
     matchLabels:
       app.kubernetes.io/name: ambree-paypal
@@ -23,7 +26,7 @@ spec:
         app.kubernetes.io/name: ambree-paypal
         app.kubernetes.io/component: web
     spec:
-      priorityClassName: paypal-low # TODO-CHECK: created by the monorepo's security.sh paypal block
+      priorityClassName: paypal-low
       automountServiceAccountToken: false
       enableServiceLinks: false
       terminationGracePeriodSeconds: 10
@@ -31,16 +34,27 @@ spec:
         runAsNonRoot: true
         runAsUser: 1000
         runAsGroup: 1000
+        # The volume must be writable by uid 1000 (the image's `node` user), as k8s/oracle/tasks.
         fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
         seccompProfile:
           type: RuntimeDefault
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: paypal-data
       containers:
         - name: web
+          # Built on the host by the deploy gate (`build ambree-paypal <sha7>`); the tag is the
+          # 7-char commit sha, set in kustomization.yaml at deploy time (DEPLOY.md step 5).
           image: oraculum/ambree-paypal
           imagePullPolicy: Never
           ports:
             - name: http
               containerPort: 8080
+          # PAYPAL_OPERATOR_IDENTITY is deliberately unset: the default ("paypal") confirms the
+          # operator's merchant id with PayPal at startup and refuses to start if it can't.
+          # PAYPAL_BASE_URL is unset too: the sandbox (the app refuses any live PayPal URL).
           env:
             - name: PORT
               value: "8080"
@@ -50,32 +64,36 @@ spec:
               value: https://paypal.ambree.ai
             - name: DB_PATH
               value: /data/ambree.sqlite
-            # No Secret (or no keys in it) means the fake PayPal and the scripted model, so the pod still boots.
-            # With PAYPAL_CLIENT_ID + SECRET set, PAYPAL_GUIDE_PAYEE_MERCHANT_ID and PAYPAL_OPERATOR_MERCHANT_ID are
-            # required (merchant ids only; any *_EMAIL variable makes the app refuse to start).
-            - name: PAYPAL_CLIENT_ID
-              valueFrom: { secretKeyRef: { name: paypal-sandbox, key: PAYPAL_CLIENT_ID, optional: true } }
-            - name: PAYPAL_CLIENT_SECRET
-              valueFrom: { secretKeyRef: { name: paypal-sandbox, key: PAYPAL_CLIENT_SECRET, optional: true } }
-            - name: PAYPAL_WEBHOOK_ID
-              valueFrom: { secretKeyRef: { name: paypal-sandbox, key: PAYPAL_WEBHOOK_ID, optional: true } }
-            - name: PAYPAL_GUIDE_PAYEE_MERCHANT_ID
-              valueFrom: { secretKeyRef: { name: paypal-sandbox, key: PAYPAL_GUIDE_PAYEE_MERCHANT_ID, optional: true } }
-            # The REST app owner's own merchant id: never a payee; the app refuses to start if a guide's equals it.
-            - name: PAYPAL_OPERATOR_MERCHANT_ID
-              valueFrom: { secretKeyRef: { name: paypal-sandbox, key: PAYPAL_OPERATOR_MERCHANT_ID, optional: true } }
-            # MCP is off unless this is set (clients send it as a Bearer token).
-            - name: MCP_DEMO_PASSCODE
-              valueFrom: { secretKeyRef: { name: paypal-sandbox, key: MCP_DEMO_PASSCODE, optional: true } }
+            # Merchant ids are not secrets. Both are required in sandbox mode, must differ, and are
+            # 8-20 capital letters and digits; empty, the pod refuses to start (fails closed), and
+            # deploy-paypal.sh refuses to apply. TODO-CHECK: fill both before the first deploy
+            # (DEPLOY.md, "Before the first deploy").
+            - name: PAYPAL_GUIDE_PAYEE_MERCHANT_ID # the sandbox business account that plays every guide
+              value: ""
+            - name: PAYPAL_OPERATOR_MERCHANT_ID # the REST app owner's own account: never a payee
+              value: ""
+            # OpenAI-compatible; the app calls ${LLM_BASE_URL}/chat/completions. TODO-CHECK: the model.
             - name: LLM_BASE_URL
-              valueFrom: { secretKeyRef: { name: llm, key: LLM_BASE_URL, optional: true } }
-            - name: LLM_API_KEY
-              valueFrom: { secretKeyRef: { name: llm, key: LLM_API_KEY, optional: true } }
+              value: https://openrouter.ai/api/v1
             - name: LLM_MODEL
-              valueFrom: { secretKeyRef: { name: llm, key: LLM_MODEL, optional: true } }
+              value: ""
+            # Secret paypal-secrets (created by hand, DEPLOY.md step 3). Every key is required, so a
+            # missing Secret or key stops the pod at CreateContainerConfigError. PAYPAL_WEBHOOK_ID and
+            # MCP_DEMO_PASSCODE may hold an empty value: no webhook id = the endpoint answers 503;
+            # no passcode = /mcp answers 401.
+            - name: PAYPAL_CLIENT_ID
+              valueFrom: { secretKeyRef: { name: paypal-secrets, key: PAYPAL_CLIENT_ID } }
+            - name: PAYPAL_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: paypal-secrets, key: PAYPAL_CLIENT_SECRET } }
+            - name: PAYPAL_WEBHOOK_ID
+              valueFrom: { secretKeyRef: { name: paypal-secrets, key: PAYPAL_WEBHOOK_ID } }
+            - name: LLM_API_KEY
+              valueFrom: { secretKeyRef: { name: paypal-secrets, key: LLM_API_KEY } }
+            - name: MCP_DEMO_PASSCODE
+              valueFrom: { secretKeyRef: { name: paypal-secrets, key: MCP_DEMO_PASSCODE } }
           volumeMounts:
             - name: data
-              mountPath: /data
+              mountPath: /data # the directory of DB_PATH (sqlite also writes its -wal/-shm files here)
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -83,6 +101,9 @@ spec:
             capabilities:
               drop:
                 - ALL
+          # Inside the paypal LimitRange (max 500m / 256Mi per container) and the paypal-cap quota
+          # (requests 100m / 256Mi, limits 1 / 600Mi). 256Mi is the LimitRange max: more needs the
+          # host's paypal block changed first.
           resources:
             requests:
               cpu: 25m
@@ -90,17 +111,20 @@ spec:
             limits:
               cpu: 200m
               memory: 256Mi
+          # The server listens only after the operator check passed, so /healthz answering means
+          # the config loaded, sqlite opened DB_PATH and PayPal confirmed the operator.
           readinessProbe:
-            httpGet: { path: /healthz, port: http }
+            httpGet:
+              path: /healthz
+              port: http
             periodSeconds: 10
             timeoutSeconds: 3
+            failureThreshold: 3
           livenessProbe:
-            httpGet: { path: /healthz, port: http }
+            httpGet:
+              path: /healthz
+              port: http
             initialDelaySeconds: 10
             periodSeconds: 30
             timeoutSeconds: 5
-      volumes:
-        # TODO-CHECK: a PVC (local-path) so the ledger survives restarts until 15 Dec; emptyDir resets it.
-        - name: data
-          emptyDir:
-            sizeLimit: 256Mi
+            failureThreshold: 3

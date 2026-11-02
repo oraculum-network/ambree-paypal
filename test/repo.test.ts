@@ -25,10 +25,23 @@ describe("repo hygiene", () => {
     expect(SANDBOX_API_BASE).toBe("https://api-m.sandbox.paypal.com");
   });
 
-  it("the k8s draft reads every credential from optional Secrets", () => {
+  it("the k8s manifests match the host's paypal block: credentials from Secret paypal-secrets, sqlite on paypal-data", () => {
     const d = read("deploy/k8s/deployment.yaml");
-    for (const k of ["PAYPAL_CLIENT_ID", "PAYPAL_CLIENT_SECRET", "PAYPAL_WEBHOOK_ID", "LLM_API_KEY"]) expect(d).toMatch(new RegExp(`${k}, optional: true`));
+    // The five keys of the hand-made Secret, each required (no optional: the pod waits for the Secret).
+    for (const k of ["PAYPAL_CLIENT_ID", "PAYPAL_CLIENT_SECRET", "PAYPAL_WEBHOOK_ID", "LLM_API_KEY", "MCP_DEMO_PASSCODE"]) {
+      expect(d).toContain(`secretKeyRef: { name: paypal-secrets, key: ${k} }`);
+    }
+    expect(d.match(/secretKeyRef/g)).toHaveLength(5);
+    expect(d).not.toMatch(/optional:|paypal-sandbox|envFrom/);
+    // The safe default: the operator check runs (never config-only), and no live PayPal base URL.
+    expect(d).not.toMatch(/- name: PAYPAL_OPERATOR_IDENTITY|- name: PAYPAL_BASE_URL|_EMAIL/);
+    expect(d).toContain("claimName: paypal-data");
+    expect(d).toContain("mountPath: /data");
+    expect(d).toContain("value: /data/ambree.sqlite");
+    expect(d).toContain("type: Recreate");
+    expect(d).toContain("priorityClassName: paypal-low");
     expect(d).toContain("value: https://paypal.ambree.ai");
+    expect(read("deploy/k8s/kustomization.yaml")).toContain("namespace: paypal");
     expect(read("deploy/k8s/ingress.yaml")).toContain("host: paypal.ambree.ai");
   });
 });
