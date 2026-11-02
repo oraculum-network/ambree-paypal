@@ -257,6 +257,24 @@ describe("R8-3: one intended refund, one operation", () => {
     expect(refundPosts(w)).toBe(2);
   });
 
+  it("settled pending by its event, then completed with that webhook lost: the next call reads it, reports it completed and sends nothing", async () => {
+    const { w, id } = await offered();
+    w.fake.pendNextRefund();
+    loseBothReplies(w);
+    await expect(w.service.refund(id, "10.00")).rejects.toMatchObject({ kind: "network" });
+    const refundId = w.fake.refundIds()[0]!;
+    w.fake.deliver = async (raw, headers) => void (await w.service.handleWebhook(raw, headers));
+    w.fake.emitWebhook("PAYMENT.REFUND.PENDING", "refund", { id: refundId, status: "PENDING", amount: { currency_code: "EUR", value: "10.00" }, custom_id: id });
+    await w.fake.flush();
+    expect(w.service.get(id)!.refund_ops).toMatchObject([{ status: "pending", acknowledged: false }]);
+    w.fake.deliver = undefined; // the completion's webhook is lost
+    w.fake.settleRefund(refundId, "COMPLETED");
+    const out = await tool(w, "refund_payment", { booking_id: id, amount: "10.00" });
+    expect(out).toMatchObject({ ok: true, value: { status: "partially_refunded", refunded: { value: "10.00" }, refund_pending: null, acknowledged: { n: 1, status: "completed" } } });
+    expect(refundPosts(w)).toBe(2);
+    expect(moved(w)).toBe(1000);
+  });
+
   it("the tool's error on an ambiguous send says it may have gone through, that calling again never refunds twice, and get_booking", async () => {
     const { w, id } = await offered();
     loseBothReplies(w);
