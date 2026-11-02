@@ -93,8 +93,9 @@ Weather feed      Agent                      Booking service                 Gui
 ```
 
 **Refund policy** (`BookingService.refundReason` in `src/booking/service.ts`). A refund is allowed when the booking is captured and one of these holds:
-(a) there is an active cyclone alert for the booking date, (b) the guide declined a reschedule, or (c) the guide
-offered the refund on the operator page. The amount must be at most the captured amount minus earlier refunds.
+(a) a real feed alert (orange or red) covers the booking date, (b) the guide declined a reschedule, or (c) the
+guide offered the refund on the operator page. The hosted demo's simulated warning (§14) is not a feed alert and
+never allows a refund by itself: it only gets the agent to propose a reschedule, and (b) or (c) decides. The amount must be at most the captured amount minus earlier refunds.
 Partial refunds are allowed. The agent cannot refund for any other reason; it can only explain.
 
 ## 3. Data model (`node:sqlite`, one file, or `:memory:` in tests)
@@ -234,7 +235,7 @@ only on network errors or 5xx, and only for calls that carry a `PayPal-Request-I
 | `POST /webhooks/paypal` | Verify via call 7, log to the ledger once, process. Only completed processing makes a redelivery a duplicate; a processing failure answers 500 |
 | `POST /mcp` | The tools over MCP (stateless). Off unless `MCP_DEMO_PASSCODE` is set (Bearer); scoped to the conversation `mcp` |
 | `GET /fake-paypal/checkout?token=` | **Fake mode only**: a stand-in buyer approval page |
-| `POST /api/demo/cyclone` | Fake and sandbox mode (live is refused at startup). Needs an existing session (401, and it never creates one). **Sandbox:** `{booking_id}` of a booking the session owns (else 404); posts one simulated warning for that booking's day, once, and calls no payment API (§14). **Fake:** unchanged, a demo-feed alert around every booking of the tab's conversation |
+| `POST /api/demo/cyclone` | Fake and sandbox mode (live is refused at startup). Needs an existing session (401, and it never creates one). **Sandbox:** `{booking_id}` of a booking the session owns (else 404) and has paid (`captured`; else 409 with the reason, and nothing is saved); posts one simulated warning for that booking's day, once, and calls no payment API (§14). **Fake:** unchanged, a demo-feed alert around every booking of the tab's conversation |
 | `GET /healthz` | `{ok, mode}` |
 
 ## 8. Three-minute demo script (from the report, §6 B)
@@ -252,10 +253,11 @@ only on network errors or 5xx, and only for calls that carry a `PayPal-Request-I
 - **2:05** The return capture lands, and the webhook is verified. The ledger rows appear with their hashes, and
   the chain status under the ledger says "Chain OK" by itself. The guide's sandbox balance goes up (shown in the
   PayPal sandbox dashboard).
-- **2:25** "Simulate a cyclone warning (demo)" puts a simulated warning on Thursday for this booking only (a real
-  GDACS warning can't be triggered on demand). Ambree explains the risk, says it is simulated, and proposes
-  Saturday. The guide declines, so Ambree refunds the deposit (partially, if the guide keeps a fee), and the
-  refund webhook is logged.
+- **2:25** Now that the deposit is paid, "Simulate a cyclone warning (demo)" puts a simulated warning on Thursday
+  for this booking only (a real GDACS warning can't be triggered on demand; before payment the button is off and
+  says to pay first). Ambree explains the risk, says it is simulated, and proposes Saturday. The simulated warning
+  alone allows no refund. The guide declines, and that decline lets Ambree refund the deposit (partially, if the
+  guide keeps a fee; PayPal's note reads "the guide declined the reschedule"), and the refund webhook is logged.
 - **2:50** Architecture slide: never custody. The order's payee is the guide, our account is never the payee, and
   the mandate is enforced in code.
 
@@ -268,8 +270,9 @@ only on network errors or 5xx, and only for calls that carry a `PayPal-Request-I
    README (the CEO creates it; the credentials are published for judges as the rules ask). On the fake, click
    approve.
 5. Watch the ledger fill in; the chain status under it says "Chain OK" by itself.
-6. Press "Simulate a cyclone warning (demo)" (Demo controls), follow Ambree's reschedule, decline it as the guide,
-   and see the refund.
+6. After paying, press "Simulate a cyclone warning (demo)" (Demo controls; it stays off, saying why, until the
+   booking is captured). Follow Ambree's reschedule and decline it as the guide: the guide's decline, not the
+   simulated warning, allows the refund. See the refund.
 
 ## 10. Deploy shape (as hosted; the steps are in DEPLOY.md)
 
@@ -423,22 +426,47 @@ GDACS warnings can't be triggered on demand.
     judge's session) on the same day never sees it. The record field is optional, so `SCHEMA_VERSION` stays 2.
   - It logs `weather.simulated_alert` and emits the agent event "Simulated cyclone warning (demo) for
     {date}, not a real warning: …".
-  - It is idempotent: a second call (or a racing one) answers `posted: false` with no new row or event.
-  - A booking that isn't yet priced, or is already finished, answers 409 and records nothing.
-  - It calls no payment API. The agent reacts to the event (check_weather → propose_reschedule). The refund
-    rules (§2.2) see the simulated alert like any other, and the refund reason (and so PayPal's
-    `note_to_payer`) reads "a simulated cyclone warning (demo) covers the date".
-- **Fake mode** keeps its conversation-wide demo-feed raise (`weather.alert`, ±1 day).
+  - It is idempotent and runs one at a time with the booking's money steps (`#serial`): a second call (or a
+    racing one) answers `posted: false` with no new row or event, and a press while a capture or refund is
+    waiting on PayPal waits for it.
+  - Only a paid (`captured`) booking takes it; the agent can only move a captured booking, so a warning spent
+    earlier could never lead to the reschedule. Any other status answers 409 and records nothing (no
+    `simulated_alert`, no ledger row, no event), with one message per group:
+    - not paid yet (requested, priced, mandate_proposed, mandate_approved, order_created; reason `not_paid`):
+      "pay for the booking first, then simulate";
+    - finished or still in processing (declined, capture_pending, capture_failed, needs_review,
+      partially_refunded, refunded; reason `cannot_simulate`): it can't be simulated now, and why.
+  - It calls no payment API. The agent reacts to the event (check_weather → propose_reschedule). The simulated
+    warning never allows a refund by itself (§2.2 rule (a) takes real feed alerts only): a refund still needs
+    the guide's offer or the guide declining the new date. A traveller who asks for a refund before the guide
+    answers is refused. In the demo the refund reason (and so PayPal's `note_to_payer`) reads "the guide
+    declined the reschedule".
+  - Once the booking is no longer captured (e.g. refunded), the guide's page hides "Move the trip?" and an
+    answer is refused (`wrong_state`).
+- **Fake mode** keeps its conversation-wide demo-feed raise (`weather.alert`, ±1 day). That is a feed alert
+  (source `demo`), so refund rule (a) applies to it as before.
 - **Live mode** can't run it: `loadConfig` and `PayPalRestClient` refuse any base URL but the sandbox's
   before the server starts.
 - **The page** (`public/labels.js` `demoView`):
   - Demo controls show in fake and sandbox mode: "Simulate a cyclone warning (demo)", which acts on the
-    tab's newest booking, and "Start over", which adds a new conversation to the caller's own session and
-    switches this tab to it.
+    tab's newest booking (sandbox: enabled only when that booking is captured, with the reason shown
+    otherwise; `simulateControl`), and "Start over", which adds a new conversation to the caller's own
+    session and switches this tab to it.
   - Only the guide's fake balance stays fake-only: it is the fake's own bookkeeping, and the server sends
     `null` in sandbox mode.
   - The stand-in checkout (`/fake-paypal/checkout`) exists only in fake mode.
 - **Tests:** `test/fix4-hosted.test.ts` runs the app in sandbox mode with no network
   (`AppOptions.paypalFetch`, tests only: a stub that refuses every PayPal call, or the fake). The Playwright
   project `sandbox-like` (`e2e/serve-sandbox.ts`) runs the whole hosted path in a browser, using a stand-in
-  buyer checkout on its own port.
+  buyer checkout on its own port: Simulate is off until the booking is paid, a refund request is refused until
+  the guide answers, and the guide's decline refunds.
+- **After the review (2 Nov), also:**
+  - A save that follows an await (a PayPal call or the weather feed) merges its own fields onto the booking
+    as stored then, never onto the copy read before the await: the capture's saves (`#reconcileCapture` and
+    the needs_review save before capture), the refund's reservation after `refundReason`, and every refund
+    reply (`#applyRefund`, from `refund` and `refreshRefunds`). A change made meanwhile (the guide's refund
+    offer, a simulated warning) survives.
+  - `Content-Type` is matched case-insensitively by both the 415 check and the JSON body reader
+    (`isJsonRequest` in `src/app.ts`), so "Application/JSON" is read, not dropped.
+  - `test/fix5-review.test.ts` covers the review's findings, with deterministic races: a gate holds one
+    PayPal reply (or feed lookup) while the test changes the booking.

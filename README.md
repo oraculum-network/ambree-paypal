@@ -50,8 +50,10 @@ Ambree never holds your money. PayPal sandbox only.
     must match too. Otherwise the booking goes to `needs_review` and is not marked paid.
   - "Paid" and "refunded" mean PayPal said `COMPLETED`. The page shows "Payment pending", "Payment failed"
     or "Payment needs review" otherwise.
-  - It refunds only when there is a cyclone warning, a declined reschedule or the guide's offer. Each refund
-    is saved (amount and PayPal-Request-Id) before it is sent, and retried unchanged.
+  - It refunds only when a real cyclone warning covers the day, the guide declined the reschedule, or the
+    guide offered the refund. The hosted demo's simulated warning never allows a refund by itself: it only
+    gets Ambree to ask the guide for a new date. Each refund is saved (amount and PayPal-Request-Id) before it
+    is sent, and retried unchanged.
   - PayPal's refund reply must carry exactly that currency and amount. A missing or different amount puts
     the booking in `needs_review`: nothing is counted as refunded and no success is announced.
   - A refund that ends `FAILED` or `CANCELLED` (seen by GET after a `PAYMENT.REFUND.*` or
@@ -67,7 +69,7 @@ Ambree never holds your money. PayPal sandbox only.
     session.
   - The demo control "Simulate a cyclone warning (demo)" (`POST /api/demo/cyclone`) also needs an existing
     session (401 otherwise). On the hosted sandbox it acts only on a booking the session owns (404
-    otherwise), once, and calls no payment API.
+    otherwise), only once that booking is paid (409 otherwise, saying why), once, and calls no payment API.
   - MCP is off unless `MCP_DEMO_PASSCODE` is set. MCP calls run in their own scope and can't see web
     bookings.
 
@@ -154,13 +156,15 @@ PAYPAL_CLIENT_ID=... PAYPAL_CLIENT_SECRET=... node scripts/spike.ts --payee-merc
 5. Press **Pay the guide in PayPal**. On the hosted sandbox, log in as the sandbox buyer:
    `TODO-CHECK: buyer email / password, published here by the CEO` (the rules ask for sandbox login details).
 6. Watch the ledger fill in (order, capture, verified webhooks) and the chain say **Chain OK**.
-7. Under **Demo controls**, press **Simulate a cyclone warning (demo)**. A real cyclone warning can't be
-   triggered on demand, so this puts a simulated warning on your own newest booking's day, once. It is
+7. Once the booking is paid (status `captured`), press **Simulate a cyclone warning (demo)** under **Demo
+   controls**. Before you pay, the button is off and the page says to pay first. A real cyclone warning can't
+   be triggered on demand, so this puts a simulated warning on your own newest booking's day, once. It is
    labelled as simulated on the page, in the chat and in the ledger (`weather.simulated_alert`). No weather
-   service is called and the button itself moves no money. Ambree explains the risk and asks the guide to move
-   the trip. On the guide's link, answer "No, I can't": Ambree refunds the deposit from the guide's sandbox
-   capture back to you, and the refund webhook appears in the ledger. **Start over** opens a fresh conversation
-   in your tab only.
+   service is called, and the simulated warning alone moves no money: asking Ambree for a refund now is
+   refused. Ambree explains the risk and asks the guide to move the trip. On the guide's link, answer "No, I
+   can't": the guide's decline is what allows the refund (PayPal's note reads "the guide declined the
+   reschedule"). Ambree refunds the deposit from the guide's sandbox capture back to you, and the refund
+   webhook appears in the ledger. **Start over** opens a fresh conversation in your tab only.
 
 ## The agent's tools (also over MCP at `POST /mcp`, with `MCP_DEMO_PASSCODE`)
 
@@ -199,11 +203,17 @@ npx playwright test
     - the ledger checkpoint;
     - spike run ids.
   - the hosted demo (`test/fix4-hosted.test.ts`), in sandbox mode with no network: the cyclone simulation on
-    the caller's own booking only, once, with no PayPal call; the page's Demo controls; Start over staying in
-    the caller's session.
+    the caller's own paid booking only, once, with no PayPal call; the page's Demo controls; Start over staying
+    in the caller's session.
+  - the review of that simulation (`test/fix5-review.test.ts`): it is refused on any booking that isn't
+    captured, with nothing saved and a reason for each status; the page offers it only for a captured newest
+    booking; a simulated warning alone never allows a refund, and a refunded booking can't be moved; a change
+    made while PayPal answers (capture, refund refresh, refund request) is never wiped by the save that follows
+    (deterministic races, with PayPal's reply held by a gate); `Content-Type` is case-insensitive.
 - **Playwright** runs the happy path and the refund path in a browser against the fake. A second project
   (`sandbox-like`) runs the hosted sandbox-mode path, with the fake behind the REST client and a stand-in
-  buyer checkout: the Demo controls, the simulated warning, the refund and Start over.
+  buyer checkout: the Demo controls (Simulate is off until the booking is paid), the simulated warning, a
+  refund request refused until the guide answers, the guide's decline and the refund, and Start over.
 
 ## Built during the hackathon
 
@@ -222,4 +232,5 @@ All of this repository was written from 31 Oct 2026, inside the PayPal AI Hackat
   booking for someone may count as tour-operator work even without holding money.
 - **Conversations live in memory**; bookings and the ledger live in sqlite.
 - **The real GDACS cyclone feed is not wired yet.** The "Simulate a cyclone warning (demo)" control stands in
-  for it, labelled as simulated. On the hosted sandbox it marks only your own booking's day.
+  for it, labelled as simulated. On the hosted sandbox it marks only your own paid booking's day, and it never
+  allows a refund by itself: the guide's decline (or offer) does.
