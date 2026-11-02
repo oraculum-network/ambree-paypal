@@ -104,7 +104,7 @@ Partial refunds are allowed. The agent cannot refund for any other reason; it ca
 guides(id, name, area, activities[], languages[], bio, payee{email_address|merchant_id}, currency)      -- seed, in code
 bookings(id, conversation_id, guide_id, activity, area, date, party_size, status,
          operator_token_hash, quote?, quote_hash?, mandate_id?, order_id?, approve_url?, capture_id?,
-         captured{currency_code,value}?, refunded_minor, reschedule?{new_date,status}, refund_offered,
+         captured{currency_code,value}?, refunded_minor, reschedule?{new_date,status,n?}, refund_offered,
          created_at, updated_at)                                                                         -- records table, JSON
 mandates(id, booking_id, amount{currency_code,value}, payee, quote_hash, nonce, expires_at,
          step_up_hash, attempts, status: proposed|approved|used|expired|locked)                          -- records table, JSON
@@ -118,7 +118,8 @@ webhook_events(event_id PRIMARY KEY, event_type, received_at)                   
   `declined` (the guide said no) and `cancelled` are terminal. A reschedule keeps the status and changes `date`.
 - **Reschedule:** `proposed → accepted | declined`, or `withdrawn` when a refund (part or all of the deposit,
   §15, §16) completes before the guide answered. It can be proposed and answered only while the booking is
-  `captured` and no refund has started.
+  `captured` and no refund has started. Each proposal is numbered (`n`, since round 8; absent on older
+  records, which count as 0), and the guide's answer names the proposal it answers (§17).
 - **Quote** (frozen once priced): `{booking_id, guide_id, guide_name, activity, area, date, party_size,
   total{currency_code,value}, deposit{currency_code,value}, payee, guide_note, priced_at}`. The **quote hash** is
   sha256 hex of the canonical JSON: keys sorted, no whitespace, strings NFC.
@@ -196,7 +197,7 @@ only on network errors or 5xx, and only for calls that carry a `PayPal-Request-I
 |---|---|---|---|
 | `search_guides` | `area?`, `activity?`, `date?`, `language?` | Lists seed guides that match | no |
 | `request_quote` | `guide_id`, `date`, `party_size`, `activity`, `note?` | Creates a booking and an operator link; the guide is "notified" | no |
-| `get_booking` | `booking_id` | Status, quote, mandate state, order and capture ids, refunds | no |
+| `get_booking` | `booking_id` | Status, quote, mandate state, order and capture ids, refunds (done, pending, in review), the reschedule and, when the guide can't answer it now, why (`reschedule_hold`, §17) | no |
 | `propose_mandate` | `booking_id` | Builds the mandate from the frozen quote; the step-up code goes to the traveller channel only | no |
 | `create_order` | `booking_id` | **Only** with an approved, unexpired, unused mandate whose quote hash, amount and payee match. Creates the order with payee = the guide; returns the approve link | prepares a payment |
 | `get_order` | `booking_id` | `GET /v2/checkout/orders/{id}` | no |
@@ -233,12 +234,12 @@ only on network errors or 5xx, and only for calls that carry a `PayPal-Request-I
 | `POST /api/conversations` | Starts a new conversation in this session ("Start over") |
 | `GET /api/ledger/head` | The ledger checkpoint kept outside the database `{count, head}` and the verify result against it |
 | `POST /api/mandates/{id}/approve` | `{code}`. **Human only**: no tool can call it; 404 unless the session owns the booking |
-| `GET /o/{token}`, `POST /o/{token}` | The operator page: price, accept or decline a reschedule, offer a refund. The token is 256-bit base64url and stored as sha256; there is no login |
+| `GET /o/{token}`, `POST /o/{token}` | The operator page: price, accept or decline a reschedule, offer a refund. The token is 256-bit base64url and stored as sha256; there is no login. A reschedule answer names the proposal it answers (hidden `proposal`); one for an earlier proposal, or none, answers 422 and the page shows the current question (§17) |
 | `GET /paypal/return`, `GET /paypal/cancel` | The PayPal redirects, both to `/` (never a conversation id). Return captures if the session owns the booking |
 | `POST /webhooks/paypal` | Verify via call 7, log to the ledger once, process. Only completed processing makes a redelivery a duplicate; a processing failure answers 500 |
 | `POST /mcp` | The tools over MCP (stateless). Off unless `MCP_DEMO_PASSCODE` is set (Bearer); scoped to the conversation `mcp` |
 | `GET /fake-paypal/checkout?token=` | **Fake mode only**: a stand-in buyer approval page |
-| `POST /api/demo/cyclone` | Fake and sandbox mode (live is refused at startup). Needs an existing session (401, and it never creates one). **Sandbox:** `{booking_id}` of a booking the session owns (else 404) and has paid (`captured`; else 409 with the reason, and nothing is saved); posts one simulated warning for that booking's day, once, and calls no payment API (§14). **Fake:** unchanged, a demo-feed alert around every booking of the tab's conversation |
+| `POST /api/demo/cyclone` | Fake and sandbox mode (live is refused at startup). Needs an existing session (401, and it never creates one). **Sandbox:** `{booking_id}` of a booking the session owns (else 404) and has paid with no refund under way (`captured`, no refund being sent or pending; else 409 with the reason, and nothing is saved); posts one simulated warning for that booking's day, once, and calls no payment API (§14). **Fake:** unchanged, a demo-feed alert around every booking of the tab's conversation |
 | `GET /healthz` | `{ok, mode}` |
 
 ## 8. Three-minute demo script (from the report, §6 B)
@@ -432,13 +433,15 @@ GDACS warnings can't be triggered on demand.
   - It is idempotent and runs one at a time with the booking's other steps (`#serial`; since round 7 every
     step, §16): a second call (or a racing one) answers `posted: false` with no new row or event, and a press
     while a capture or refund is waiting on PayPal waits for it.
-  - Only a paid (`captured`) booking takes it; the agent can only move a captured booking, so a warning spent
-    earlier could never lead to the reschedule. Any other status answers 409 and records nothing (no
-    `simulated_alert`, no ledger row, no event), with one message per group:
+  - Only a paid (`captured`) booking with no refund under way takes it (round 8, §17); the agent can only move
+    such a booking, so a warning spent earlier could never lead to the reschedule. Any other status answers
+    409 and records nothing (no `simulated_alert`, no ledger row, no event), with one message per group:
     - not paid yet (requested, priced, mandate_proposed, mandate_approved, order_created; reason `not_paid`):
       "pay for the booking first, then simulate";
     - finished or still in processing (declined, capture_pending, capture_failed, needs_review,
-      partially_refunded, refunded; reason `cannot_simulate`): it can't be simulated now, and why.
+      partially_refunded, refunded; reason `cannot_simulate`): it can't be simulated now, and why;
+    - captured, but a refund being sent or pending at PayPal (reason `cannot_simulate`): "a refund of the
+      deposit has started, so the trip can't be moved".
   - It calls no payment API. The agent reacts to the event (check_weather → propose_reschedule). The simulated
     warning never allows a refund by itself (§2.2 rule (a) takes real feed alerts only): a refund still needs
     the guide's offer or the guide declining the new date. A traveller who asks for a refund before the guide
@@ -452,9 +455,9 @@ GDACS warnings can't be triggered on demand.
   before the server starts.
 - **The page** (`public/labels.js` `demoView`):
   - Demo controls show in fake and sandbox mode: "Simulate a cyclone warning (demo)", which acts on the
-    tab's newest booking (sandbox: enabled only when that booking is captured, with the reason shown
-    otherwise; `simulateControl`), and "Start over", which adds a new conversation to the caller's own
-    session and switches this tab to it.
+    tab's newest booking (sandbox: enabled only when that booking is captured and its `refund_pending` is
+    null, with the reason shown otherwise; `simulateControl`), and "Start over", which adds a new
+    conversation to the caller's own session and switches this tab to it.
   - Only the guide's fake balance stays fake-only: it is the fake's own bookkeeping, and the server sends
     `null` in sandbox mode.
   - The stand-in checkout (`/fake-paypal/checkout`) exists only in fake mode.
@@ -538,3 +541,54 @@ deterministic, held by `test/helpers/race.ts`'s gate, or chained 0 to 5 microtas
   `propose_reschedule` and `refund_payment` descriptions); the scripted model is unchanged.
 - **Fake mode:** the demo control's `announceCyclone` now queues per booking, so a press while a refund is
   held at PayPal waits for it and reads the booking as the refund left it. Otherwise unchanged.
+
+## 17. Round 8: an answer names its move; a lost refund reply; what a held move says (2 Nov)
+
+Five findings from the independent reviewers, each with a test that failed at 7777925
+(`test/fix8-*.test.ts`: 21 of 27 failed; the race is the guide's own two pages, read from the rendered HTML).
+
+- **D1, an answer names the move it answers** (`fix8-stale`). The accept and decline forms posted only
+  `action`, so a page left open on one proposal answered whatever was proposed when it was clicked: a stale
+  "No, I can't" declined a later date the guide never saw (and unlocked the refund), a stale "Yes" moved the
+  trip there. Each proposal is now numbered (`reschedule.n`), and both forms carry `proposalKey(b)`
+  ("n:new_date") in a hidden `proposal` field. `answerReschedule(token, accept, proposal?)` refuses an
+  answer naming any other key (`stale_reschedule`; nothing saved, logged or announced), and the page shown
+  after the post asks the current question. The page always sends the key, so a post without one (a page
+  rendered before round 8) is refused too; the service's own callers may leave it out. `summary().reschedule`
+  stays `{new_date, status}`.
+- **D2, no simulated warning during a refund** (`fix8-simulate`). `#simulateNow` refuses (`cannot_simulate`)
+  a captured booking whose refund is being sent or pending, as `proposeReschedule` does since §16 S2, so the
+  once-only warning isn't spent on a booking the agent can't move. The page's control is off with the same
+  reason while the newest booking's `refund_pending` is set (on a captured booking that is exactly
+  `refundStarted`).
+- **D3, a refund whose reply was lost** (`fix8-lostreply`). PayPal refunded, but both client attempts lost the
+  reply, so the operation stayed `sending`; its `PAYMENT.CAPTURE.REFUNDED` (custom_id = the booking) only
+  refreshed `pending` refunds and was marked completed. Now the webhook's refund branch also runs
+  `#recoverSendingNow`: when the event's refund is unknown to the booking, names it, and an operation is
+  `sending` (at most one is), the refund is read back by GET (nothing is sent, so nothing can be refunded
+  twice), logged `refund.recovered`, and recorded on that operation by `#applyRefund` (which fails closed on
+  another amount or currency, and withdraws a waiting move on completion). Only COMPLETED or PENDING is
+  recorded; a failed refund that can't be tied to the operation leaves it `sending`. A GET that fails
+  answers 500, so PayPal redelivers. And a resend (the operation was already `sending`) that PayPal refuses
+  outright no longer frees the reservation: the first send may have refunded (a request id no longer
+  deduped is answered e.g. 422 `CAPTURE_FULLY_REFUNDED`), so the operation and the booking go to
+  `needs_review` (`refund.resend_refused`; the caller gets `refund_under_review`). A first send refused
+  outright is `failed` as before.
+- **D4, a held move says what it waits on** (`fix8-hold`). A move proposed before a refund started stays
+  `proposed` while that refund is being sent or pending, and for good once the booking is held for review,
+  but the guide can't answer it then. `summary()` adds `reschedule_hold` (`rescheduleHold(b)`: null when
+  nothing is proposed or the guide can answer; otherwise "a refund of the deposit is under way" or "the
+  booking is held for review"). It is derived, not stored: a pending refund that fails makes the move
+  answerable again. `get_booking`'s description and the system prompt define `proposed` as answerable only
+  while the booking is captured and no refund has started; `refund_payment`'s says a pending or in-review
+  refund puts a waiting move on hold. The card reads "Reschedule to {date}: proposed, but the guide can't
+  answer it while {hold}."
+- **D5, the card after a partial refund and a mismatched reply** (`fix8-card`). The withdrawn reason follows
+  the amounts (refunded less than captured: "part of the deposit was refunded"), not the status, which may
+  be `needs_review` by then. `summary()` adds `refund_review` (the amount held for review), and
+  `paymentLine` gives it its own line ("A refund needs review: PayPal's reply about the refund of {amount}
+  didn't match what was sent ... The deposit ... was paid"), instead of the capture's "did not match the
+  approved mandate".
+- **Earlier tests** that posted a bare `{action: accept/decline_reschedule}` post what the page's form posts
+  (the proposal key; read from the page in the HTTP tests). `SCHEMA_VERSION` stays 2: `reschedule.n` is
+  optional.
