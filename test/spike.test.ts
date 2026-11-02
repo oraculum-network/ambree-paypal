@@ -278,7 +278,7 @@ describe("spike run against the fake", () => {
   it("names every issue of the refusal, and says the service reads only the first", async () => {
     const h = harness(["--payee-email", "g@business.example.com", "--poll", "1"]);
     // e1, e2 and e4 go through; e5's refusal carries two issues.
-    for (let i = 0; i < 3; i++) h.fake.failNext({ method: "POST", path: /\/refund$/, pass: true });
+    for (let i = 0; i < 3; i++) h.fake.failNext({ method: "POST", path: /\/refund$/, status: 0, pass: true });
     h.fake.failNext({
       method: "POST",
       path: /\/refund$/,
