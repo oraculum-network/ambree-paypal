@@ -63,6 +63,26 @@ function lastTraveller(messages: ChatMessage[]): string {
   return "";
 }
 
+const money = (m: { currency_code?: string; value?: string } | null | undefined) => `${m?.currency_code} ${m?.value}`;
+
+/**
+ * What the traveller is told after refund_payment answered. "Done ... refunded" only when a refund
+ * completed: one pending at PayPal says so, one held for review says so, and an earlier refund the call
+ * reported (acknowledged: its own call never heard PayPal's answer) says it was that one.
+ */
+export function refundReply(r: Record<string, any>): string {
+  const ack = r.acknowledged as { status?: string; amount?: { currency_code?: string; value?: string } } | undefined;
+  if (ack) {
+    return ack.status === "completed"
+      ? `Your earlier refund request did go through: ${money(ack.amount)} was refunded to you from the guide's PayPal. Nothing new was sent (booking ${r.status}).`
+      : `Your earlier refund request reached PayPal: ${money(ack.amount)} is pending at PayPal and isn't complete yet. Nothing new was sent; I'll tell you when it completes.`;
+  }
+  if (r.status === "needs_review") return `The refund is held for review: PayPal's answer about it didn't settle it, so nothing is counted as refunded and nothing more is refunded until a person checks it (booking ${r.status}).`;
+  if (r.refund_pending) return `The refund of ${money(r.refund_pending)} is pending at PayPal: it isn't complete yet, and I'll tell you when it is (booking ${r.status}).`;
+  if (r.status === "refunded" || r.status === "partially_refunded") return `Done: ${money(r.refunded)} refunded to you from the guide's PayPal (booking ${r.status}).`;
+  return `PayPal didn't complete the refund, so nothing was refunded (booking ${r.status}).`;
+}
+
 export class ScriptedModel implements ChatModel {
   readonly label = "scripted model (offline demo)";
   readonly #today: () => string;
@@ -119,7 +139,7 @@ export class ScriptedModel implements ChatModel {
     } catch {
       r = {};
     }
-    if (r.error) return say(`That didn't work: ${r.error}`);
+    if (r.error) return say(last.name === "refund_payment" && /^refund_unconfirmed:/.test(String(r.error)) ? `I couldn't confirm the refund yet: ${r.error}` : `That didn't work: ${r.error}`);
     switch (last.name) {
       case "search_guides": {
         const guides = (r.guides ?? []) as Array<{ guide_id: string; name: string; typical_price_per_person: string }>;
@@ -149,7 +169,7 @@ export class ScriptedModel implements ChatModel {
       case "propose_reschedule":
         return say(`${this.#simulatedWarning(messages) ? "A simulated cyclone warning (demo)" : "A cyclone warning"} covers the day, so trails won't be safe. I've asked the guide to move the trip to ${r.reschedule?.new_date}; if they can't, I'll refund your deposit.`);
       case "refund_payment":
-        return say(`Done: ${r.refunded?.currency_code} ${r.refunded?.value} refunded to you from the guide's PayPal (booking ${r.status}).`);
+        return say(refundReply(r));
       default:
         return say("Done.");
     }
