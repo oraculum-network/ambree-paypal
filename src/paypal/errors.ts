@@ -9,6 +9,8 @@ export interface PayPalErrorInit {
   call: string;
   code?: string;
   issue?: string;
+  /** Every details[].issue, in order. Default: `[issue]`, or none. */
+  issues?: readonly string[];
   debugId?: string;
   message: string;
   /** Default: a network error, a timeout or a 5xx. */
@@ -24,6 +26,8 @@ export class PayPalError extends Error {
   readonly code: string | undefined;
   /** The first details[].issue, e.g. ORDER_NOT_APPROVED. */
   readonly issue: string | undefined;
+  /** Every details[].issue name, in PayPal's order (at most 10). `issue` stays details[0]'s, the one the service reads. */
+  readonly issues: readonly string[];
   readonly debugId: string | undefined;
   /** "POST /v2/checkout/orders/{id}/capture": the method and path template, no ids or query. */
   readonly call: string;
@@ -43,6 +47,7 @@ export class PayPalError extends Error {
     this.call = init.call;
     this.code = init.code;
     this.issue = init.issue;
+    this.issues = init.issues ?? (init.issue ? [init.issue] : []);
     this.debugId = init.debugId;
     this.maybeDelivered = init.maybeDelivered ?? (init.kind === "network" || init.kind === "timeout" || init.status >= 500);
   }
@@ -60,6 +65,7 @@ export class PayPalError extends Error {
 }
 
 const MAX_TEXT = 200;
+const MAX_ISSUES = 10;
 
 function short(s: unknown): string | undefined {
   return typeof s === "string" && s.length > 0 ? s.slice(0, MAX_TEXT) : undefined;
@@ -70,12 +76,14 @@ export function errorFromBody(status: number, call: string, body: unknown): PayP
   const b = (body && typeof body === "object" ? body : {}) as Record<string, unknown>;
   const details = Array.isArray(b.details) ? (b.details as Array<Record<string, unknown>>) : [];
   const oauth = short(b.error);
+  const issues = details.map((d) => short(d?.issue)).filter((i): i is string => i !== undefined).slice(0, MAX_ISSUES);
   return new PayPalError({
     kind: status === 401 || oauth ? "auth" : "http",
     status,
     call,
     code: short(b.name) ?? oauth,
     issue: short(details[0]?.issue),
+    issues,
     debugId: short(b.debug_id),
     message: short(details[0]?.description) ?? short(b.message) ?? short(b.error_description) ?? `HTTP ${status}`,
   });
