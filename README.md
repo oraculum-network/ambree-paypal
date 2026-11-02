@@ -51,16 +51,22 @@ Ambree never holds your money. PayPal sandbox only.
     goes to `needs_review` and is not marked paid.
   - "Paid" and "refunded" mean PayPal said `COMPLETED`. The page shows "Payment pending", "Payment failed"
     or "Payment needs review" otherwise, "Refund under way" while a refund is being sent or pending, "A
-    refund needs review" when a refund reply didn't match, and "A refund is held for review" when PayPal
-    gave no definitive answer about one.
+    refund needs review" when a refund reply didn't match or PayPal reports money refunded that no refund of
+    the booking accounts for, and "A refund is held for review" when PayPal gave no definitive answer about
+    one.
   - It refunds only when a real cyclone warning covers the day, the guide declined the reschedule, or the
     guide offered the refund. The hosted demo's simulated warning never allows a refund by itself: it only
     gets Ambree to ask the guide for a new date. Each refund is saved (amount and PayPal-Request-Id) before it
     is sent, and retried unchanged.
   - A refund whose outcome is unknown (a lost reply, a timeout or a 5xx, even inside the client's own retry)
     is never marked failed by a later refusal: it is held for review, still reserved, until its own webhook
-    settles it. The agent is told it may have gone through. Its next `refund_payment` resends the same
-    refund, or reports it if PayPal has confirmed it since: one intended refund is never refunded twice.
+    settles it (found by the refund's custom_id or, without one, its capture), or, if that never comes, a
+    person reconciles it. The agent is told it may have gone through. Its next `refund_payment` resends the
+    same refund, or reports it if PayPal has confirmed it since: one intended refund is never refunded twice.
+  - A refund PayPal reports on the booking that no refund the booking sent accounts for (say, a second
+    refund made for one request if PayPal doesn't dedupe it, or one made outside the app), or a total
+    refunded at PayPal above what the booking accounts for, holds the booking for review with that amount
+    shown as held. It never clears by itself, and nothing more is refunded meanwhile.
   - PayPal's refund reply must carry exactly that currency and amount. A missing or different amount puts
     the booking in `needs_review`: nothing is counted as refunded and no success is announced.
   - A refund that ends `FAILED` or `CANCELLED` releases its reserved amount. PayPal's GET decides: after a
@@ -112,7 +118,8 @@ refused (it fails closed); the spike checks this (DESIGN.md §5 S6).
 A refund whose PayPal reply doesn't match what was sent puts the booking in `needs_review`, and it stays
 there even if a later refund completes. While any refund is in review, new refunds and retries on that
 booking are refused (`refund_under_review`). The one exception: a refund held only because PayPal's answer
-about it was unknown leaves review when that refund's own webhook settles it (DESIGN.md §18).
+about it was unknown leaves review when that refund's own webhook settles it (DESIGN.md §18). A refund PayPal
+reports that no refund of the booking accounts for holds it in review for good too (DESIGN.md §19).
 
 ## Run it locally (no keys needed)
 
@@ -209,7 +216,9 @@ npx playwright test
     - pending captures and refunds;
     - refund retries, and a refund whose outcome is unknown, in every order of the signals that settle it
       (`test/fix9-*.test.ts`: the client's retry reply, the refund's webhook, the agent's resend and
-      `get_booking`);
+      `get_booking`), and again with refund webhooks that carry no custom_id and with a PayPal that doesn't
+      dedupe a repeated request id (`test/fix10-*.test.ts`), where every refund PayPal made must end up
+      counted or held;
     - webhook redelivery;
     - log redaction;
     - the ledger checkpoint;

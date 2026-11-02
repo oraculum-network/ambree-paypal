@@ -189,6 +189,10 @@ Then the webhook, once the site answers:
    - URL: `https://paypal.ambree.ai/webhooks/paypal`.
    - Events: `CHECKOUT.ORDER.APPROVED`, `PAYMENT.CAPTURE.COMPLETED`, `PAYMENT.CAPTURE.REFUNDED`,
      `PAYMENT.CAPTURE.PENDING`, `PAYMENT.CAPTURE.DECLINED`, `PAYMENT.CAPTURE.REVERSED`.
+   - TODO-CHECK: add the refund failure events too, by their exact names in the dashboard's list (spike S11).
+     The handler already takes any `PAYMENT.REFUND.*`, such as a refund that was PENDING and then failed.
+     Without them, such a refund held for an unknown outcome gets no notice, and a person reconciles it
+     (DESIGN.md §19).
 2. Store its id with step 3's `ssh` line for `PAYPAL_WEBHOOK_ID` alone, then restart.
 3. TODO-CHECK: one `POST /v1/notifications/simulate-event`, or a real checkout, shows a `webhook.*` row in the
    ledger.

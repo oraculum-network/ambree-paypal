@@ -107,7 +107,9 @@ bookings(id, conversation_id, guide_id, activity, area, date, party_size, status
          captured{currency_code,value}?, refunded_minor, refund_ids[], reschedule?{new_date,status,n?}, refund_offered,
          refund_ops[{n, request_id, amount_minor, full, reason,
                      status: sending|pending|completed|failed|needs_review, refund_id?,
-                     maybe_sent?, review_cause?: unknown|mismatch|already_refunded, acknowledged?}],   -- §18
+                     maybe_sent?, review_cause?: unknown|mismatch|already_refunded|unexplained,
+                     acknowledged?, evidence?}],                                                       -- §18, §19
+         paypal_refunded_minor?,                                                                         -- §19
          created_at, updated_at)                                                                         -- records table, JSON
 mandates(id, booking_id, amount{currency_code,value}, payee, quote_hash, nonce, expires_at,
          step_up_hash, attempts, status: proposed|approved|used|expired|locked)                          -- records table, JSON
@@ -119,7 +121,8 @@ webhook_events(event_id PRIMARY KEY, event_type, received_at)                   
   A definitive create failure goes back to `priced`. `needs_review` (the order or capture doesn't match
   the mandate, a capture PayPal already reports refunded before it was recorded as paid, or a refund held
   for review) and `capture_failed` stop the money steps. Only a refund held because its outcome was unknown
-  ever leaves review, when its own webhook settles it (§18).
+  ever leaves review, when its own webhook settles it (§18). A refund PayPal reports that no refund of the
+  booking accounts for, or a PayPal total above what it accounts for, holds it for good (§19).
   `declined` (the guide said no) and `cancelled` are terminal. A reschedule keeps the status and changes `date`.
 - **Reschedule:** `proposed → accepted | declined`, or `withdrawn` when a refund (part or all of the deposit,
   §15, §16) completes before the guide answered. It can be proposed and answered only while the booking is
@@ -194,7 +197,7 @@ only on network errors or 5xx, and only for calls that carry a `PayPal-Request-I
 | S8 | Does a personal sandbox account work as payee (concept A's question)? Not needed for B | optional run |
 | S9 | Currency: EUR versus USD for an MU business sandbox account | run once with each |
 | S10 | JS SDK v6 buttons versus the redirect approve link for a third-party payee | not in the spike; the build uses the approve link (redirect) first |
-| S11 | Does `GET /v1/identity/openidconnect/userinfo?schema=openid`, called with the **app's client-credentials token**, describe the REST app's owner, and is its `payer_id` the owner's merchant id (equal to the id in the sandbox dashboard)? If not, which documented call returns the app owner's merchant id? | row "a2 identity": prints payer_id, user_id, account_type and the field names (never a token). Compare payer_id with the dashboard's merchant id |
+| S11 | (Round 10 adds the refund premises listed at the end of §19 to this run.) Does `GET /v1/identity/openidconnect/userinfo?schema=openid`, called with the **app's client-credentials token**, describe the REST app's owner, and is its `payer_id` the owner's merchant id (equal to the id in the sandbox dashboard)? If not, which documented call returns the app owner's merchant id? | row "a2 identity": prints payer_id, user_id, account_type and the field names (never a token). Compare payer_id with the dashboard's merchant id |
 
 ## 6. The agent's tools (one registry: `src/tools/`; served to the model and over MCP)
 
@@ -582,7 +585,9 @@ Five findings from the independent reviewers, each with a test that failed at 77
   outright is `failed` as before (superseded in round 9, §18 I1: not when an attempt of it may have reached
   PayPal inside the client, nor when PayPal says the money already moved; and such a hold can now clear). **UNVERIFIED** (spike): that the refund resource in PayPal's refund
   webhooks carries the `custom_id` we send. Without it a refund with no known id finds no booking, and the
-  event completes unused as before (the next `refund_payment` still resends the operation).
+  event completes unused as before (the next `refund_payment` still resends the operation). Corrected in
+  round 10 (§19 F2): that resend holds only for an operation still `sending`, not for one held for an
+  unknown outcome; and a refund without custom_id now finds its booking by the capture in its `up` link.
 - **D4, a held move says what it waits on** (`fix8-hold`). A move proposed before a refund started stays
   `proposed` while that refund is being sent or pending, and for good once the booking is held for review,
   but the guide can't answer it then. `summary()` adds `reschedule_hold` (`rescheduleHold(b)`: null when
@@ -648,10 +653,11 @@ The code now keeps four invariants whatever the order.
   the operation through `#applyRefund`: COMPLETED becomes completed, PENDING becomes pending, FAILED or
   CANCELLED becomes failed and frees the reservation (`refund.recovered`, `from: sending | needs_review`).
   A COMPLETED or PENDING refund of another amount still holds the operation for good (`review_cause:
-  "mismatch"`, `refund.reconcile_failed`), as before. A FAILED or CANCELLED refund of another amount moved no
+  "mismatch"`, `refund.reconcile_failed`), as before (superseded in round 10, §19 I5: such a refund doesn't
+  match the operation, so it is held as its own unexplained entry and the operation stays unknown). A FAILED or CANCELLED refund of another amount moved no
   money and isn't this operation's. It is logged (`refund.evidence_unmatched`), and the operation stays
   unknown and reserved. Holding a booking for good over a refund that moved nothing would be new behaviour,
-  so this reading of "a mismatch holds for review" is the CTO's to confirm. `#applyRefund` now derives the
+  so this reading of "a mismatch holds for review" is the CTO's to confirm (kept in round 10, §19). `#applyRefund` now derives the
   booking's status from its refunds (`statusFromRefunds`: any operation in review means `needs_review`;
   otherwise `refunded`, `partially_refunded` or `captured` by what was refunded). So a booking held only by
   an unknown outcome leaves review once that is settled, and a waiting move is withdrawn if money came back
@@ -726,5 +732,191 @@ every new field is optional.
 **UNVERIFIED** (spike): that PayPal answers a repeated `PayPal-Request-Id` with the first reply (the fake
 does, so R8-1's stale PENDING replay is modelled on it); that the refund resource in refund webhooks, and in
 `GET /v2/payments/refunds/{id}`, carries the `custom_id` we send (without it, no booking is found and the
-event completes unused, so the next `refund_payment` still resends); and the names of PayPal's refund
+event completes unused, so the next `refund_payment` still resends; corrected in §19 F2: only a `sending`
+operation is resent, and the booking is now found by the refund's capture); and the names of PayPal's refund
 webhooks beyond `PAYMENT.CAPTURE.REFUNDED` (the handler takes any `PAYMENT.REFUND.*`).
+
+## 19. Round 10: no refund evidence is dropped; a refund found by its capture; any settle closes a move (2 Nov)
+
+Round 9's five findings (R9-1 to R9-5) each rest on PayPal behaviour nobody has verified yet. Each fix is small
+and fails closed, so the app is right under either premise:
+
+- **R9-1, R9-4 (medium).** Suppose PayPal doesn't dedupe a repeated `PayPal-Request-Id`. Then the client's own
+  retry of a refund (or the agent's resend) makes a second refund. The first refund's webhook names the booking,
+  but its id was on no operation and no operation's outcome was unknown. So `#resolveUnknownNow` returned, and
+  the event was answered 200 with nothing recorded: PayPal had moved 20.00, the booking counted 10.00, and
+  nothing was held. In R9-4's second form, a FAILED refund matched by amount freed the unknown operation while a
+  COMPLETED duplicate went unrecorded, and the agent's retry then refunded again.
+- **R9-2, R9-5 (low).** A refund webhook without `custom_id` found no booking: the capture id was only in its
+  links. So a refund held for an unknown outcome never cleared. Also, the hosted webhook isn't subscribed to the
+  refund failure events.
+- **R9-3 (low).** Only the COMPLETED branch withdrew a waiting move.
+
+Three words are used with one meaning throughout:
+
+- A refund **names** the booking when its `custom_id` is the booking's id. With no `custom_id`, it names the
+  booking when its `links[rel=up]` is `/v2/payments/captures/{the booking's capture_id}`. Nothing in it may name
+  another booking or capture (`namesBooking`, `namesOther`, `refundCaptureId` in `src/booking/service.ts`).
+- It **matches** the booking's one operation whose outcome is unknown when it carries that operation's amount in
+  the capture's currency.
+- The booking **accounts for** every refund on it that isn't `failed`: completed, pending, being sent, held, and
+  unexplained entries (`accountedMinor`, the same sum as `reservedMinor`).
+
+**I5, no refund evidence is dropped silently.** For every refund event (`PAYMENT.CAPTURE.REFUNDED`, any
+`PAYMENT.REFUND.*`), `handleWebhook` runs the strict `#refreshNow`, then `#refundEvidenceNow`, which replaces
+`#resolveUnknownNow`. If the event's refund is on no operation and names the booking, it is read back by GET. A
+GET that names another booking or capture is ignored. Then, on the booking as stored after the GET:
+
+- **It matches the unknown operation.** That operation is settled by `#applyRefund` as in round 9 (I2), whatever
+  the status.
+- **Otherwise FAILED or CANCELLED: logged only.** If an operation's outcome is unknown, the row is
+  `refund.evidence_unmatched`, as before. That is round 9's open question 1, answered: a refund that moved no
+  money neither settles nor holds anything, and the unknown operation stays unknown and reserved. If none is
+  unknown, the row is `refund.unexplained` with `held: false`.
+- **Otherwise (COMPLETED, PENDING or any other status): an evidence entry.** It goes on `refund_ops` with
+  `evidence: true`, `status: needs_review`, `review_cause: "unexplained"`, its `refund_id` and its
+  `amount_minor`. Its `request_id` "paypal-{id}" is a label; nothing is sent with it. It is logged
+  `refund.unexplained` with `held: true`. The entry is reserved and held:
+  - `statusFromRefunds` gives `needs_review`;
+  - `summary().refund_review` includes its amount, and `refund_review_cause` says `unexplained` (the order is
+    mismatch, already_refunded, unexplained, unknown);
+  - `#reserveRefund` refuses every new refund and every resend while it is there (`UNDER_REVIEW.unexplained`).
+  It never clears automatically: `#refreshNow` reads only pending operations, and the evidence path never weighs
+  its refund again, since that id is now on an entry. A person reconciles it.
+- **Changed from round 9.** A COMPLETED or PENDING refund of another amount, arriving while an operation is
+  unknown, used to turn that operation into a `mismatch` hold. That held the operation's own amount, and its own
+  refund was then dropped. Such a refund doesn't match, so it is now its own unexplained entry and the
+  operation stays unknown. The operation's own evidence still settles it, and refunded plus held equals what
+  PayPal moved.
+- **A GET that fails throws.** The webhook answers 500 and PayPal redelivers. So a refund event is answered 200
+  only once its evidence is recorded, or found to need nothing.
+- **Another refund id.** `#applyRefund` also holds as a mismatch an answer that names a different refund id from
+  the one its operation recorded (a GET of a pending refund). The service never applies one otherwise, so this
+  check is defensive.
+
+**F1, PayPal's total refunded.** This depends on an UNVERIFIED premise: that the refund reply and the GET carry
+`seller_payable_breakdown.total_refunded_amount`, and that it is the capture's running total of completed
+refunds. Every save of a refund change goes through `#saveRefunds`:
+
+- It keeps the largest total seen in `paypal_refunded_minor`. A total in another currency, or none, changes
+  nothing.
+- `refundTotalExcess` is that total minus what the booking accounts for, and never less than 0. Above 0 it holds
+  the booking: `needs_review`, cause `unexplained`, the excess counted in `refund_review`. It is logged
+  `refund.unexplained` with `source: "total_refunded_amount"` when it grows.
+- **A deviation from the brief's "completed plus this one".** The comparison uses everything the booking
+  accounts for, including operations that are pending, being sent or unknown, since their money may already be
+  in PayPal's total. Counting completed refunds only would raise a false hold: when one refund completes while
+  another operation's reply was lost, the other's own evidence would then count it twice (`fix10-evidence`,
+  "kept: an operation pending or unknown counts as accounted").
+- **The excess is derived, not stored as an entry.** So evidence that later names the refund behind it replaces
+  it rather than adding to it: the excess falls as entries account for it, and each entry holds the booking
+  itself. That is the only way it falls. No operation is reserved while the booking is held, and settling an
+  operation never raises what the booking accounts for.
+- With the field absent, the check is skipped and I5 alone applies.
+
+**R9-4's second half** is covered once the other refund's evidence holds the booking, in either order
+(`fix10-evidence`, "R9-4 (C2)"):
+
+- **FAILED first.** The operation fails (it matches). R2's webhook then holds the booking as unexplained, and the
+  agent's retry is refused.
+- **COMPLETED first.** R2 settles the operation, and R1's FAILED is logged only.
+
+What remains: R2's evidence never arrives (its webhook is lost, or never sent), and the FAILED came first. The
+booking then says captured with 0.00 refunded, while PayPal has refunded 10.00, and the agent's next
+`refund_payment` would send a new refund. With `total_refunded_amount` present, the FAILED refund's own GET
+already shows R2's 10.00, so the booking is held at that step. Without it, nothing in the service can tell; a
+person has to compare with the capture at PayPal. Payments v2 has no call that lists a capture's refunds. A GET
+of the capture's status (`PARTIALLY_REFUNDED`) would be a weak hint, and isn't done.
+
+**F2, a refund found by its capture.** When the resource has no `custom_id` and its id is on no booking,
+`#findForResource` falls back to the capture named by `links[rel=up]` (`refundCaptureId`). It takes only
+`/v2/payments/captures/{id}`, because a capture's own `up` link is its order. `#refundEvidenceNow` uses
+`namesBooking` and `namesOther`; the amount and currency checks are unchanged.
+
+This corrects §17 D3 and §18's UNVERIFIED paragraph. "Without custom_id ... the next `refund_payment` still
+resends" held only for an operation still `sending`. An operation held for an unknown outcome (after a refused
+retry or resend) is never resent, and `get_booking` doesn't read it (it has no refund id), so before round 10
+nothing could clear it. Now its refund's webhook settles it by the capture link. It still stays held until a
+person reconciles it if PayPal's refund webhooks carry neither `custom_id` nor that link, or if the event never
+comes. A failure event the hosted webhook isn't subscribed to yet is one case (DEPLOY.md's new TODO-CHECK for the
+refund failure events, whose exact names are to be read off the dashboard in spike S11).
+
+The traveller's card no longer promises the notice: "Nothing more is refunded meanwhile: if PayPal's notice
+doesn't settle it, a person will reconcile it." The agent-facing `refund_under_review` texts say the same. An
+unexplained hold has its own line: "A refund needs review: PayPal reports {held} refunded on this booking that
+no refund this booking sent accounts for, so more may have come back to you than it shows. Nothing more is
+refunded until a person reconciles it." Before, it fell into the "didn't match what was sent" line, but nothing
+had been sent.
+
+**F3, any settle closes a waiting move.** Every branch of `#applyRefund` (completed, pending, failed, mismatch),
+and the evidence entry, saves through `#saveRefunds`. It derives the status from the refunds. When that status
+is `refunded` or `partially_refunded` and a move is still `proposed`, it withdraws the move in the same save and
+logs `reschedule.withdrawn` after the branch's own rows. No other path sets those statuses. A hold in that same
+save keeps the move, as in §16. A move that an earlier settle withdrew stays withdrawn when a later hold comes.
+
+**Tests** (`test/fix10-*.test.ts`). The red runs were at 8ea717f: 95f8312's service, plus only the fake's new
+controls (8573cad: `dedupe`, `refundCustomId`, `refundTotals`, `replyAfter`). Three files:
+
+- **`fix10-evidence`** reproduces R9-1 to R9-5 and pins I5, F1, F2 and F3. 23 of its 27 tests failed at
+  8ea717f; the 4 that passed are guards. One red test was later replaced, so it still has 27. That test assumed
+  an operation's resend could be answered with a refund already held as unexplained. It can't: the hold refuses
+  the resend first. So it became a test of that refusal.
+- **`fix10-matrix-nocustom`** is round 9's 324 cases with refund resources that carry no `custom_id`. It ends as
+  round 9 does: the refund's own webhook arrived, so nothing is held. 258 of 324 failed.
+- **`fix10-matrix-nodedupe`** has 504 cases in which PayPal doesn't dedupe a repeated request id. Attempt 1
+  makes R1 and loses its reply. PayPal completes R1, or makes it PENDING and then completes or fails it. The
+  client's retry reaches PayPal at once: it makes R2 for 10.00 of 30.00, or for the whole deposit it is refused
+  422 (nothing is left). Its reply is answered or lost when R arrives. Then come every arrival order of the
+  retry's reply, R1's webhook, R2's webhook and the agent's resend (no resend after a 201), and then every other
+  refund webhook PayPal sent (a resend's R3). Each of those runs with `custom_id` on and off, and with
+  `total_refunded_amount` on and off. 404 of 504 failed. There is no `get_booking` signal: no operation is ever
+  pending in this grid (R2 and R3 complete at once), so it reads nothing.
+- **Both matrices assert at the end:**
+  - the money truth: PayPal's completed refunds equal `refunded_minor` plus every amount held for review;
+  - every refund PayPal completed is on the booking exactly once;
+  - nothing is left pending, sending or unknown;
+  - at most one unknown operation at every step.
+  The nodedupe grid also asserts:
+  - at most 3 refund POSTs;
+  - held money means `needs_review`, and otherwise the status and the move follow the money.
+- **Green, step by step.**
+  - df4179f (F2): nocustom 0 failing, nodedupe 304, evidence 20.
+  - 0ad60f8 (F3): evidence 18.
+  - c1956e4 (I5, F1): nodedupe 0, evidence 4.
+  - 134ae9c (the texts): evidence 1.
+  - This section's commit, with DEPLOY.md: 0.
+
+**Earlier tests whose meaning changed** (all through I5's "matches"):
+
+- `fix9-outcome` R8-4, "an event of another amount". It used to turn the unknown hold into a mismatch. Now the
+  5.00 is held as unexplained beside it, and the unknown refund's own event completes it, with the booking still
+  in review.
+- `fix9-outcome` I1, `already_refunded` (both issues). The out-of-band 30.00 is now recorded beside the hold.
+- `fix8-lostreply` D3, "fails closed: a refund event whose amount isn't the operation's". The 5.00 is its own
+  unexplained entry, and the operation stays `sending`.
+
+`SCHEMA_VERSION` stays 2: `evidence` and `paypal_refunded_minor` are optional, and `unexplained` is one more value
+of an optional field.
+
+**Verify in spike S11** (each one the code now depends on, and what happens if it is false):
+
+- **Dedupe.** That PayPal answers a repeated `PayPal-Request-Id` on `POST /v2/payments/captures/{id}/refund` with
+  the first reply. If it doesn't, I5 and F1 catch the extra refund and hold the booking. This is the only
+  premise that decides whether one intent can cost two refunds.
+- **`custom_id`.** That the refund resource in refund webhooks, and in `GET /v2/payments/refunds/{id}`, carries
+  the `custom_id` we send. If it doesn't, F2's capture link is the fallback.
+- **The `up` link.** That the same resources carry `links[rel=up]` to `/v2/payments/captures/{id}`. If neither
+  this nor `custom_id` is there, a refund with no known id finds no booking, an unknown hold waits for a person,
+  and I5 can't see a duplicate.
+- **The resource.** That `PAYMENT.CAPTURE.REFUNDED`'s resource is the refund (its id is a refund id), as the
+  fake assumes.
+- **The failure events.** The exact names of PayPal's refund failure events (`PAYMENT.REFUND.FAILED`?
+  `PAYMENT.REFUND.CANCELLED`?), to subscribe to (DEPLOY.md's TODO-CHECK).
+- **The total.** That `seller_payable_breakdown.total_refunded_amount` is present on the refund reply and on GET,
+  in the capture's currency. Also whether it counts only completed refunds or pending ones too. Pending counted
+  only over-holds, which fails closed. And whether a GET shows the running total or the total when that refund
+  was made. A stale total only under-detects, and I5 still applies.
+- **PENDING then FAILED.** That a sandbox refund can be PENDING and later FAILED or CANCELLED. That is the path
+  R9-3 and R9-4 (C2) rest on.
+- **The refusal issues.** Which 422 issue PayPal answers a refused retry or resend with (`CAPTURE_FULLY_REFUNDED`,
+  `REFUND_AMOUNT_EXCEEDED`?). Either way, round 9's I1 holds it.
