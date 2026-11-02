@@ -5,9 +5,10 @@ const money = (m) => (m ? `${m.currency_code} ${m.value}` : "");
 const cents = (m) => Math.round(Number(m.value) * 100);
 
 /**
- * A booking held for review because of a refund (`refund_review`: PayPal's reply about it didn't match
- * what was sent) says that, and that the deposit was paid; one held because the order or capture didn't
- * match the mandate says that instead.
+ * A booking held for review because of a refund (`refund_review`) says that, and that the deposit was paid:
+ * held only because PayPal gave no definitive answer about the refund (`refund_review_cause` "unknown"), so
+ * it may have gone through and PayPal's notice may still settle it; or because PayPal's reply about it
+ * didn't match what was sent. One held because the order or capture didn't match the mandate says that.
  * @returns {{ testid: string, text: string } | null}
  */
 export function paymentLine(b) {
@@ -23,11 +24,24 @@ export function paymentLine(b) {
     case "capture_failed":
       return { testid: "payment-failed", text: `Payment failed: PayPal reported ${b.capture.status ?? "a failure"}; nothing was paid to ${b.guide.name}.` };
     default:
+      if (b.refund_review && b.refund_review_cause === "unknown") {
+        return { testid: "refund-review", text: `A refund is held for review: PayPal gave no definitive answer about the refund of ${money(b.refund_review)}, so it may have gone through. Nothing more is refunded until PayPal's notice settles it or a person checks it. The deposit, ${amount} to ${b.guide.name}, was paid (capture ${b.capture.id}).` };
+      }
       if (b.refund_review) {
         return { testid: "refund-review", text: `A refund needs review: PayPal's reply about the refund of ${money(b.refund_review)} didn't match what was sent, so nothing more is refunded until a person checks it. The deposit, ${amount} to ${b.guide.name}, was paid (capture ${b.capture.id}).` };
       }
       return { testid: "payment-review", text: `Payment needs review: PayPal's reply did not match the approved mandate (status ${b.capture.status ?? "unknown"}).` };
   }
+}
+
+/**
+ * The card's line while a refund is being sent or is pending at PayPal (`refund_pending`), so the card
+ * doesn't say only "Paid" while money is on its way back. Null otherwise.
+ * @returns {{ testid: string, text: string } | null}
+ */
+export function refundLine(b) {
+  if (!b.refund_pending) return null;
+  return { testid: "refund-pending", text: `Refund under way: ${money(b.refund_pending)} back to you from ${b.guide.name}; PayPal hasn't confirmed it yet.` };
 }
 
 /**

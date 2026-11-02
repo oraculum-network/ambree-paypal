@@ -1,6 +1,6 @@
 // The chat page: talks to /api/chat and /api/state, renders the approval card, pay button, guide's
 // phone, inbox and ledger. Polls state so guide answers and webhooks show up without a reload.
-import { demoMessage, demoView, paymentLine, rescheduleLine, simulateControl } from "/labels.js";
+import { demoMessage, demoView, paymentLine, refundLine, rescheduleLine, simulateControl } from "/labels.js";
 
 // The session cookie (HttpOnly) is the traveller's authority. Each tab keeps its own conversation id in
 // sessionStorage and sends it with every request; the server checks the session owns it.
@@ -88,6 +88,8 @@ function render(s) {
     if (b.order && b.order.approve_url && b.status === "order_created") c.append(el("a", { class: "button pay", href: b.order.approve_url, "data-testid": "pay" }, "Pay the guide in PayPal"));
     const pay = paymentLine(b);
     if (pay) c.append(el("p", { "data-testid": pay.testid }, pay.text));
+    const back = refundLine(b);
+    if (back) c.append(el("p", { "data-testid": back.testid }, back.text));
     if (b.refunded && b.refunded.value !== "0.00") c.append(el("p", { "data-testid": "refunded" }, `Refunded ${money(b.refunded)}.`));
     if (b.simulated_warning) c.append(el("p", { class: "small", "data-testid": "simulated-warning" }, `Simulated cyclone warning (demo) for ${b.simulated_warning.date}: not a real warning.`));
     const move = rescheduleLine(b);
