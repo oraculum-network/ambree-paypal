@@ -23,7 +23,8 @@ export function paymentLine(b) {
 
 /**
  * The card's line for a move the agent proposed. "withdrawn": a refund of the deposit (part or all of it)
- * completed before the guide answered, so the move was closed (the guide's page no longer asks).
+ * completed before the guide answered, so the move was closed (the guide's page no longer asks). A
+ * proposed move the guide can't answer now (`reschedule_hold`: a refund under way, or a review) says why.
  * @returns {{ testid: string, text: string } | null}
  */
 export function rescheduleLine(b) {
@@ -33,6 +34,7 @@ export function rescheduleLine(b) {
     const why = b.status === "partially_refunded" ? "part of the deposit was refunded" : "the deposit was refunded";
     return { testid: "reschedule", text: `Reschedule to ${r.new_date}: withdrawn, because ${why}.` };
   }
+  if (r.status === "proposed" && b.reschedule_hold) return { testid: "reschedule", text: `Reschedule to ${r.new_date}: proposed, but the guide can't answer it while ${b.reschedule_hold}.` };
   return { testid: "reschedule", text: `Reschedule to ${r.new_date}: ${r.status}` };
 }
 

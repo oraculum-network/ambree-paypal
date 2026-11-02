@@ -155,6 +155,18 @@ export function rescheduleAnswerable(b: Booking): boolean {
 }
 
 /**
+ * Why the guide can't answer a proposed move now, or undefined (nothing is proposed, or they can). The move
+ * stays `proposed` meanwhile: a refund being sent or pending may still fail (and the guide can then answer),
+ * and a booking held for review keeps its move as it was until a person has looked.
+ */
+export function rescheduleHold(b: Booking): string | undefined {
+  if (b.reschedule?.status !== "proposed" || rescheduleAnswerable(b)) return undefined;
+  if (b.status === "needs_review") return "the booking is held for review";
+  if (b.status === "captured") return "a refund of the deposit is under way";
+  return `the booking is ${b.status}`;
+}
+
+/**
  * The move the guide's page asks about, as its accept and decline forms name it: the proposal's number and
  * date. An answer that names another key was rendered for an earlier move and is refused (`stale_reschedule`).
  */
@@ -999,6 +1011,7 @@ export class BookingService {
       refunded: b.captured ? { currency_code: b.captured.currency_code, value: fromMinor(b.refunded_minor) } : null,
       refund_pending: b.captured && pending ? { currency_code: b.captured.currency_code, value: fromMinor(pending) } : null,
       reschedule: b.reschedule ? { new_date: b.reschedule.new_date, status: b.reschedule.status } : null,
+      reschedule_hold: rescheduleHold(b) ?? null,
       refund_offered: b.refund_offered,
       simulated_warning: b.simulated_alert ? { name: b.simulated_alert.name, level: b.simulated_alert.level, date: b.simulated_alert.from } : null,
     };

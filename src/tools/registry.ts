@@ -68,7 +68,7 @@ export const TOOLS = [
     name: "get_booking",
     title: "Get a booking",
     description:
-      "The booking's status, the guide's quote, the mandate, the PayPal order, the capture and any refund or reschedule. reschedule.status is proposed (waiting for the guide), accepted (the date moved), declined (a refund is now allowed) or withdrawn (a refund of the deposit completed before the guide answered: the guide is no longer asked and the date stays).",
+      "The booking's status, the guide's quote, the mandate, the PayPal order, the capture and any refund or reschedule. reschedule.status is proposed (asked; the guide can answer it only while the booking is captured and no refund has started: reschedule_hold is null then, and otherwise says what the move waits on instead of the guide, a refund under way or a review), accepted (the date moved), declined (a refund is now allowed) or withdrawn (a refund of the deposit completed before the guide answered: the guide is no longer asked and the date stays).",
     input: z.object({ booking_id: bookingId }),
     moneyMoving: false,
     run: async (a, ctx) => ctx.service.summary(own(ctx, a.booking_id)),
@@ -151,7 +151,7 @@ export const TOOLS = [
     name: "refund_payment",
     title: "Refund the deposit",
     description:
-      "Refund the deposit (all of it, or `amount`) from the guide's capture back to the traveller. Allowed only when a cyclone warning (orange/red) covers the date, the guide declined a reschedule, or the guide offered a refund. A simulated (demo) warning alone does not allow it. A completed refund withdraws a reschedule still waiting for the guide (status withdrawn). date_changed: the date changed while the weather was checked and nothing was refunded; call it once again.",
+      "Refund the deposit (all of it, or `amount`) from the guide's capture back to the traveller. Allowed only when a cyclone warning (orange/red) covers the date, the guide declined a reschedule, or the guide offered a refund. A simulated (demo) warning alone does not allow it. A completed refund withdraws a reschedule still waiting for the guide (status withdrawn); while a refund is pending or held for review, a waiting reschedule is on hold (get_booking's reschedule_hold). date_changed: the date changed while the weather was checked and nothing was refunded; call it once again.",
     input: z.object({ booking_id: bookingId, amount: z.string().regex(/^\d{1,4}(\.\d{1,2})?$/).optional() }),
     moneyMoving: true,
     run: async (a, ctx) => {
