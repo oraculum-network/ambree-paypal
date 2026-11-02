@@ -11,9 +11,10 @@
 // The races are deterministic: test/helpers/race.ts's gate holds one PayPal reply or feed lookup.
 
 import { describe, expect, it } from "vitest";
+import { systemPrompt } from "../src/agent/loop.ts";
 import { ServiceError } from "../src/booking/service.ts";
 import { renderOperatorPage } from "../src/operator/page.ts";
-import { runTool } from "../src/tools/registry.ts";
+import { findTool, runTool } from "../src/tools/registry.ts";
 import type { CycloneFeed, DemoCycloneFeed } from "../src/weather/cyclones.ts";
 // @ts-expect-error plain browser module, no types
 import * as labels from "../public/labels.js";
@@ -443,5 +444,23 @@ describe("S3: no lost update in the microtasks after the feed's reply", () => {
       expect(answer).toMatchObject({ ok: false, error: { code: "no_reschedule" } });
       expect(w.service.get(id)).toMatchObject({ date: DATE, reschedule: { status: "withdrawn" } });
     }
+  });
+});
+
+// ---------- what a real model is told ----------
+
+describe("the model is told what `withdrawn` and `date_changed` mean", () => {
+  it("the system prompt names both and says what to do", () => {
+    const p = systemPrompt("2026-11-03");
+    expect(p).toMatch(/withdrawn/);
+    expect(p).toMatch(/date_changed/);
+    expect(p).toMatch(/date_changed[^\n]*(again|retry)/i);
+  });
+
+  it("get_booking, propose_reschedule and refund_payment describe them", () => {
+    expect(findTool("get_booking")!.description).toMatch(/withdrawn/);
+    expect(findTool("propose_reschedule")!.description).toMatch(/refund[^.]*started|started[^.]*refund/i);
+    expect(findTool("refund_payment")!.description).toMatch(/date_changed/);
+    expect(findTool("refund_payment")!.description).toMatch(/withdrawn/);
   });
 });
