@@ -267,6 +267,13 @@ export function createApp(opts: AppOptions): App {
   }
   const publicOrigin = new URL(config.publicUrl).origin;
   /**
+   * A local run (no PUBLIC_URL) opened on localhost (DESIGN.md §22). Its public URL is
+   * http://127.0.0.1:<PORT>, the one origin refuseMutation accepts, and the fake checkout and PayPal's return
+   * come back there, so a page or cookie on localhost can't work. A GET or HEAD for Host localhost:<PORT> (any
+   * case) is sent to the same path and query on that origin. With PUBLIC_URL set, never: no second origin.
+   */
+  const localhostHost = config.publicUrlSet ? undefined : `localhost:${config.port}`;
+  /**
    * Checks for a state-changing browser request, run BEFORE any session work so a refused request never
    * creates or replaces a session: the body must be JSON (an HTML form can't send that cross-site without
    * a CORS preflight, which this server never grants), and an Origin header, when present, must be ours.
@@ -319,6 +326,9 @@ export function createApp(opts: AppOptions): App {
     const method = req.method ?? "GET";
     const path = url.pathname;
 
+    if (localhostHost && (method === "GET" || method === "HEAD") && req.headers.host?.toLowerCase() === localhostHost) {
+      return send(res, 307, "", "text/plain", { Location: `${publicOrigin}${path}${url.search}` });
+    }
     if (method === "GET" && statics[path]) {
       if (path === "/") session(req, res);
       return send(res, 200, statics[path]!.body.toString("utf8"), statics[path]!.type);

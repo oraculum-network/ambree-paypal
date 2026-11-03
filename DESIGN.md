@@ -1300,3 +1300,20 @@ Tests: `test/fix13-prg.test.ts` (6 of its 8 failed at 52244cb; the 2 that passed
 the Origin refusal). `e2e/flow.spec.ts` reloads the guide's tab after pricing and sees no error and no second
 answer (red at 52244cb). Three earlier assertions of a 200 on the post (`test/app.test.ts`,
 `test/fix4-hosted.test.ts`) now assert the 303, its `Location`, and the message on the GET that follows.
+
+### A local run opened on localhost
+
+With no `PUBLIC_URL`, `loadConfig` makes the public URL `http://127.0.0.1:<PORT>`, and `refuseMutation` refuses a
+POST whose Origin is anything else, so a page opened at `http://localhost:8080` stayed at "loading…". The fake
+checkout and PayPal's return URL use 127.0.0.1 too, so a cookie set on localhost would be lost on the way back
+anyway.
+
+- **Only with no `PUBLIC_URL`** (`Config.publicUrlSet` false): a GET or HEAD whose `Host` is `localhost:<PORT>`, in
+  any case, gets a **307** to the same path and query on `http://127.0.0.1:<PORT>`, before any session or route
+  work (so no cookie is set on localhost). Any other Host, and every other method, is served as before.
+- **No second origin.** A POST from `http://localhost:<PORT>` is still refused 403.
+- **With `PUBLIC_URL` set** (the hosted site's Deployment sets it), nothing is redirected and every reply is as
+  before.
+
+Tests: `test/fix13-localhost.test.ts` (4 of its 8 failed at bb456a0; the 4 that passed are guards: the POST, other
+Hosts, and both `PUBLIC_URL`-set cases, which compare status, headers and body with the site's own Host).

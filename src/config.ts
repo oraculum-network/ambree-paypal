@@ -12,6 +12,11 @@ export interface Config {
   port: number;
   host: string;
   publicUrl: string;
+  /**
+   * Whether PUBLIC_URL was set. Unset (a local run), the public URL is http://127.0.0.1:<PORT>, and a GET or
+   * HEAD for Host localhost:<PORT> is redirected there (DESIGN.md §22); set (the hosted site), never.
+   */
+  publicUrlSet: boolean;
   dbPath: string;
   /**
    * Sandbox: two REST apps (DESIGN.md §21, D1). The operator's (PAYPAL_CLIENT_ID/SECRET, webhook
@@ -105,5 +110,5 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
   const idCheck = env.PAYPAL_OPERATOR_IDENTITY ?? "paypal";
   if (idCheck !== "paypal" && idCheck !== "config-only") throw new ConfigError("PAYPAL_OPERATOR_IDENTITY must be paypal (default) or config-only");
 
-  return { port, host, publicUrl, dbPath: env.DB_PATH ?? ":memory:", paypal, llm, guidePayee, operatorPayees, operatorIdentityCheck: idCheck, mcpPasscode: env.MCP_DEMO_PASSCODE || undefined };
+  return { port, host, publicUrl, publicUrlSet: env.PUBLIC_URL !== undefined, dbPath: env.DB_PATH ?? ":memory:", paypal, llm, guidePayee, operatorPayees, operatorIdentityCheck: idCheck, mcpPasscode: env.MCP_DEMO_PASSCODE || undefined };
 }

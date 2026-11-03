@@ -3,8 +3,11 @@
 import { type App, type AppOptions, createApp } from "../../src/app.ts";
 import { loadConfig } from "../../src/config.ts";
 
-/** `options` reach createApp as they are (e.g. `paypalFetch` for a sandbox-mode app with no network). */
-export async function startApp(env: Record<string, string> = {}, options: Omit<AppOptions, "config"> = {}) {
+/**
+ * `options` reach createApp as they are (e.g. `paypalFetch` for a sandbox-mode app with no network). An env
+ * value of `undefined` unsets the helper's default, e.g. `{ PUBLIC_URL: undefined }` for a local run's.
+ */
+export async function startApp(env: Record<string, string | undefined> = {}, options: Omit<AppOptions, "config"> = {}) {
   const probe = createApp({ config: loadConfig({ PORT: "0", HOST: "127.0.0.1" }) });
   const port = await probe.listen();
   await probe.close();
