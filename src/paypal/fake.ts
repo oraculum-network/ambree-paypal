@@ -16,7 +16,7 @@ export interface FakePayPalOptions {
   webhookId?: string;
   /** Where the approve link points. The demo server serves its own stand-in checkout page there. */
   checkoutUrl?: string;
-  /** The merchant id that "owns" the fake REST app (userinfo's payer_id). Default AMBREEOPER001. */
+  /** The merchant id that owns the fake REST app: an order with no payee is paid to it (and echoes it). Default AMBREEOPER001. */
   ownerMerchantId?: string;
   /** If set, only these payee emails / merchant ids are accepted. */
   knownPayees?: string[];
@@ -350,11 +350,8 @@ export class FakePayPal {
       return r ? json(200, this.#refundView(r)) : ppError(404, "RESOURCE_NOT_FOUND", "INVALID_RESOURCE_ID", "Specified resource ID does not exist.");
     }
     if (method === "POST" && path === "/v1/notifications/verify-webhook-signature") return this.#verify(body);
-    if (method === "GET" && path === "/v1/identity/openidconnect/userinfo") {
-      // The shape the real reply is assumed to have (UNVERIFIED, spike S11): payer_id = the app owner's merchant id.
-      const owner = this.#opts.ownerMerchantId ?? "AMBREEOPER001";
-      return json(200, { user_id: `https://www.paypal.com/webapps/auth/identity/user/FAKE${owner}`, sub: `fake-${owner.toLowerCase()}`, payer_id: owner, verified_account: "true", account_type: "BUSINESS" });
-    }
+    // No userinfo: the spike (S11) found it has no payer_id for an app token; the app owner comes from the
+    // payee echo of an order with no payee (#createOrder), as at PayPal.
     return ppError(404, "NOT_FOUND", "INVALID_RESOURCE_ID", "The specified resource does not exist.");
   }
 
@@ -372,7 +369,9 @@ export class FakePayPal {
       return invalid("INVALID_PARAMETER_SYNTAX", "amount.value is not a valid amount.");
     }
     if (minor <= 0) return ppError(422, "UNPROCESSABLE_ENTITY", "AMOUNT_NOT_POSITIVE", "Amount must be greater than zero.");
-    const key = payeeKey(unit.payee);
+    // No payee: PayPal pays the app's owner, and the reply echoes it (spike, 3 Nov; D3's identity probe).
+    const payee: Payee = unit.payee ?? { merchant_id: this.#opts.ownerMerchantId ?? "AMBREEOPER001" };
+    const key = payeeKey(payee);
     const known = this.#opts.knownPayees;
     if (unit.payee && known && !known.some((k) => key === `email:${k.toLowerCase()}` || key === `merchant:${k}`)) {
       return ppError(422, "UNPROCESSABLE_ENTITY", "PAYEE_ACCOUNT_INVALID", "Payee account specified is invalid.");
@@ -390,7 +389,7 @@ export class FakePayPal {
       id,
       intent: "CAPTURE",
       status: usesPaymentSource ? "PAYER_ACTION_REQUIRED" : "CREATED",
-      purchase_units: [{ ...structuredClone(unit), reference_id: unit.reference_id ?? "default", amount: { currency_code: unit.amount.currency_code, value: fromMinor(minor) } }],
+      purchase_units: [{ ...structuredClone(unit), payee: structuredClone(payee), reference_id: unit.reference_id ?? "default", amount: { currency_code: unit.amount.currency_code, value: fromMinor(minor) } }],
       create_time: this.#now(),
       links,
     };

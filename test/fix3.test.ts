@@ -60,12 +60,13 @@ describe("round 3 #1: needs_review is never overwritten", () => {
 });
 
 describe("round 3 #2: the operator's merchant id is confirmed with PayPal", () => {
-  it("the client asks PayPal who owns the app (fake: userinfo payer_id)", async () => {
+  // Since the spike (S11 answered no; DESIGN.md §21 D3): the owner is the payee PayPal echoes for an order with no payee.
+  it("the client asks PayPal who owns the app (the payee echo of a probe order with no payee)", async () => {
     const fake = new FakePayPal({ ownerMerchantId: "OWNERACCOUNT1" });
     const client = new PayPalRestClient({ clientId: fake.clientId, clientSecret: fake.clientSecret, fetch: fake.fetch });
-    const who = await client.getOperatorIdentity();
+    const who = await client.getAppOwner();
     expect(who.merchant_id).toBe("OWNERACCOUNT1");
-    expect(fake.calls.some((c) => c.path === "/v1/identity/openidconnect/userinfo")).toBe(true);
+    expect(fake.calls.some((c) => c.method === "POST" && c.path === "/v2/checkout/orders")).toBe(true);
   });
 
   it("refuses to start when PayPal's owner differs from PAYPAL_OPERATOR_MERCHANT_ID", async () => {
@@ -97,7 +98,7 @@ describe("round 3 #2: the operator's merchant id is confirmed with PayPal", () =
     const fake = new FakePayPal({ ownerMerchantId: "OWNERACCOUNT1" });
     const client = new PayPalRestClient({ clientId: fake.clientId, clientSecret: fake.clientSecret, fetch: fake.fetch });
     const row = await identityRow(client);
-    expect(row.note).toContain("payer_id OWNERACCOUNT1");
+    expect(row.note).toContain("merchant_id OWNERACCOUNT1");
     expect(row.note).not.toMatch(/A21AA|Bearer/);
   });
 });

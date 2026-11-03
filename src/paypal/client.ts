@@ -2,10 +2,22 @@
 // every write, a timeout on every call, and PayPalError for every failure. Credentials live in this
 // object only; they are never logged, thrown or returned.
 
+import { randomUUID } from "node:crypto";
 import type { PaymentsApi } from "./api.ts";
 import { PayPalError, errorFromBody } from "./errors.ts";
 import { assertSandboxBase } from "./sandbox.ts";
-import type { CreateOrderRequest, OperatorIdentity, Order, Refund, RefundRequest, WebhookEvent, WebhookTransmission } from "./types.ts";
+import type { AppOwner, CreateOrderRequest, Order, Refund, RefundRequest, WebhookEvent, WebhookTransmission } from "./types.ts";
+
+/**
+ * The identity probe (getAppOwner): an order with no payee, which PayPal pays to the app's owner and echoes.
+ * Its description says what it is; nobody approves it, so no money moves and it lapses.
+ */
+export const IDENTITY_ORDER: CreateOrderRequest = {
+  intent: "CAPTURE",
+  purchase_units: [{ description: "Ambree identity check: names this REST app's owner. It is never approved and lapses.", amount: { currency_code: "EUR", value: "1.00" } }],
+};
+/** PayPal merchant ids seen are 13 capitals and digits; the exact rule is UNVERIFIED, so 8-20 (as config.ts). */
+const MERCHANT_ID_RE = /^[A-Z0-9]{8,20}$/;
 
 export interface PayPalCredentials {
   clientId: string;
@@ -112,13 +124,25 @@ export class PayPalRestClient implements PaymentsApi {
     return reply.verification_status === "SUCCESS";
   }
 
-  async getOperatorIdentity(): Promise<OperatorIdentity> {
-    const call = "GET /v1/identity/openidconnect/userinfo";
-    const r = await this.#api<Record<string, unknown>>("GET", "/v1/identity/openidconnect/userinfo?schema=openid", call);
-    const body = r && typeof r === "object" ? r : {};
-    const str = (k: string) => (typeof body[k] === "string" ? (body[k] as string).slice(0, 200) : undefined);
-    const payer = str("payer_id");
-    return { merchant_id: payer && /^[A-Z0-9]{8,20}$/.test(payer) ? payer : undefined, fields: Object.keys(body).slice(0, 40), user_id: str("user_id"), account_type: str("account_type") };
+  /**
+   * Who owns this app (DESIGN.md §21, D3): creates IDENTITY_ORDER (no payee) under a fresh PayPal-Request-Id
+   * and reads purchase_units[0].payee.merchant_id from the reply (Prefer: return=representation). Nobody
+   * approves the order; it lapses at PayPal. A missing or odd-looking merchant id is undefined, never guessed.
+   */
+  async getAppOwner(): Promise<AppOwner> {
+    const reply = await this.#api<unknown>("POST", "/v2/checkout/orders", "POST /v2/checkout/orders", IDENTITY_ORDER, `identity-${randomUUID()}`);
+    const order = (reply && typeof reply === "object" ? reply : {}) as { id?: unknown; status?: unknown; purchase_units?: unknown };
+    const unit = Array.isArray(order.purchase_units) ? (order.purchase_units[0] as unknown) : undefined;
+    const payee = unit && typeof unit === "object" ? ((unit as { payee?: unknown }).payee as Record<string, unknown> | undefined) : undefined;
+    const payeeObj = payee && typeof payee === "object" ? payee : undefined;
+    const mid = payeeObj?.merchant_id;
+    const short = (v: unknown) => (typeof v === "string" ? v.slice(0, 64) : undefined);
+    return {
+      merchant_id: typeof mid === "string" && MERCHANT_ID_RE.test(mid) ? mid : undefined,
+      order_id: short(order.id),
+      order_status: short(order.status),
+      payee_fields: payeeObj ? Object.keys(payeeObj).slice(0, 10) : [],
+    };
   }
 
   /** Drops the cached token (the next call fetches a new one). */

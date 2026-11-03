@@ -60,8 +60,8 @@ describe("RoutedPayments: refunds to the payee's own app, the rest to the operat
     await r.router.getOrder("O1");
     await r.router.captureOrder("O1", "capture-O1");
     await r.router.verifyWebhookSignature({ auth_algo: "a", cert_url: "c", transmission_id: "t", transmission_sig: "s", transmission_time: "x" }, { id: "WH-1", event_type: "X", resource: {} });
-    await r.router.getOperatorIdentity();
-    expect(r.who()).toEqual(["operator.createOrder", "operator.getOrder", "operator.captureOrder", "operator.verifyWebhookSignature", "operator.getOperatorIdentity"]);
+    await r.router.getAppOwner();
+    expect(r.who()).toEqual(["operator.createOrder", "operator.getOrder", "operator.captureOrder", "operator.verifyWebhookSignature", "operator.getAppOwner"]);
   });
 
   it.each([

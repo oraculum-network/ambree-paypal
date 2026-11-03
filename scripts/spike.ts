@@ -912,18 +912,19 @@ export function newRunId(): string {
 }
 
 /**
- * DESIGN.md S11: asks GET /v1/identity/openidconnect/userinfo with the app's token and reports the identity
- * fields PayPal returns (payer_id, user_id, account_type, and the field names). It never prints a token.
- * The app refuses to start unless payer_id equals PAYPAL_OPERATOR_MERCHANT_ID; this row shows whether it can.
+ * DESIGN.md §21 (D3): who owns the app, as the app checks it at startup. It creates the identity probe (an
+ * order with no payee, never approved; it lapses) and prints the payee merchant_id PayPal echoes, the probe's
+ * id and status, and the payee's field names. Compare the id with the dashboard's merchant id. It never
+ * prints a token. (userinfo, the S11 call, had no payer_id.)
  */
-export async function identityRow(api: Pick<PaymentsApi, "getOperatorIdentity">): Promise<Row> {
-  const call = "GET /v1/identity/openidconnect/userinfo";
+export async function identityRow(api: Pick<PaymentsApi, "getAppOwner">, step = "a2 identity"): Promise<Row> {
+  const call = "POST /v2/checkout/orders";
   try {
-    const who = await api.getOperatorIdentity();
-    const note = `payer_id ${who.merchant_id ?? "(absent or not a merchant id)"}; user_id ${who.user_id ?? "(absent)"}; account_type ${who.account_type ?? "(absent)"}; fields ${who.fields.join(",") || "(none)"}`;
-    return { step: "a2 identity", call, status: "200", id: who.merchant_id ?? "", note: scrub(note) };
+    const who = await api.getAppOwner();
+    const note = `payee echo merchant_id ${who.merchant_id ?? "(absent or not a merchant id)"}; probe order ${who.order_id ?? "(no id)"} ${who.order_status ?? "(no status)"} (never approved; it lapses); payee fields ${who.payee_fields.join(",") || "(none)"}`;
+    return { step, call, status: "201", id: who.merchant_id ?? "", note: scrub(note) };
   } catch (e) {
-    return { step: "a2 identity", call, status: e instanceof PayPalError ? String(e.status || e.kind) : "-", id: "", note: scrub(`${describeError(e)} (S11: this call can't confirm the operator)`) };
+    return { step, call, status: e instanceof PayPalError ? String(e.status || e.kind) : "-", id: "", note: scrub(`${describeError(e)} (the app's owner can't be read this way)`) };
   }
 }
 

@@ -4,7 +4,7 @@
 // @paypal/agent-toolkit's create_order / get_order / refund tools would implement this same interface, so
 // the mandate check in src/booking/ still runs before any of it (see DESIGN.md §6).
 
-import type { CreateOrderRequest, OperatorIdentity, Order, Refund, RefundRequest, WebhookEvent, WebhookTransmission } from "./types.ts";
+import type { AppOwner, CreateOrderRequest, Order, Refund, RefundRequest, WebhookEvent, WebhookTransmission } from "./types.ts";
 
 export interface PaymentsApi {
   /** POST /v2/checkout/orders. `requestId` goes in PayPal-Request-Id (idempotency). */
@@ -22,6 +22,6 @@ export interface PaymentsApi {
   getRefund(refundId: string, captureId?: string): Promise<Refund>;
   /** POST /v1/notifications/verify-webhook-signature → true only on verification_status SUCCESS. */
   verifyWebhookSignature(transmission: WebhookTransmission, event: WebhookEvent): Promise<boolean>;
-  /** GET /v1/identity/openidconnect/userinfo with the app token: who owns the REST app (see OperatorIdentity). */
-  getOperatorIdentity(): Promise<OperatorIdentity>;
+  /** POST /v2/checkout/orders with no payee (a probe order, never approved): who owns this REST app (see AppOwner). */
+  getAppOwner(): Promise<AppOwner>;
 }

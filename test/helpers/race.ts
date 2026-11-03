@@ -37,7 +37,7 @@ export function gate() {
 }
 export type Gate = ReturnType<typeof gate>;
 
-const PAYMENT_METHODS = ["createOrder", "getOrder", "captureOrder", "refundCapture", "getRefund", "verifyWebhookSignature", "getOperatorIdentity"] as const;
+const PAYMENT_METHODS = ["createOrder", "getOrder", "captureOrder", "refundCapture", "getRefund", "verifyWebhookSignature", "getAppOwner"] as const;
 
 /** The REST client, with `method`'s reply held by `g` while armed. */
 export function slow(inner: PaymentsApi, method: keyof PaymentsApi, g: Gate): PaymentsApi {

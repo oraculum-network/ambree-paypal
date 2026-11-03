@@ -163,31 +163,37 @@ export function createApp(opts: AppOptions): App {
   const service = new BookingService({ db, ledger, mandates, payments, guides, weather, channels, publicUrl: config.publicUrl, operatorPayees: config.operatorPayees });
 
   /**
-   * Confirms the operator's merchant id with PayPal before serving: PAYPAL_OPERATOR_MERCHANT_ID must be
-   * the merchant PayPal says owns the REST app, and no guide may be paid to it. No documented PayPal call
-   * returns the app owner's merchant id for a client-credentials token (DESIGN.md §13), so this uses
-   * userinfo's payer_id and fails closed when it is absent; the spike checks it (S11).
+   * Confirms with PayPal who owns each app before serving (DESIGN.md §21, D3), by the payee echo of a probe
+   * order with no payee (getAppOwner; it is never approved and lapses). The operator app's owner must be
+   * PAYPAL_OPERATOR_MERCHANT_ID and no guide's payee. Any other answer, or none, refuses to start, naming the
+   * check that failed. userinfo, used before, has no payer_id for an app token (spike S11, 3 Nov).
    */
   let operatorIdentity: "pending" | "confirmed" | "config-only (unconfirmed)" = "pending";
-  async function confirmOperator(): Promise<void> {
+  const optOut = "Set PAYPAL_OPERATOR_IDENTITY=config-only to run on the configured ids alone (unconfirmed).";
+  /** The merchant id PayPal echoes as `client`'s owner; throws, naming `check`, when it can't be read. */
+  async function appOwner(client: PaymentsApi, check: string, what: string): Promise<string> {
+    let owner: string | undefined;
+    try {
+      owner = (await client.getAppOwner()).merchant_id;
+    } catch (e) {
+      throw new Error(`${check}: could not ask PayPal who owns ${what} (${e instanceof PayPalError ? e.summary() : "error"}); refusing to start. ${optOut}`);
+    }
+    if (!owner) throw new Error(`${check}: PayPal's probe order for ${what} echoes no payee merchant_id; refusing to start. ${optOut}`);
+    return owner;
+  }
+  async function confirmOwners(): Promise<void> {
     if (config.operatorIdentityCheck === "config-only") {
       operatorIdentity = "config-only (unconfirmed)";
       log({ event: "operator_identity", status: operatorIdentity, warning: "PAYPAL_OPERATOR_MERCHANT_ID is trusted from config, not confirmed with PayPal" });
       return;
     }
-    const optOut = "Set PAYPAL_OPERATOR_IDENTITY=config-only to run on the configured id alone (unconfirmed).";
-    let owner: string | undefined;
-    try {
-      owner = (await payments.getOperatorIdentity()).merchant_id;
-    } catch (e) {
-      throw new Error(`Could not confirm the operator's merchant id with PayPal (${e instanceof PayPalError ? e.summary() : "error"}); refusing to start. ${optOut}`);
-    }
-    if (!owner) throw new Error(`PayPal's identity reply carries no merchant id (payer_id) for the operator; refusing to start. ${optOut}`);
+    const check = "Operator identity check failed";
+    const owner = await appOwner(payments, check, "the operator's REST app");
     if (!config.operatorPayees.some((p) => p.merchant_id === owner)) {
-      throw new Error(`PayPal says the REST app's operator is merchant ${owner}, which is not PAYPAL_OPERATOR_MERCHANT_ID; refusing to start`);
+      throw new Error(`${check}: PayPal says the operator's REST app is owned by merchant ${owner}, which is not PAYPAL_OPERATOR_MERCHANT_ID; refusing to start`);
     }
     const guide = guides.find((g) => g.payee.merchant_id === owner);
-    if (guide) throw new Error(`Guide ${guide.id}'s payee is the operator's own account (confirmed with PayPal); refusing to start`);
+    if (guide) throw new Error(`${check}: the operator's REST app is owned by merchant ${owner}, which is guide ${guide.id}'s payee; Ambree must never be the payee; refusing to start`);
     operatorIdentity = "confirmed";
     log({ event: "operator_identity", status: operatorIdentity, merchant_id: owner });
   }
@@ -452,7 +458,7 @@ export function createApp(opts: AppOptions): App {
     service,
     fake,
     listen: async () => {
-      await confirmOperator();
+      await confirmOwners();
       return new Promise<number>((resolve) => {
         server.listen(config.port, config.host, () => {
           port = (server.address() as AddressInfo).port;

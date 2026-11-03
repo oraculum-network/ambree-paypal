@@ -11,7 +11,7 @@
 
 import type { PaymentsApi } from "./api.ts";
 import { PayPalError } from "./errors.ts";
-import type { CreateOrderRequest, OperatorIdentity, Order, Refund, RefundRequest, WebhookEvent, WebhookTransmission } from "./types.ts";
+import type { AppOwner, CreateOrderRequest, Order, Refund, RefundRequest, WebhookEvent, WebhookTransmission } from "./types.ts";
 
 /** What the router asks the booking service: who a capture paid, and which capture a recorded refund is on. */
 export interface PayeeLookup {
@@ -92,8 +92,9 @@ export class RoutedPayments implements PaymentsApi {
     return this.#operator.verifyWebhookSignature(transmission, event);
   }
 
-  getOperatorIdentity(): Promise<OperatorIdentity> {
-    return this.#operator.getOperatorIdentity();
+  /** The operator app's owner; each payee app's own is asked of that app directly (the startup check). */
+  getAppOwner(): Promise<AppOwner> {
+    return this.#operator.getAppOwner();
   }
 
   /** The app of the payee `captureId` paid; throws (definitive, nothing sent) when there is none. */

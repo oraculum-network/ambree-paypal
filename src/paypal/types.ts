@@ -105,17 +105,19 @@ export interface WebhookEvent {
 }
 
 /**
- * Who PayPal says owns the REST app, from GET /v1/identity/openidconnect/userinfo with the app's own token.
- * UNVERIFIED (spike S11): that this call accepts a client-credentials token and describes the app owner,
- * and that `payer_id` is the owner's merchant id. The docs' sample shows user_id/sub but no payer_id.
+ * Who owns a REST app, as PayPal's own order reply says (DESIGN.md §21, D3). An order created with no payee is
+ * paid to the app's owner, and `Prefer: return=representation` echoes that payee: the spike (3 Nov) found its
+ * merchant_id equal to the dashboard's, for the operator's app and the guide's. (userinfo, tried first, has
+ * no payer_id for an app token: S11.) The probe order is never approved and lapses.
  */
-export interface OperatorIdentity {
-  /** `payer_id` from the reply, when it looks like a merchant id; undefined otherwise. */
+export interface AppOwner {
+  /** purchase_units[0].payee.merchant_id of the probe order, when it looks like a merchant id; undefined otherwise. */
   merchant_id?: string;
-  /** The reply's top-level field names (for the spike's report; no values). */
-  fields: string[];
-  user_id?: string;
-  account_type?: string;
+  /** The probe order's id and status (for the spike's report). */
+  order_id?: string;
+  order_status?: string;
+  /** The payee echo's field names (for the spike's report; no values). */
+  payee_fields: string[];
 }
 
 /** The 5 PAYPAL-* transmission headers, lower-cased as Node gives them. */
