@@ -149,6 +149,22 @@ describe("the booking service through the router", () => {
     expect(refundPosts(w)).toBe(0);
   });
 
+  it("a resend of an operation that may have reached PayPal, with no app for its payee: held for review (unknown), never failed (I1)", async () => {
+    const { w } = recorded([]);
+    const { id, token } = await paid(w);
+    await w.service.offerRefund(token);
+    // An operation left `sending` by an earlier send that may have arrived (as a lost reply leaves it).
+    const cur = w.service.get(id)!;
+    w.db.prepare("UPDATE records SET json = ? WHERE kind = 'booking' AND id = ?").run(
+      JSON.stringify({ ...cur, refund_ops: [{ n: 1, request_id: `refund-${id}-1`, amount_minor: 3000, full: true, reason: "the guide offered it", status: "sending", maybe_sent: true }] }),
+      id,
+    );
+    await expect(w.service.refund(id)).rejects.toMatchObject({ code: "refund_under_review" });
+    expect(refundPosts(w)).toBe(0);
+    expect(w.service.get(id)).toMatchObject({ status: "needs_review", refund_ops: [{ n: 1, status: "needs_review", review_cause: "unknown", maybe_sent: true }] });
+    expect(w.ledger.list(id).map((r) => r.kind)).toContain("refund.resend_refused");
+  });
+
   it("at the fake, the refund POST and GET carry the guide app's token, the order and capture the operator's", async () => {
     const w = makeWorld();
     const { id, token } = await paid(w);

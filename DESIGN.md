@@ -150,7 +150,8 @@ webhook_events(event_id PRIMARY KEY, event_type, received_at)                   
 
 The base URL is a constant. `src/paypal/sandbox.ts` refuses any other origin; this guard is what refuses
 `api-m.paypal.com`. Startup fails if `PAYPAL_BASE_URL` is set to anything else. Credentials are read by name only:
-`PAYPAL_CLIENT_ID`, `PAYPAL_CLIENT_SECRET`, `PAYPAL_WEBHOOK_ID`.
+`PAYPAL_CLIENT_ID`, `PAYPAL_CLIENT_SECRET`, `PAYPAL_WEBHOOK_ID`, and since §21 the guide's own app's
+`PAYPAL_GUIDE_CLIENT_ID`, `PAYPAL_GUIDE_CLIENT_SECRET`, `PAYPAL_GUIDE_WEBHOOK_ID` (calls 5 and 6 go through it).
 
 | # | Call | Method + path | Body / headers we send | Doc read (31 Oct) |
 |---|---|---|---|---|
@@ -328,11 +329,12 @@ refund *webhooks* carry them too is P3, read in the event log.
 | `POST /api/mandates/{id}/approve` | `{code}`. **Human only**: no tool can call it; 404 unless the session owns the booking |
 | `GET /o/{token}`, `POST /o/{token}` | The operator page: price, accept or decline a reschedule, offer a refund. The token is 256-bit base64url and stored as sha256; there is no login. A reschedule answer names the proposal it answers (hidden `proposal`); one for an earlier proposal, or none, answers 422 and the page shows the current question (§17) |
 | `GET /paypal/return`, `GET /paypal/cancel` | The PayPal redirects, both to `/` (never a conversation id). Return captures if the session owns the booking |
-| `POST /webhooks/paypal` | Verify via call 7, log to the ledger once, process. Only completed processing makes a redelivery a duplicate; a processing failure answers 500 |
+| `POST /webhooks/paypal` | Verify via call 7 (the operator's app, `PAYPAL_WEBHOOK_ID`), log to the ledger once, process. Only completed processing makes a redelivery a duplicate; a processing failure answers 500 |
+| `POST /webhooks/paypal/guide` | The same handler, verified through the guide's own app and `PAYPAL_GUIDE_WEBHOOK_ID` (§21 D4); the same event on both endpoints is processed once |
 | `POST /mcp` | The tools over MCP (stateless). Off unless `MCP_DEMO_PASSCODE` is set (Bearer); scoped to the conversation `mcp` |
 | `GET /fake-paypal/checkout?token=` | **Fake mode only**: a stand-in buyer approval page |
 | `POST /api/demo/cyclone` | Fake and sandbox mode (live is refused at startup). Needs an existing session (401, and it never creates one). **Sandbox:** `{booking_id}` of a booking the session owns (else 404) and has paid with no refund under way (`captured`, no refund being sent or pending; else 409 with the reason, and nothing is saved); posts one simulated warning for that booking's day, once, and calls no payment API (§14). **Fake:** unchanged, a demo-feed alert around every booking of the tab's conversation |
-| `GET /healthz` | `{ok, mode}` |
+| `GET /healthz` | `{ok, version, paypal, model, operator_identity, guide_identity}` (§21 D3) |
 
 ## 8. Three-minute demo script (from the report, §6 B)
 
@@ -378,7 +380,8 @@ refund *webhooks* carry them too is P3, read in the event log.
   - Runs as user `node` with a read-only root filesystem; the only writable path is `/data`, the PVC `paypal-data`
     (64Mi, `local-path`, made by the admin), which holds the SQLite file. One replica, `Recreate`.
 - **Secret:** `paypal/paypal-secrets`, made by hand, holds `PAYPAL_CLIENT_ID`, `PAYPAL_CLIENT_SECRET`,
-  `PAYPAL_WEBHOOK_ID`, `LLM_API_KEY` and `MCP_DEMO_PASSCODE`. Every key is required (no `optional`), so the pod
+  `PAYPAL_WEBHOOK_ID`, `LLM_API_KEY` and `MCP_DEMO_PASSCODE`, and since §21 the guide's own app:
+  `PAYPAL_GUIDE_CLIENT_ID`, `PAYPAL_GUIDE_CLIENT_SECRET`, `PAYPAL_GUIDE_WEBHOOK_ID`. Every key is required (no `optional`), so the pod
   doesn't start without it; there is no fake-PayPal fallback on the host. The merchant ids, `LLM_BASE_URL` and
   `LLM_MODEL` are plain values in the Deployment.
 - **Network:** egress on TCP 443 only; the target hosts are `api-m.sandbox.paypal.com` and the LLM host. A
@@ -487,7 +490,9 @@ that changed:
     `ServiceError("refund_under_review")`;
   - `refreshRefunds` may still record other ops' real completions (money did move), but it never clears the
     review.
-- **Operator identity confirmed with PayPal** (`App.listen()` → `confirmOperator()`).
+- **Operator identity confirmed with PayPal** (`App.listen()` → `confirmOperator()`). Superseded by §21 D3: the
+  spike found no `payer_id` in userinfo, so both apps' owners are now read from the payee echo of an order with no
+  payee (`getAppOwner`, `confirmOwners`).
   - **What the docs say (read 31 Oct):**
     - `/v1/oauth2/token` returns `scope, access_token, token_type, app_id, expires_in, nonce`, and no
       merchant or payer id (https://developer.paypal.com/api/rest/authentication/).
@@ -1039,3 +1044,223 @@ unnoticed until a person looks).
 Kept as decided by the round-10 builder: PayPal's running total is compared with every refund that isn't failed
 (completed, pending, being sent or unknown), not with completed ones only, so a lost reply's own refund is never
 counted twice.
+
+## 21. After the spike: refunds go through the guide's own app (3 Nov)
+
+The 3 Nov spike answered S4 and S11 with no (§5). The design below is the CTO's (D1-D8); this section records it
+as built. It supersedes §4's credential list, §7's webhook row, §10's Secret keys and §13's identity check where
+they differ.
+
+### The evidence (real sandbox, 3 Nov; facts, not guesses)
+
+- **Orders and captures work from the operator's app.** It creates the order with `payee.merchant_id` = the guide
+  (DE, `DF39WHJKDE862`), the buyer approves, and the operator's app captures it.
+- **The operator's app can't refund the guide's capture.** `POST /v2/payments/captures/{id}/refund` answers 403
+  `PERMISSION_DENIED`. `PayPal-Auth-Assertion` gets 400 "No permissions to set target_client_id", and Partner
+  Referrals answers 403. These are partner features the app doesn't have.
+- **A second REST app, owned by the guide's own sandbox account, can.** The same POST with that app's token
+  answered 201 `COMPLETED`. Its reply carries `custom_id` as sent, `links[rel=up]` = the capture, and
+  `seller_payable_breakdown.total_refunded_amount`.
+- **Refund GET.** `GET /v2/payments/refunds/{id}` works with the guide app's token (the same fields) and is 403
+  with the operator's.
+- **Capture GET.** `GET /v2/payments/captures/{id}` works with both tokens. It has links self, refund and up, and
+  no refunded total; its status became `PARTIALLY_REFUNDED`.
+- **Identity.** `userinfo` with an app token has no `payer_id` (only `user_id` and `sub`), so the §13 startup check
+  refused to start. What works for both apps: `POST /v2/checkout/orders` with no payee (intent `CAPTURE`, one
+  purchase unit of EUR 1.00, `Prefer: return=representation`) answers 201 with `purchase_units[0].payee.merchant_id`
+  = that app's owner (operator `LG3KJ8XHUA4DW`, guide `DF39WHJKDE862`, each equal to the dashboard's). Nobody
+  approves that order, and it lapses.
+
+So PayPal's refund permission follows the money: only the account a capture paid may refund it, or read its
+refunds. That fact drives the design.
+
+### D1. Two apps
+
+- **The operator's app** (`PAYPAL_CLIENT_ID`/`_SECRET`, webhook `PAYPAL_WEBHOOK_ID`): orders, captures, and the
+  order and capture GETs.
+- **The guide's own app** (`PAYPAL_GUIDE_CLIENT_ID`/`_SECRET`, webhook `PAYPAL_GUIDE_WEBHOOK_ID`): the refund POST
+  and the refund GET, for captures whose payee is `PAYPAL_GUIDE_PAYEE_MERCHANT_ID`.
+- **Config** (`loadConfig`):
+  - In sandbox mode the guide's id and secret are required, as the operator's are; the check comes after the
+    existing payee and operator checks, so their errors are unchanged.
+  - The operator's client id given as the guide's is refused, and so are guide credentials without the operator's
+    (fake mode).
+  - The guide's webhook id may be empty, like `PAYPAL_WEBHOOK_ID`: `/webhooks/paypal/guide` then answers 503.
+
+### D2. Routing, not rewriting
+
+`RoutedPayments` (`src/paypal/routed.ts`) is a `PaymentsApi` composed of the operator's client and a map of payee
+clients keyed by merchant id. `BookingService` still calls one `PaymentsApi`.
+
+- **What it routes.** `refundCapture` and `getRefund` go to the client of the capture's payee. Everything else
+  (`createOrder`, `getOrder`, `captureOrder`, `getCapture`, `verifyWebhookSignature`, `getAppOwner`) goes to the
+  operator's client.
+- **Why keyed by payee.** Which app may act is decided by whose money it is, not by the kind of call, so the
+  payee's merchant id is the key. A second guide with their own app is one more map entry (a config change),
+  and a payee with no entry is refused by construction.
+- **Where the payee comes from.** The service knows each booking's payee:
+  - `payeeOfCapture(captureId)` answers the frozen quote's payee merchant id, which `orderProblem` checked against
+    PayPal's own order before the capture and on its reply.
+  - It answers only for a booking recorded as paid (`captured`) and only when exactly one booking has the capture;
+    otherwise undefined.
+  - The router takes these lookups as `PayeeLookup` closures, because the service is built after the router.
+- **A refund GET by id.** `getRefund(refundId, captureId?)` gains an optional capture id: a routing hint, never
+  sent. The service passes the booking's capture in both of its refund GETs (`#refreshNow` and
+  `#refundEvidenceNow`). Without the hint, the router uses `captureOfRefund(refundId)`, the capture of the one
+  booking whose refund operation recorded that id.
+  - **Why a hint, not only that lookup.** The evidence GET (§19 I5, F2) reads a refund that no operation has
+    recorded yet: that is its precondition, so a lookup by the refund's operation can't find it. The booking that
+    the resource names (its `custom_id` or its `up` link) does give the capture. With the hint, POST and GET follow
+    one rule: route by the capture's payee.
+  - **Rejected alternatives:**
+    - asking each app in turn until one doesn't answer 403: extra calls, the operator's 403 as noise, and worse
+      with each guide added;
+    - reading the payee from `GET /v2/payments/captures/{id}`: whether it carries the payee is unverified, and it
+      is an extra call;
+    - having the service pass the payee itself, which puts the routing in the service.
+- **Fail closed, before any POST.** No capture, no paid booking for it, or no app for its payee throws a
+  `PayPalError` with kind `invalid_request`, status 0, code `PAYEE_APP_NOT_CONFIGURED` and `maybeDelivered: false`.
+  Nothing is sent. The service treats it as PayPal refusing outright (`isDefinitive`), so I1 decides as before:
+  - a new operation is `failed`, its reservation released, and the booking stays `captured`;
+  - a resend of an operation that may have reached PayPal is held for review (`unknown`, `refund.resend_refused`),
+    never failed;
+  - the agent gets "PayPal error: ... PAYEE_APP_NOT_CONFIGURED", not `refund_unconfirmed`;
+  - a refund GET for such a payee is skipped by the lenient refresh. The webhook's strict refresh and evidence GET
+    throw, so the webhook answers 500 and PayPal redelivers: nothing is dropped silently (I5).
+
+### D3. Identity by the payee echo
+
+`PaymentsApi.getOperatorIdentity` (userinfo) became `getAppOwner`. It creates `IDENTITY_ORDER`:
+- intent `CAPTURE`, EUR 1.00, no payee;
+- the description "Ambree identity check: names this REST app's owner. It is never approved and lapses.";
+- a fresh `PayPal-Request-Id` (`identity-<uuid>`).
+
+It reads `purchase_units[0].payee.merchant_id`; a missing or odd-looking one is undefined, never guessed.
+
+At startup (`confirmOwners`):
+- the operator app's owner must be `PAYPAL_OPERATOR_MERCHANT_ID`, and no guide's payee or payee-app key;
+- each payee app's owner must be its key: in sandbox mode, `PAYPAL_GUIDE_PAYEE_MERCHANT_ID`;
+- a failed call, an echo with no merchant id, or a mismatch refuses to start, beginning "Operator identity check
+  failed" or "Guide identity check failed";
+- `PAYPAL_OPERATOR_IDENTITY=config-only` skips both checks;
+- `/healthz` reports `operator_identity` and `guide_identity`.
+
+Each start leaves one lapsing probe order in each app's account.
+
+### D4. Two webhook endpoints, one handler
+
+- **The endpoints.** `/webhooks/paypal` is verified through the operator's client and `PAYPAL_WEBHOOK_ID`.
+  `/webhooks/paypal/guide` is verified through the payee apps (`RoutedPayments.payeeWebhooks`), each with its own
+  webhook id (sandbox: the guide's, `PAYPAL_GUIDE_WEBHOOK_ID`).
+  - The payee verifier answers true once a payee app's PayPal says `SUCCESS`.
+  - If none does and one couldn't ask (no webhook id set), it throws, so the endpoint answers 503 and PayPal
+    retries.
+  - Neither endpoint ever verifies with the other's webhook id.
+- **One handler.** After verification both call `handleWebhook(raw, headers, verifier)`. The log line names the
+  endpoint.
+- **The same event on both.** Which app's webhook PayPal uses for a refund made with the guide's app is unknown, so
+  a refund event may arrive on either endpoint, or both, with the same event id. The existing dedupe already
+  handles that:
+  - after verification, the event's booking is found and the rest runs on that booking's queue (`#serial`, §16);
+  - there `beginWebhook` (by event id) makes it a duplicate once its processing completed;
+  - so two deliveries of one event, in turn or at once, are logged and acted on once: the second waits on the
+    queue, then reads "duplicate";
+  - if the first delivery's processing failed (500), the second is processed, as a redelivery would be;
+  - an event that finds no booking is deduped the same way, synchronously.
+- **Tests.** `test/guide-webhooks.test.ts`:
+  - in the world: one event to both endpoints in turn, at once, and after a 500;
+  - over HTTP in sandbox mode: the same event on both endpoints, concurrently, gives one ledger row; each
+    endpoint refuses the other app's webhook;
+  - an empty guide webhook id gives 503;
+  - in fake mode: both endpoints take their own app's events.
+
+### D5. The fake models the permission split
+
+`FakePayPal` has several apps: the options' own id, secret, owner and webhook id are the default (operator's)
+app, and `apps` or `addApp` add more. `fakeAppFor(merchant)` gives a guide's app fixed, low-value test
+credentials.
+- **Tokens.** The bearer token names the calling app, and each logged call records it (`calls[].app`).
+- **Orders.** An order with no payee is paid to the calling app's owner.
+- **Refunds.** A refund POST by any app but the one owned by the capture's payee (its merchant id, or one of its
+  listed emails) is 403 `NOT_AUTHORIZED` / `PERMISSION_DENIED`, and nothing is refunded: no money, no refund, no
+  event. A refund GET is the same.
+- **Captures.** A capture GET is allowed for the order's creator and for the payee.
+- **Idempotency** is per app.
+- **Webhooks.** Each app has its own webhook id.
+  - Order and capture events go to the creating app's webhook, and a refund's events to the refunding app's.
+  - `refundEventsOnBoth` also sends a refund's events, as the same event, to the order creator's webhook.
+  - Each transmission is signed for one webhook id, and verify succeeds only for the calling app's own id.
+  - `emitWebhook` (a test's own event) defaults to the operator's webhook and takes `{ to }`.
+
+The test world, the offline demo (fake mode: one fake app per seed guide payee) and `e2e/serve-sandbox.ts` wire
+an operator app and guide apps. The existing tests pass with wiring changes only. Each such commit names them:
+helpers that pass the webhook's app, refunds made out of band through the guide's app, and env with the guide's
+app. Two identity tests changed for a real reason: they asserted the userinfo call, which D3 replaced.
+
+### D6. The spike
+
+- **The refund app.** `PAYPAL_REFUND_CLIENT_ID`/`_SECRET` (both or neither) is the payee's own app. Every refund
+  call, POST and GET, goes through it when set, otherwise through the operator's, which PayPal refuses (the fake
+  now refuses it too). Both clients share the counters, so the money guard counts every refund POST.
+- **Row a2** reads the payee echo for the operator's app and, when set, the refund app.
+- **`--capture <id> --remaining <amount>`** skips a-d and runs e1-e6 on an existing capture, with A = `--remaining`
+  for `RefundBudget`, so it never refunds more than A.
+  - Row e0 reads the capture (the operator's app; a GET) and refuses, before any refund, an A that can't be what is
+    left: more than the capture; not all of it while it shows no refund (`COMPLETED`); all of it while it shows one
+    (`PARTIALLY_REFUNDED`); any other status; or under 2.00.
+  - e1's `total_refunded_amount` must then equal (C − A) + 1.00, where C is the capture's amount. Otherwise, or
+    with no total at all, the run stops before e2 (row "e1 check"). A wrong `--remaining` could otherwise let e4's
+    "rest of A", or a probe, move money the run doesn't expect.
+  - The premise readings count the refunds made before the run (e4 "= C", P5's running total).
+- **Tests.** `test/spike-capture.test.ts`: its first 24 tests were red at 2b09c16. One more, added with the fake's
+  split, shows a run with no refund app refused at e1 (403), as on 3 Nov.
+
+### D7. Deploy
+
+`deployment.yaml` takes `PAYPAL_GUIDE_CLIENT_ID`, `PAYPAL_GUIDE_CLIENT_SECRET` and `PAYPAL_GUIDE_WEBHOOK_ID` from
+Secret `paypal-secrets`, whose eight keys `test/repo.test.ts` checks. DEPLOY.md gains:
+- the Secret's keys;
+- the second webhook: the guide's app → `https://paypal.ambree.ai/webhooks/paypal/guide`, the same refund events;
+- the identity check.
+
+The README carries the env table and the spike's usage.
+
+### The invariants (§16-§20)
+
+No rule of the service changed: I1-I5, F1-F3, S1-S3, the queue and the review causes are as they were. The
+service changed in three places only:
+- its two refund GETs pass the booking's capture id (a routing hint the REST client ignores);
+- `handleWebhook` takes the endpoint's verifier (default: its `PaymentsApi`, as before);
+- it answers the router's two lookups.
+
+What proves they still hold:
+- the whole suite runs through the router against the permission-split fake: the fix9 and fix10 ordering
+  matrices (324 + 324 + 504 cases), fix9-outcome, fix10-evidence, fix11 and fix8;
+- a refund misrouted to the operator's app would now be refused 403, so those matrices would fail;
+- `test/guide-router.test.ts` pins the no-app refusal for a new operation (failed, nothing sent) and for a resend
+  that may have arrived (held as `unknown`, I1);
+- `test/guide-webhooks.test.ts` pins that one refund event on both endpoints is recovered once (I2) and logged once.
+
+### What production would use instead
+
+PayPal partner onboarding (Partner Referrals) with the guide's consent to `REFUND` (third-party permissions), and
+`PayPal-Auth-Assertion` naming the guide, sent from Ambree's own app. Ambree would then hold no guide credentials.
+That needs PayPal to enable partner features for the app; the sandbox refused both calls on 3 Nov. Until then, the
+router's map holds one app per guide, which only the demo's single sandbox guide can be.
+
+### The wording for the demo
+
+"Ambree triggers the refund with the guide's own PayPal app credentials." The money still goes from the guide's
+account back to the traveller; Ambree is never the payee and never holds it.
+
+### Premises still open
+
+The refund replies above answer P2 and P2b (on the reply and on GET) and show P5's field present. Whether that
+field is the running total (e4, e4b) is still open, and so are:
+- **P1** (dedupe of a repeated `PayPal-Request-Id`) and **P7** (the issue a refused refund carries): rerun the spike
+  on the 3 Nov capture, with `PAYPAL_REFUND_CLIENT_*` set and `--capture <id> --remaining <what is left>`;
+- **P3** (the resource of `PAYMENT.CAPTURE.REFUNDED` and `REVERSED`), **P4** (the refund failure event names) and
+  **P6** (PENDING, then FAILED or CANCELLED): the developer dashboard's webhook simulator and event log, now for
+  both apps;
+- **new: which app's webhook** PayPal notifies about a refund made with the guide's app, or both. Both are
+  subscribed and the app takes either. The pod's `{"event":"webhook","endpoint":...}` log lines will answer it.
