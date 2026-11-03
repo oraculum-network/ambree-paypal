@@ -91,7 +91,8 @@ export class PayPalRestClient implements PaymentsApi {
     return this.#api<Refund>("POST", `/v2/payments/captures/${checkId(captureId, call)}/refund`, call, body, requestId);
   }
 
-  async getRefund(refundId: string): Promise<Refund> {
+  /** The capture id is RoutedPayments' routing hint; this client is one app and ignores it. */
+  async getRefund(refundId: string, _captureId?: string): Promise<Refund> {
     const call = "GET /v2/payments/refunds/{id}";
     return this.#api<Refund>("GET", `/v2/payments/refunds/${checkId(refundId, call)}`, call);
   }

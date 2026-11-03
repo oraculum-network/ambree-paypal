@@ -347,7 +347,7 @@ describe("I5: no refund evidence is dropped silently", () => {
     const { w, id, got, captureId } = await offered({ totals: false });
     expect(await w.service.refund(id, "10.00")).toMatchObject({ status: "partially_refunded" });
     w.fake.pendNextRefund();
-    const oob = await w.payments.refundCapture(captureId, { amount: eur("5.00"), custom_id: id }, "out-of-band-1");
+    const oob = await w.guide.refundCapture(captureId, { amount: eur("5.00"), custom_id: id }, "out-of-band-1");
     w.fake.emitWebhook("PAYMENT.REFUND.PENDING", "refund", { id: oob.id, status: "PENDING", amount: eur("5.00"), custom_id: id });
     await w.fake.flush();
     expect(await deliver(w, got.at(-1)!)).toEqual({ status: 200, result: "logged" });

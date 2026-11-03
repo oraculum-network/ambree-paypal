@@ -34,8 +34,8 @@ describe("PAYMENT.CAPTURE.REVERSED with a refund resource is refund evidence", (
   it.each([true, false])("custom_id present: %s. The reversal holds the booking (unexplained); the move is no longer answerable", async (customId) => {
     const { w, id, got, captureId } = await booked(customId);
     // PayPal reverses the capture (a dispute or chargeback): money goes back to the buyer without our asking.
-    const reversal = await w.payments.refundCapture(captureId, {}, "paypal-reversal-1");
-    const resource = await w.payments.getRefund(reversal.id);
+    const reversal = await w.guide.refundCapture(captureId, {}, "paypal-reversal-1");
+    const resource = await w.guide.getRefund(reversal.id);
     w.fake.emitWebhook("PAYMENT.CAPTURE.REVERSED", "refund", resource);
     await w.fake.flush();
     expect(eventType(got.at(-1)!)).toBe("PAYMENT.CAPTURE.REVERSED"); // not the fake's own REFUNDED for it

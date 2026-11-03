@@ -416,6 +416,23 @@ export class BookingService {
     return this.#bookings.list().filter((b) => b.conversation_id === conversationId);
   }
 
+  /**
+   * For the payments router (§21, RoutedPayments' PayeeLookup): the merchant id of the account a capture
+   * paid. That is the booking's frozen quote payee, which orderProblem checked against PayPal's own order
+   * before the capture and on its reply, so only a booking recorded as paid (`captured`) answers. Undefined
+   * when no such booking, or more than one, has this capture: the router then sends nothing.
+   */
+  payeeOfCapture(captureId: string): string | undefined {
+    const found = this.#bookings.list().filter((b) => b.capture_id === captureId && b.captured);
+    return found.length === 1 ? found[0]!.quote?.payee.merchant_id : undefined;
+  }
+
+  /** For the payments router: the capture of the one booking whose refund operation recorded `refundId`. */
+  captureOfRefund(refundId: string): string | undefined {
+    const found = this.#bookings.list().filter((b) => b.refund_ops.some((o) => o.refund_id === refundId));
+    return found.length === 1 ? found[0]!.capture_id : undefined;
+  }
+
   mandateView(b: Booking): MandateView | undefined {
     const m = b.mandate_id ? this.#d.mandates.get(b.mandate_id) : undefined;
     return m ? view(m) : undefined;
@@ -1185,10 +1202,12 @@ export class BookingService {
    * webhook). `lenient: false` (the webhook) throws on the first GET that fails, so the webhook answers 500.
    */
   async #refreshNow(bookingId: string, opts: { lenient: boolean }): Promise<Booking> {
-    for (const op of this.must(bookingId).refund_ops.filter((o) => o.status === "pending" && o.refund_id)) {
+    const b = this.must(bookingId);
+    for (const op of b.refund_ops.filter((o) => o.status === "pending" && o.refund_id)) {
       let refund: Refund;
       try {
-        refund = await this.#d.payments.getRefund(op.refund_id!);
+        // The capture id only routes the GET to the payee's own app (§21); it is fixed once captured.
+        refund = await this.#d.payments.getRefund(op.refund_id!, b.capture_id);
       } catch (e) {
         if (opts.lenient) continue;
         throw e;
@@ -1221,7 +1240,9 @@ export class BookingService {
     const b = this.must(bookingId);
     const refundId = typeof resource.id === "string" ? resource.id : undefined;
     if (!refundId || !b.captured || !namesBooking(resource, b) || b.refund_ops.some((o) => o.refund_id === refundId)) return;
-    const refund = await this.#d.payments.getRefund(refundId);
+    // No operation has this refund id yet, so the router can't find its capture by it: the booking it names
+    // gives the capture, which routes the GET to the payee's own app (§21). Nothing else changes.
+    const refund = await this.#d.payments.getRefund(refundId, b.capture_id);
     if (refund.id !== refundId || namesOther(refund, b)) return;
     const now = this.must(bookingId);
     if (now.refund_ops.some((o) => o.refund_id === refundId)) return; // recorded meanwhile (only a writer outside the service could)

@@ -1,6 +1,8 @@
 // A whole app world in memory: sqlite :memory:, the fake PayPal (webhooks delivered straight into the
 // service), the demo cyclone feed and a controllable clock. `payments` and `weather` can wrap what the
 // service talks to (e.g. to hold one PayPal reply or one feed lookup while a test changes the booking).
+// The service pays through RoutedPayments (DESIGN.md §21): the operator's app for orders and captures, and
+// each guide payee's own app for its refunds.
 
 import { Channels } from "../../src/booking/channels.ts";
 import { BookingService } from "../../src/booking/service.ts";
@@ -10,6 +12,7 @@ import { Mandates } from "../../src/mandate/mandate.ts";
 import type { PaymentsApi } from "../../src/paypal/api.ts";
 import { PayPalRestClient } from "../../src/paypal/client.ts";
 import { FakePayPal } from "../../src/paypal/fake.ts";
+import { RoutedPayments } from "../../src/paypal/routed.ts";
 import type { Payee } from "../../src/paypal/types.ts";
 import { openDb } from "../../src/store/db.ts";
 import { type CycloneFeed, DemoCycloneFeed } from "../../src/weather/cyclones.ts";
@@ -17,8 +20,12 @@ import { type CycloneFeed, DemoCycloneFeed } from "../../src/weather/cyclones.ts
 export interface WorldOptions {
   start?: string;
   operatorPayees?: Payee[];
-  /** Wraps the PayPal REST client the service pays through. */
+  /** Wraps what the service pays through (the router over the apps). */
   payments?: (inner: PaymentsApi) => PaymentsApi;
+  /** Wraps each app's client inside the router: `name` is "operator" or the payee's merchant id. */
+  apps?: (name: string, inner: PaymentsApi) => PaymentsApi;
+  /** The guide payees (merchant ids) that have their own app. Default: every seed guide's. Left out: its refunds fail closed. */
+  payeeApps?: string[];
   /** Wraps the demo cyclone feed the service reads (`weather` in the result stays the demo feed). */
   weather?: (inner: DemoCycloneFeed) => CycloneFeed;
 }
@@ -28,17 +35,28 @@ export function makeWorld(opts: WorldOptions = {}) {
   const now = () => new Date(t);
   const db = openDb();
   const fake = new FakePayPal({ checkoutUrl: "http://127.0.0.1/fake-paypal/checkout" });
-  const payments = new PayPalRestClient({ clientId: fake.clientId, clientSecret: fake.clientSecret, webhookId: fake.webhookId, fetch: fake.fetch });
+  const guides = guidesWithPayee(undefined);
+  const wrap = (name: string, c: PaymentsApi) => (opts.apps ? opts.apps(name, c) : c);
+  const operator = new PayPalRestClient({ clientId: fake.clientId, clientSecret: fake.clientSecret, webhookId: fake.webhookId, fetch: fake.fetch });
+  const payeeIds = opts.payeeApps ?? [...new Set(guides.map((g) => g.payee.merchant_id))];
+  /** Each guide payee's own app (until the fake models several apps, a client of its one app). */
+  const guideApps = new Map(payeeIds.map((m) => [m, new PayPalRestClient({ clientId: fake.clientId, clientSecret: fake.clientSecret, webhookId: fake.webhookId, fetch: fake.fetch })]));
+  let service!: BookingService;
+  const payments = new RoutedPayments({
+    operator: wrap("operator", operator),
+    payees: new Map([...guideApps].map(([m, c]) => [m, wrap(m, c)])),
+    lookup: { payeeOfCapture: (c) => service.payeeOfCapture(c), captureOfRefund: (r) => service.captureOfRefund(r) },
+  });
   const ledger = new Ledger(db, now);
   const mandates = new Mandates(db, now);
   const channels = new Channels();
   const weather = new DemoCycloneFeed();
-  const service = new BookingService({
+  service = new BookingService({
     db,
     ledger,
     mandates,
     payments: opts.payments ? opts.payments(payments) : payments,
-    guides: guidesWithPayee(undefined),
+    guides,
     weather: opts.weather ? opts.weather(weather) : weather,
     channels,
     publicUrl: "http://127.0.0.1:3999",
@@ -49,7 +67,9 @@ export function makeWorld(opts: WorldOptions = {}) {
   fake.deliver = async (raw, headers) => {
     webhookResults.push(await service.handleWebhook(raw, headers));
   };
-  return { db, fake, payments, ledger, mandates, channels, weather, service, webhookResults, now, advance: (ms: number) => (t += ms) };
+  /** The first seed guide's own app (g_lantern's, the guide every test books): PayPal acting on its own. */
+  const guide = guideApps.get(guides[0]!.payee.merchant_id) ?? new PayPalRestClient({ clientId: fake.clientId, clientSecret: fake.clientSecret, fetch: fake.fetch });
+  return { db, fake, payments, operator, guideApps, guide, ledger, mandates, channels, weather, service, webhookResults, now, advance: (ms: number) => (t += ms) };
 }
 
 export function tokenOf(operatorUrl: string): string {

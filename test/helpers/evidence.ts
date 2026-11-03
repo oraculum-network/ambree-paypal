@@ -19,7 +19,7 @@ export function expectMoneyTruth(w: World, id: string): void {
   expect({ paypal: w.fake.refundedFrom(b.capture_id!) }).toEqual({ paypal: b.refunded_minor + heldMinor(w, id) });
 }
 
-/** Every refund PayPal made, as its GET shows it now. */
+/** Every refund PayPal made, as its GET by the guide's own app (the only one PayPal lets read them) shows it now. */
 export async function paypalRefunds(w: World): Promise<Refund[]> {
-  return Promise.all(w.fake.refundIds().map((r) => w.payments.getRefund(r)));
+  return Promise.all(w.fake.refundIds().map((r) => w.guide.getRefund(r)));
 }
