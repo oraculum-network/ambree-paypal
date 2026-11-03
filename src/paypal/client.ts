@@ -21,6 +21,12 @@ export interface PayPalClientOptions extends PayPalCredentials {
   now?: () => number;
   /** Called after each HTTP exchange with no ids, bodies or headers (for the spike's table and logs). */
   onCall?: (c: { call: string; status: number; ms: number }) => void;
+  /**
+   * How many times a write with a PayPal-Request-Id is sent again after a network error or a 5xx (default 1;
+   * a GET is always retried once). The spike passes 0, so each refund POST is one exchange and the client's
+   * own resend never mixes into what it asks PayPal (DESIGN.md §5 S12).
+   */
+  writeRetries?: number;
 }
 
 /** A refreshed token is used until this long before PayPal says it expires. */
@@ -39,6 +45,7 @@ export class PayPalRestClient implements PaymentsApi {
   readonly #timeoutMs: number;
   readonly #now: () => number;
   readonly #onCall: PayPalClientOptions["onCall"];
+  readonly #writeRetries: number;
   #token: { value: string; expiresAt: number } | undefined;
   #pendingToken: Promise<string> | undefined;
 
@@ -52,6 +59,9 @@ export class PayPalRestClient implements PaymentsApi {
     this.#timeoutMs = opts.timeoutMs ?? 15_000;
     this.#now = opts.now ?? Date.now;
     this.#onCall = opts.onCall;
+    const retries = opts.writeRetries ?? 1;
+    if (!Number.isInteger(retries) || retries < 0) throw new RangeError("writeRetries must be a whole number, 0 or more");
+    this.#writeRetries = retries;
   }
 
   /** Never print the client: this keeps credentials out of util.inspect and JSON.stringify. */
@@ -142,8 +152,9 @@ export class PayPalRestClient implements PaymentsApi {
   }
 
   async #api<T>(method: "GET" | "POST", path: string, call: string, body?: unknown, requestId?: string): Promise<T> {
-    // A write is retried once on a network error or 5xx only if PayPal can dedupe it (PayPal-Request-Id).
-    const attempts = method === "GET" || requestId ? 2 : 1;
+    // A GET is retried once on a network error or 5xx. A write is retried (writeRetries times, default once)
+    // only if PayPal can dedupe it (PayPal-Request-Id).
+    const attempts = method === "GET" ? 2 : requestId ? 1 + this.#writeRetries : 1;
     let refreshed = false;
     // Whether an attempt so far may have reached PayPal (a network error or a 5xx): the error this call
     // ends with then says so (maybeDelivered), even if the last attempt was refused outright.
