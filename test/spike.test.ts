@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
-import { RefundBudget, type RefundCall, RefundGuardRefused, type RefundRun, type Row, buildOrder, formatTable, parseArgs, readEnv, redact, refundOk, refundPremises, refundProblems, refundRows, runSpike, scrub, spikeClient } from "../scripts/spike.ts";
+import { RefundBudget, type RefundCall, RefundGuardRefused, type RefundRun, type Row, buildOrder, formatTable, parseArgs, readEnv, redact, refundOk, refundPremises, refundProblems, refundRows, runSpike, scrub, spikeClient, spikeReport, type SpikeDeps, type SpikeProgress } from "../scripts/spike.ts";
 import { FakePayPal } from "../src/paypal/fake.ts";
 import { toMinor } from "../src/paypal/money.ts";
 import { LiveEnvironmentRefused } from "../src/paypal/sandbox.ts";
@@ -96,6 +96,8 @@ describe("spike run against the fake", () => {
     beforeRefundPost?: (n: number, fake: FakePayPal) => void;
     /** The fake handles the n-th refund POST exchange (or refund GET) as usual, but its reply arrives with this body. */
     replyBody?: { post?: number; get?: number; body: string };
+    /** Changes the deps the run gets (e.g. a counter that throws). */
+    wrapDeps?: (d: SpikeDeps) => SpikeDeps;
   }
   /** One refund POST exchange as the spike sent it: its request id, the amount asked, and what was left of A on the capture then. */
   interface Ask {
@@ -139,8 +141,8 @@ describe("spike run against the fake", () => {
       fake,
       printed,
       asks,
-      run: () =>
-        runSpike({
+      run: (progress?: SpikeProgress) => {
+        const deps: SpikeDeps = {
           api,
           args: parseArgs(argv),
           runId: "T1",
@@ -156,7 +158,9 @@ describe("spike run against the fake", () => {
               fake.approve(orderId);
             }
           },
-        }),
+        };
+        return runSpike(opts.wrapDeps ? opts.wrapDeps(deps) : deps, progress);
+      },
     };
   }
 
@@ -504,6 +508,58 @@ describe("spike run against the fake", () => {
     expect(rows.find((r) => r.step === "e4 rest")!.note).toBe("COMPLETED; EUR 9.00; total_refunded_amount EUR 10.00 (= A: yes)");
     expect(h.fake.refundedFrom(rows.find((r) => r.step === "d capture")!.id)).toBe(1000);
     expectAsksFit(h.asks);
+  });
+
+  describe("what main prints after the run (spikeReport)", () => {
+    const HEAD: Row[] = [{ step: "a token", call: "POST /v1/oauth2/token", status: "200", id: "", note: "token cached (never printed)" }];
+
+    it("OK: the table, the premise block and SPIKE OK", async () => {
+      const h = harness(["--payee-email", "g@business.example.com", "--poll", "1"]);
+      const progress: SpikeProgress = { rows: [] };
+      const result = await h.run(progress);
+      const { ok, text } = spikeReport(HEAD, progress, { result });
+      expect(ok).toBe(true);
+      expect(text).toMatch(/\ne4b get +\| GET \/v2\/payments\/refunds\/\{id\} +\| 200 /);
+      expect(text).toContain("\n\nRefund premises (DESIGN.md §19-§20)\nP1 dedupe (e2, e6): e2 DEDUPED");
+      expect(text.endsWith("\n\nSPIKE OK: paste this table and the premise block into the CTO's notes.")).toBe(true);
+    });
+
+    it("not OK: SPIKE FAILED names the reason", async () => {
+      const h = harness(["--payee-email", "g@business.example.com", "--poll", "1"]);
+      onRefundPost(h.fake, 4, { status: 429, body: RATE });
+      const progress: SpikeProgress = { rows: [] };
+      const { ok, text } = spikeReport(HEAD, progress, { result: await h.run(progress) });
+      expect(ok).toBe(false);
+      expect(text.endsWith("\n\nSPIKE FAILED (e5: no answer (HTTP 429 is not a refusal)): paste this table and the premise block into the CTO's notes.")).toBe(true);
+    });
+
+    it("a run that throws: the rows so far, where it stopped, the premise block, then SPIKE FAILED", async () => {
+      let n = 0;
+      // The 5th read of the refund counter is e4's, before it is sent.
+      const h = harness(["--payee-email", "g@business.example.com", "--poll", "1"], {
+        wrapDeps: (d) => ({ ...d, refundPosts: () => (++n === 5 ? (() => { throw new Error("counter broke"); })() : d.refundPosts()) }),
+      });
+      const progress: SpikeProgress = { rows: [] };
+      const crash = await h.run(progress).then(() => undefined, (e: unknown) => e);
+      expect(crash).toBeInstanceOf(Error);
+      expect(refundPostsIn(h.fake)).toHaveLength(2);
+      const { ok, text } = spikeReport(HEAD, progress, { crash });
+      expect(ok).toBe(false);
+      const steps = text.split("\n").map((l) => l.split(" | ")[0]!.trim());
+      expect(steps.slice(3, 10)).toEqual(["a token", "b create", "c poll", "d capture", "e1 refund", "e2 dedupe", "e3 get"]);
+      expect(text).toMatch(/\nstopped +\| - +\| - +\| +\| the run stopped: counter broke\n/);
+      expect(text).toContain("P1 dedupe (e2, e6): e2 DEDUPED (same refund id); e6 not run → yes for e2; e6 unanswered");
+      expect(text.endsWith("\n\nSPIKE FAILED (the run stopped: counter broke): paste this table and the premise block into the CTO's notes.")).toBe(true);
+    });
+
+    it("never throws itself: a row or a block that can't be rendered is replaced", () => {
+      const trap = { id: "R1", get status(): never { throw new Error("bad status") } } as unknown as Refund;
+      const progress: SpikeProgress = { rows: [], refunds: { captureId: "C1", captured: { currency_code: "EUR", value: "10.00" }, customId: "spike-X", e1: { http: 201, refund: trap } } };
+      const { ok, text } = spikeReport(HEAD, progress, { crash: new Error("bad status") });
+      expect(ok).toBe(false);
+      expect(text).toContain("| R1 | (this row couldn't be shown)");
+      expect(text).toContain("Refund premises (DESIGN.md §19-§20)\n(the premises couldn't be read from what the run saw)");
+    });
   });
 
   it("times out cleanly if nobody approves", async () => {

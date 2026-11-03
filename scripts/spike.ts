@@ -214,12 +214,20 @@ export interface SpikeResult {
   refunds?: RefundRun;
 }
 
+/** What a run has collected so far. main passes one in, so a run that throws still prints what it saw. */
+export interface SpikeProgress {
+  /** The rows of (b)-(d). (e)'s rows are refundRows(refunds). */
+  rows: Row[];
+  /** The refund sequence, filled in as it goes. */
+  refunds?: RefundRun;
+}
+
 /**
  * Runs (b)-(e). Returns the rows, whether every step that ran succeeded (for (e), every planned call ran:
  * refundOk) and why not, and what the refund sequence saw, for the premise block.
  */
-export async function runSpike(d: SpikeDeps): Promise<SpikeResult> {
-  const rows: Row[] = [];
+export async function runSpike(d: SpikeDeps, progress: SpikeProgress = { rows: [] }): Promise<SpikeResult> {
+  const rows = progress.rows;
   const status = () => String(d.lastStatus() || "-");
   const stopped = (step: string): SpikeResult => ({ rows, ok: false, problem: `stopped at ${step} (see its row)` });
   const fail = (step: string, call: string, e: unknown) => {
@@ -274,10 +282,9 @@ export async function runSpike(d: SpikeDeps): Promise<SpikeResult> {
     rows.push({ step: "e refund", call: "-", status: "-", id: "", note: "skipped (--no-refund)" });
     return { rows, ok: true };
   }
-  const refunds = await runRefundPremises(d, capture);
-  rows.push(...refundRows(refunds));
+  const refunds = await runRefundPremises(d, capture, progress);
   const problems = refundProblems(refunds);
-  return { rows, ok: problems.length === 0, problem: problems.join("; ") || undefined, refunds };
+  return { rows: [...rows, ...refundRows(refunds)], ok: problems.length === 0, problem: problems.join("; ") || undefined, refunds };
 }
 
 // ---------- (e) the refund premises (DESIGN.md §5 S12; §19 "Verify in spike S11"; §20) ----------
@@ -404,7 +411,8 @@ export class RefundBudget {
         this.#ids.add(c.refund.id);
         if (c.refund.status !== "FAILED" && c.refund.status !== "CANCELLED") this.#confirmed += Math.min(minorIn(c.refund.amount, this.currency) ?? askedMinor, askedMinor);
       }
-    } else if (c.error?.maybeDelivered) {
+    } else if (!c.error || c.error.maybeDelivered) {
+      // A lost or unreadable reply (or none at all): PayPal may have refunded.
       counted = c.http >= 400 && c.http < 500 ? n - 1 : n;
     }
     this.#worst += askedMinor * counted;
@@ -432,14 +440,28 @@ function fmtMoney(m: Money): string {
   }
 }
 
+/** A reply the spike can read as a refund: an object with a string id. */
+function isRefundReply(x: unknown): x is Refund {
+  return typeof x === "object" && x !== null && typeof (x as { id?: unknown }).id === "string" && (x as { id: string }).id.length > 0;
+}
+
+/**
+ * A 2xx whose body is no refund (empty, unreadable, or without an id). On a refund POST PayPal acted on it,
+ * so it may have refunded: the guard counts it, and it is never read as DEDUPED.
+ */
+function invalidReply(call: string, http: number, post: boolean): RefundCall {
+  return { http, error: { kind: "invalid_response", issues: [], summary: `${call} · HTTP ${http} · no refund in the reply`, maybeDelivered: post } };
+}
+
 function callFromError(e: unknown): RefundCall {
   if (e instanceof PayPalError) return { http: e.status, error: { kind: e.kind, issues: e.issues, summary: scrub(e.summary()), maybeDelivered: e.maybeDelivered } };
   return { http: 0, error: { kind: "error", issues: [], summary: scrub(e instanceof Error ? e.message : "unknown error"), maybeDelivered: true } };
 }
 
 /** e1-e6 on the capture. Stops after e1 if e1 made no refund. Every refund POST passes the guard first. */
-async function runRefundPremises(d: SpikeDeps, capture: Capture): Promise<RefundRun> {
+async function runRefundPremises(d: SpikeDeps, capture: Capture, progress: SpikeProgress): Promise<RefundRun> {
   const run: RefundRun = { captureId: capture.id, captured: capture.amount, customId: `spike-${d.runId}` };
+  progress.refunds = run;
   const a = capture.amount;
   let capturedMinor: number;
   try {
@@ -469,8 +491,8 @@ async function runRefundPremises(d: SpikeDeps, capture: Capture): Promise<Refund
     const before = d.refundPosts();
     let c: RefundCall;
     try {
-      const refund = await d.api.refundCapture(capture.id, b, requestId);
-      c = { http: d.lastStatus(), refund };
+      const refund: unknown = await d.api.refundCapture(capture.id, b, requestId);
+      c = isRefundReply(refund) ? { http: d.lastStatus(), refund } : invalidReply(REFUND_CALL, d.lastStatus(), true);
     } catch (e) {
       c = callFromError(e);
     }
@@ -489,8 +511,8 @@ async function runRefundPremises(d: SpikeDeps, capture: Capture): Promise<Refund
 
   const get = async (refundId: string): Promise<RefundCall> => {
     try {
-      const refund = await d.api.getRefund(refundId);
-      return { http: d.lastStatus(), refund };
+      const refund: unknown = await d.api.getRefund(refundId);
+      return isRefundReply(refund) ? { http: d.lastStatus(), refund } : invalidReply(GET_REFUND_CALL, d.lastStatus(), false);
     } catch (e) {
       return callFromError(e);
     }
@@ -550,18 +572,30 @@ function isRefusal(c: RefundCall): boolean {
 }
 
 /**
- * Why a call has no answer. A refund POST whose reply was lost (a network error, a timeout or a 5xx), or
- * refused after an earlier attempt's reply was lost, may have refunded. A 4xx that isn't a refusal (see
- * isRefusal) says nothing about the refund.
+ * Whether a call that made no refund still answered its step: on e2, e5 and e6 only a refusal does; on e1,
+ * e3, e4 and e4b PayPal's own error does (S4). A lost or unreadable reply, or none at all, never does.
+ */
+function answered(key: StepKey, c: RefundCall): boolean {
+  const e = c.error;
+  if (!e || e.kind === "invalid_response") return false;
+  return isPremise(key) ? isRefusal(c) : !e.maybeDelivered;
+}
+
+/**
+ * Why a call has no answer. A refund POST whose reply was lost (a network error, a timeout or a 5xx), was
+ * unreadable, or was refused after an earlier attempt's reply was lost, may have refunded. A 4xx that isn't
+ * a refusal (see isRefusal) says nothing about the refund.
  */
 function noAnswer(c: RefundCall, post: boolean): string {
   const e = c.error;
-  if (e?.maybeDelivered) {
+  if (!e) return "no answer (nothing came back)";
+  if (e.kind === "invalid_response") return `no answer (HTTP ${c.http || "2xx"} with no refund in the reply${post ? "; PayPal may have refunded" : ""})`;
+  if (e.maybeDelivered) {
     if (!post) return "no answer (the reply was lost)";
     return is4xx(c) ? "no answer (an earlier attempt's reply may have been lost; PayPal may have refunded)" : "no answer (the reply may have been lost; PayPal may have refunded)";
   }
   if (is4xx(c)) return `no answer (HTTP ${c.http} is not a refusal)`;
-  return `no answer (${e?.summary ?? "nothing came back"})`;
+  return `no answer (${e.kind})`;
 }
 
 /**
@@ -627,10 +661,8 @@ function noteOf(key: StepKey, c: RefundCall, run: RefundRun): string {
   if (c.guard) return `not sent: ${c.guard}`;
   const r = c.refund;
   if (!r) {
+    if (!answered(key, c)) return c.error ? `${noAnswer(c, !isGet(key))}: ${errorNote(c)}` : noAnswer(c, !isGet(key));
     const e = c.error!;
-    // e2, e5 and e6 are answered only by a refusal; e1, e3, e4 and e4b show PayPal's error as it is (S4)
-    // unless the reply may have been lost.
-    if (isPremise(key) ? !isRefusal(c) : e.maybeDelivered && !isGet(key)) return `${noAnswer(c, !isGet(key))}: ${errorNote(c)}`;
     if (key === "e5") return `refused as expected: HTTP ${c.http}; issues ${e.issues.join(", ") || "none"}; ${e.summary}`;
     if (key === "e6") return `refused: HTTP ${c.http}; issues ${e.issues.join(", ") || "none"}; ${e.summary}`;
     return errorNote(c);
@@ -664,7 +696,7 @@ export function refundRows(run: RefundRun): Row[] {
   for (const [key, step, call] of STEPS) {
     const c = run[key];
     if (!c) continue;
-    const status = c.refund ? String(c.http || "-") : c.error ? String(c.http || c.error.kind) : "-";
+    const status = String(c.http || c.error?.kind || "-");
     rows.push({ step, call, status, id: c.refund?.id ?? "", note: scrub(noteOf(key, c, run)) });
   }
   return rows;
@@ -677,8 +709,7 @@ function outcomeOf(key: StepKey, c: RefundCall | undefined): string {
   if (c.guard) return "not sent (the money guard)";
   if (c.refund) return `refund ${c.refund.id}`;
   const e = c.error;
-  const answered = isPremise(key) ? isRefusal(c) : Boolean(e && !e.maybeDelivered);
-  if (!answered || !e) return noAnswer(c, !isGet(key));
+  if (!e || !answered(key, c)) return noAnswer(c, !isGet(key));
   const what = `HTTP ${c.http || e.kind}${e.issues.length ? ` ${e.issues.join(", ")}` : ""}`;
   return isPremise(key) ? `refused (${what})` : what;
 }
@@ -832,6 +863,45 @@ export function refundPremises(run: RefundRun): string[] {
   ].map(scrub);
 }
 
+/** How a run ended: with a result, or by throwing. */
+export type SpikeOutcome = { result: SpikeResult } | { crash: unknown };
+
+/** refundRows when they can't be rendered: each call's status and id only. */
+function bareRefundRows(run: RefundRun): Row[] {
+  return STEPS.filter(([key]) => run[key]).map(([key, step, call]) => ({ step, call, status: String(run[key]!.http || "-"), id: String(run[key]!.refund?.id ?? "").slice(0, 64), note: "(this row couldn't be shown)" }));
+}
+
+/**
+ * What main prints after the run: the table (`head` and the run's rows), the premise block and the verdict.
+ * If the run threw, it prints what `progress` collected, a row saying where the run stopped, and SPIKE
+ * FAILED. It doesn't throw itself.
+ */
+export function spikeReport(head: Row[], progress: SpikeProgress, outcome: SpikeOutcome): { ok: boolean; text: string } {
+  const attempt = <T>(f: () => T, fallback: () => T): T => {
+    try {
+      return f();
+    } catch {
+      return fallback();
+    }
+  };
+  let rows: Row[];
+  let problem: string | undefined;
+  let ok = false;
+  const refunds = "result" in outcome ? outcome.result.refunds : progress.refunds;
+  if ("result" in outcome) {
+    ({ rows, problem, ok } = outcome.result);
+  } else {
+    const why = scrub(describeError(outcome.crash));
+    const refundPart = refunds ? attempt(() => refundRows(refunds), () => bareRefundRows(refunds)) : [];
+    rows = [...progress.rows, ...refundPart, { step: "stopped", call: "-", status: "-", id: "", note: `the run stopped: ${why}` }];
+    problem = `the run stopped: ${why}`;
+  }
+  const block = refunds ? attempt(() => refundPremises(refunds), () => [PREMISES_HEADING, "(the premises couldn't be read from what the run saw)"]) : undefined;
+  const verdict = ok ? "SPIKE OK" : `SPIKE FAILED (${problem ?? "see the table"})`;
+  const text = `\n${formatTable([...head, ...rows])}${block ? `\n\n${block.join("\n")}` : ""}\n\n${verdict}: paste this table${block ? " and the premise block" : ""} into the CTO's notes.`;
+  return { ok, text };
+}
+
 /**
  * One random id per independent run: it seeds every PayPal-Request-Id and the invoice id, so two runs
  * (even in the same second) never replay each other's orders. Only a deliberate retry of the same
@@ -889,10 +959,17 @@ async function main(): Promise<number> {
   // (a2) S11: who does PayPal say owns this REST app? Informational: a failure here doesn't stop the run.
   rows.push(await identityRow(client));
 
-  const result = await runSpike({ api: client, args, runId, print: out, sleep: (ms) => new Promise((r) => setTimeout(r, ms)), lastStatus, refundPosts });
-  const block = result.refunds ? `\n\n${refundPremises(result.refunds).join("\n")}` : "";
-  out(`\n${formatTable([...rows, ...result.rows])}${block}\n\n${result.ok ? "SPIKE OK" : `SPIKE FAILED (${result.problem ?? "see the table"})`}: paste this table${block ? " and the premise block" : ""} into the CTO's notes.`);
-  return result.ok ? 0 : 1;
+  // A run that throws still prints the rows and the premise block it has, then SPIKE FAILED.
+  const progress: SpikeProgress = { rows: [] };
+  let outcome: SpikeOutcome;
+  try {
+    outcome = { result: await runSpike({ api: client, args, runId, print: out, sleep: (ms) => new Promise((r) => setTimeout(r, ms)), lastStatus, refundPosts }, progress) };
+  } catch (e) {
+    outcome = { crash: e };
+  }
+  const report = spikeReport(rows, progress, outcome);
+  out(report.text);
+  return report.ok ? 0 : 1;
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
