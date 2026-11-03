@@ -1,7 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
-import { REFUND_CALL, RefundBudget, type RefundCall, RefundGuardRefused, type RefundRun, type Row, buildOrder, formatTable, parseArgs, readEnv, redact, refundOk, refundPremises, refundRows, runSpike, scrub } from "../scripts/spike.ts";
-import { PayPalRestClient } from "../src/paypal/client.ts";
+import { RefundBudget, type RefundCall, RefundGuardRefused, type RefundRun, type Row, buildOrder, formatTable, parseArgs, readEnv, redact, refundOk, refundPremises, refundRows, runSpike, scrub, spikeClient } from "../scripts/spike.ts";
 import { FakePayPal } from "../src/paypal/fake.ts";
 import { toMinor } from "../src/paypal/money.ts";
 import { LiveEnvironmentRefused } from "../src/paypal/sandbox.ts";
@@ -131,17 +130,8 @@ describe("spike run against the fake", () => {
       const res = await fake.fetch(input, init);
       return replace && res.ok ? new Response(opts.replyBody!.body || null, { status: res.status, headers: { "Content-Type": "application/json" } }) : res;
     }) as typeof globalThis.fetch;
-    let last = 0;
-    let refundPosts = 0;
-    const api = new PayPalRestClient({
-      clientId: fake.clientId,
-      clientSecret: fake.clientSecret,
-      fetch,
-      onCall: (c) => {
-        last = c.status;
-        if (c.call === REFUND_CALL) refundPosts++;
-      },
-    });
+    // The client and its counters as main builds them: writes sent once, a 401 not counted as a refund exchange.
+    const { client: api, lastStatus, refundPosts } = spikeClient({ clientId: fake.clientId, clientSecret: fake.clientSecret, fetch });
     const printed: string[] = [];
     let sleeps = 0;
     const approveAfterPolls = opts.approveAfterPolls ?? 2;
@@ -155,8 +145,8 @@ describe("spike run against the fake", () => {
           args: parseArgs(argv),
           runId: "T1",
           print: (l) => printed.push(l),
-          lastStatus: () => last,
-          refundPosts: () => refundPosts,
+          lastStatus,
+          refundPosts,
           sleep: async () => {
             sleeps++;
             await new Promise((r) => setTimeout(r, 20));
@@ -754,6 +744,14 @@ describe("the refund money guard", () => {
     const b = new RefundBudget(1000);
     b.record(100, 1, { http: 201 });
     expect([b.worstMinor, b.confirmedMinor]).toEqual([100, 0]);
+  });
+
+  it("reserves the amount once for every exchange a POST may take", () => {
+    const b = new RefundBudget(1000, "EUR", 2);
+    b.record(100, 1, made("R1", "1.00"));
+    expect(() => b.assertRoom("e4", 450)).not.toThrow();
+    expect(() => b.assertRoom("e4", 451)).toThrow("another EUR 4.51 on each of 2 exchanges could take the capture past A");
+    expect(() => new RefundBudget(1000, "EUR", 0)).toThrow(RangeError);
   });
 
   it("doesn't count a FAILED refund as held for the capture", () => {

@@ -8,11 +8,13 @@
 // back, e4 refunds the rest, e4b reads e1 again, e5 asks 1.00 more of the fully refunded capture (a refusal
 // is expected), e6 repeats e4's request; (f) a table of HTTP statuses and ids, and the premise block. It never prints a
 // secret, a token or the client id, refuses any base URL but the sandbox, and never lets PayPal refund more
-// than A (RefundBudget). It answers DESIGN.md §5 S1-S6, S9, S11 and S12. PAYPAL_WEBHOOK_ID is not needed.
+// than A (RefundBudget). Its client sends each write once (spikeClient), so every refund call is one
+// exchange and a lost reply is "no answer". It answers DESIGN.md §5 S1-S6, S9, S11 and S12. PAYPAL_WEBHOOK_ID
+// is not needed.
 
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { PayPalRestClient } from "../src/paypal/client.ts";
+import { type PayPalClientOptions, PayPalRestClient } from "../src/paypal/client.ts";
 import { PayPalError } from "../src/paypal/errors.ts";
 import { formatMoney, isCurrency, money, toMinor } from "../src/paypal/money.ts";
 import { assertSandboxBase } from "../src/paypal/sandbox.ts";
@@ -158,13 +160,46 @@ export interface SpikeDeps {
   runId: string;
   print: (line: string) => void;
   sleep: (ms: number) => Promise<void>;
-  /** The HTTP status of the last call (from the client's onCall hook). */
+  /** The HTTP status of the last call (spikeClient's lastStatus). */
   lastStatus: () => number;
   /**
-   * How many refund POST exchanges (REFUND_CALL) the client has reported so far, its own retries included
-   * (from the onCall hook). The money guard counts every attempt that may have made a refund.
+   * How many refund POST exchanges (REFUND_CALL) PayPal may have acted on so far (spikeClient's refundPosts:
+   * a 401 isn't one). The money guard counts every exchange that may have made a refund.
    */
   refundPosts: () => number;
+}
+
+/**
+ * The spike's client sends a write once: a refund POST is then exactly one exchange, so the client's own
+ * resend never mixes into the dedupe experiment (P1) or makes a refund the spike can't see (P5). A lost reply
+ * is reported as "no answer" instead.
+ */
+export const SPIKE_WRITE_RETRIES = 0;
+
+export interface SpikeClient {
+  client: PayPalRestClient;
+  /** The HTTP status of the last exchange. */
+  lastStatus: () => number;
+  /**
+   * Refund POST exchanges PayPal may have acted on. A 401 isn't one: PayPal refused the token without acting,
+   * and the client sends the request again with a new token.
+   */
+  refundPosts: () => number;
+}
+
+/** The spike's PayPal client (writeRetries SPIKE_WRITE_RETRIES) and its onCall counters. main and the tests build it here. */
+export function spikeClient(opts: Omit<PayPalClientOptions, "onCall" | "writeRetries">): SpikeClient {
+  let last = 0;
+  let refundPosts = 0;
+  const client = new PayPalRestClient({
+    ...opts,
+    writeRetries: SPIKE_WRITE_RETRIES,
+    onCall: (c) => {
+      last = c.status;
+      if (c.call === REFUND_CALL && c.status !== 401) refundPosts++;
+    },
+  });
+  return { client, lastStatus: () => last, refundPosts: () => refundPosts };
 }
 
 function describeError(e: unknown): string {
@@ -250,6 +285,8 @@ type AmountRefund = RefundRequest & { amount: Money };
 export interface RefundCall {
   /** The reply's HTTP status; 0 when none came back or nothing was sent. */
   http: number;
+  /** How many refund POST exchanges it took (spikeClient's count; 1 unless the client resent it). */
+  exchanges?: number;
   /** The reply, on a 2xx. */
   refund?: Refund;
   /** What went wrong otherwise. `issues` is every details[].issue PayPal returned. */
@@ -296,10 +333,10 @@ export class RefundGuardRefused extends Error {
  * - Before a refusal probe (e5, e6): PayPal's own replies already show all of A refunded (distinct refund
  *   ids, not FAILED or CANCELLED, each counted at no more than was asked). The probe asks beyond A on
  *   purpose; PayPal can only refuse it or replay an earlier reply, as the capture holds nothing more.
- * The worst case counts the amount asked once for every exchange that may have reached PayPal, the client's
- * own retry of a lost reply included (it resends the same request id, which only dedupe makes harmless).
- * The one exchange not counted is the last, when it was answered with a refusal or with a refund id already
- * counted.
+ * The spike's client sends a refund POST once (SPIKE_WRITE_RETRIES), so a POST is one exchange. assertRoom
+ * reserves the amount for every exchange a POST may take (exchangesPerPost), and record counts the amount
+ * once for every exchange that may have reached PayPal. The one exchange not counted is the last, when it was
+ * answered with a refusal or with a refund id already counted.
  */
 export class RefundBudget {
   #worst = 0;
@@ -309,10 +346,14 @@ export class RefundBudget {
   readonly capturedMinor: number;
   /** A's currency (only for the messages; the amounts are minor units of it). */
   readonly currency: CurrencyCode;
+  /** The most exchanges one refund POST can take: 1 + the client's writeRetries (the spike's client: 1). */
+  readonly exchangesPerPost: number;
 
-  constructor(capturedMinor: number, currency: CurrencyCode = "EUR") {
+  constructor(capturedMinor: number, currency: CurrencyCode = "EUR", exchangesPerPost = 1) {
+    if (!Number.isInteger(exchangesPerPost) || exchangesPerPost < 1) throw new RangeError("exchangesPerPost must be a whole number, 1 or more");
     this.capturedMinor = capturedMinor;
     this.currency = currency;
+    this.exchangesPerPost = exchangesPerPost;
   }
 
   /** What PayPal may have refunded because of this run, in the worst case. */
@@ -325,11 +366,13 @@ export class RefundBudget {
     return this.#confirmed;
   }
 
-  /** Throws unless PayPal honouring a new refund of `minor` keeps the worst case within A. */
+  /** Throws unless PayPal honouring `minor` on every exchange the POST may take keeps the worst case within A. */
   assertRoom(step: string, minor: number): void {
     if (!Number.isSafeInteger(minor) || minor <= 0) throw new RefundGuardRefused(step, "not a positive amount");
-    if (this.#worst + minor > this.capturedMinor) {
-      throw new RefundGuardRefused(step, `PayPal may already have refunded ${this.#fmt(this.#worst)} of A (${this.#fmt(this.capturedMinor)}); another ${this.#fmt(minor)} could take the capture past A`);
+    const n = this.exchangesPerPost;
+    if (this.#worst + minor * n > this.capturedMinor) {
+      const more = n > 1 ? `${this.#fmt(minor)} on each of ${n} exchanges` : this.#fmt(minor);
+      throw new RefundGuardRefused(step, `PayPal may already have refunded ${this.#fmt(this.#worst)} of A (${this.#fmt(this.capturedMinor)}); another ${more} could take the capture past A`);
     }
   }
 
@@ -401,7 +444,7 @@ async function runRefundPremises(d: SpikeDeps, capture: Capture): Promise<Refund
     return run;
   }
   const currency = a.currency_code;
-  const budget = new RefundBudget(capturedMinor, currency);
+  const budget = new RefundBudget(capturedMinor, currency, 1 + SPIKE_WRITE_RETRIES);
   const body = (minor: number): AmountRefund => ({ amount: money(currency, minor), custom_id: run.customId, note_to_payer: "Ambree spike: refund premises (sandbox)" });
 
   const post = async (step: string, b: AmountRefund, requestId: string, kind: "room" | "probe"): Promise<RefundCall> => {
@@ -421,7 +464,8 @@ async function runRefundPremises(d: SpikeDeps, capture: Capture): Promise<Refund
     } catch (e) {
       c = callFromError(e);
     }
-    budget.record(minor, d.refundPosts() - before, c);
+    c.exchanges = d.refundPosts() - before;
+    budget.record(minor, c.exchanges, c);
     return c;
   };
 
@@ -445,8 +489,8 @@ async function runRefundPremises(d: SpikeDeps, capture: Capture): Promise<Refund
   // e3: e1 read back.
   run.e3 = await get(r1.id);
 
-  // e4: the rest of A (less e2's 1.00 if PayPal may have made it a second refund).
-  const rest = capturedMinor - budget.worstMinor;
+  // e4: the rest of A (less e2's 1.00 if PayPal may have made it a second refund, or e2's reply was lost).
+  const rest = Math.floor((capturedMinor - budget.worstMinor) / budget.exchangesPerPost);
   const id2 = `spike-refund2-${d.runId}`;
   let b4: AmountRefund | undefined;
   if (rest <= 0) {
@@ -480,6 +524,37 @@ const STEPS = [
 type StepKey = (typeof STEPS)[number][0];
 
 const is4xx = (c: RefundCall) => c.http >= 400 && c.http < 500;
+/** A 4xx PayPal answered without any earlier attempt of the call having maybe reached it. */
+const answered4xx = (c: RefundCall) => is4xx(c) && !c.error?.maybeDelivered;
+const isGet = (key: StepKey) => key === "e3" || key === "e4b";
+
+/**
+ * Why a call has no answer. A refund POST whose reply was lost (a network error, a timeout or a 5xx), or
+ * refused after an earlier attempt's reply was lost, may have refunded.
+ */
+function noAnswer(c: RefundCall, post: boolean): string {
+  const e = c.error;
+  if (e?.maybeDelivered) {
+    if (!post) return "no answer (the reply was lost)";
+    return is4xx(c) ? "no answer (an earlier attempt's reply may have been lost; PayPal may have refunded)" : "no answer (the reply may have been lost; PayPal may have refunded)";
+  }
+  return `no answer (${e?.summary ?? "nothing came back"})`;
+}
+
+/**
+ * A refund POST (e1, e2, e4) that may have made a refund its reply doesn't show: no reply came back, or the
+ * call took more than one exchange.
+ */
+function mayHideRefund(c: RefundCall | undefined): boolean {
+  if (!c || c.skipped || c.guard) return false;
+  if ((c.exchanges ?? 1) > 1) return true;
+  return !c.refund && (!c.error || c.error.maybeDelivered);
+}
+
+/** The first of e1, e2 and e4 that may have made a refund the spike never saw: P5's sums are then unknown. */
+function hiddenRefundAt(run: RefundRun): string | undefined {
+  return (["e1", "e2", "e4"] as const).find((k) => mayHideRefund(run[k]));
+}
 const amountOf = (r: Refund) => (r.amount ? fmtMoney(r.amount) : "amount absent");
 const totalOf = (r: Refund) => {
   const t = r.seller_payable_breakdown?.total_refunded_amount;
@@ -530,6 +605,7 @@ function noteOf(key: StepKey, c: RefundCall, run: RefundRun): string {
   const r = c.refund;
   if (!r) {
     const e = c.error!;
+    if (e.maybeDelivered && !isGet(key)) return `${noAnswer(c, true)}: ${errorNote(c)}`;
     if (key === "e5" && is4xx(c)) return `refused as expected: HTTP ${c.http}; issues ${e.issues.join(", ") || "none"}; ${e.summary}`;
     if (key === "e6" && is4xx(c)) return `refused: HTTP ${c.http}; issues ${e.issues.join(", ") || "none"}; ${e.summary}`;
     return errorNote(c);
@@ -578,10 +654,10 @@ export function refundOk(run: RefundRun): boolean {
   const { e1, e2, e3, e4, e5, e6 } = run;
   if (!e1?.refund || !e2?.refund || !e3?.refund || !e4 || !e5 || !e6) return false;
   if (!e4.refund && !e4.skipped) return false;
-  if (!(e5.error && is4xx(e5))) return false;
+  if (!(e5.error && answered4xx(e5))) return false;
   if (e6.skipped) return Boolean(e4.skipped);
   if (e6.refund) return e6.refund.id === e4.refund?.id;
-  return Boolean(e6.error && is4xx(e6));
+  return Boolean(e6.error && answered4xx(e6));
 }
 
 type RepeatKind = "same" | "new" | "refused" | "error" | "notsent" | "notrun";
@@ -591,8 +667,8 @@ function repeatAnswer(c: RefundCall | undefined, firstId: string | undefined, sa
   if (c.skipped) return { kind: "notrun", text: `not run (${c.skipped})` };
   if (c.guard) return { kind: "notsent", text: `not sent (${c.guard})` };
   if (c.refund) return c.refund.id === firstId ? { kind: "same", text: `DEDUPED (${sameText})` } : { kind: "new", text: `NOT DEDUPED (new refund id ${c.refund.id})` };
-  if (is4xx(c)) return { kind: "refused", text: `refused (HTTP ${c.http} ${c.error!.issues.join(", ") || "with no issue names"})` };
-  return { kind: "error", text: `no answer (${c.error!.summary})` };
+  if (answered4xx(c)) return { kind: "refused", text: `refused (HTTP ${c.http} ${c.error!.issues.join(", ") || "with no issue names"})` };
+  return { kind: "error", text: noAnswer(c, true) };
 }
 
 function dedupeVerdict(e2: RepeatKind, e6: RepeatKind): string {
@@ -610,7 +686,7 @@ function refusalAnswer(c: RefundCall | undefined, replayOf: string | undefined):
   if (c.skipped) return `not run (${c.skipped})`;
   if (c.guard) return `not sent (${c.guard})`;
   if (c.refund) return replayOf !== undefined && c.refund.id === replayOf ? "replayed (same refund id as e4), not refused" : `ACCEPTED (refund id ${c.refund.id}): UNEXPECTED`;
-  if (!is4xx(c)) return `no answer (${c.error!.summary})`;
+  if (!answered4xx(c)) return noAnswer(c, true);
   const issues = c.error!.issues;
   if (!issues.length) return `HTTP ${c.http} with no issue names`;
   return `HTTP ${c.http} ${issues.join(", ")}${issues.length > 1 ? ` (the service reads only the first, ${issues[0]})` : ""}`;
@@ -642,6 +718,8 @@ function refundsSeen(run: RefundRun): { sum: number; readable: boolean; last?: {
 
 /** P5's running total: the last refund POST reply that made a new refund, against the refunds made so far. */
 function runningTotal(run: RefundRun): string {
+  const hidden = hiddenRefundAt(run);
+  if (hidden) return `unanswered (${hidden} may have made a refund the spike never saw)`;
   const { readable, last } = refundsSeen(run);
   if (!last) return "not seen";
   const t = last.refund.seller_payable_breakdown?.total_refunded_amount;
@@ -664,6 +742,8 @@ function getAfterE4(run: RefundRun): string {
   const t = c.refund?.seller_payable_breakdown?.total_refunded_amount;
   if (!c.refund) return "not seen";
   if (!t) return "absent";
+  const hidden = hiddenRefundAt(run);
+  if (hidden) return `unanswered (${fmtMoney(t)}; ${hidden} may have made a refund the spike never saw)`;
   const { sum, readable } = refundsSeen(run);
   if (!readable) return `unknown (${fmtMoney(t)}; a refund's amount was unreadable)`;
   const currency = run.captured.currency_code;
@@ -734,15 +814,7 @@ async function main(): Promise<number> {
   }
   // Every printed line goes through redact: no token, auth header, client id or secret reaches the screen.
   const out = (text: string) => process.stdout.write(`${redact(text, [env.clientId, env.clientSecret])}\n`);
-  let last = 0;
-  let refundPosts = 0;
-  const client = new PayPalRestClient({
-    ...env,
-    onCall: (c) => {
-      last = c.status;
-      if (c.call === REFUND_CALL) refundPosts++;
-    },
-  });
+  const { client, lastStatus, refundPosts } = spikeClient(env);
   const runId = newRunId();
   out(`Ambree PayPal spike ${runId} against ${client.baseUrl} (sandbox), payee ${JSON.stringify(args.payee)}, ${args.currency} ${args.value}`);
 
@@ -762,7 +834,7 @@ async function main(): Promise<number> {
   // (a2) S11: who does PayPal say owns this REST app? Informational: a failure here doesn't stop the run.
   rows.push(await identityRow(client));
 
-  const result = await runSpike({ api: client, args, runId, print: out, sleep: (ms) => new Promise((r) => setTimeout(r, ms)), lastStatus: () => last, refundPosts: () => refundPosts });
+  const result = await runSpike({ api: client, args, runId, print: out, sleep: (ms) => new Promise((r) => setTimeout(r, ms)), lastStatus, refundPosts });
   const block = result.refunds ? `\n\n${refundPremises(result.refunds).join("\n")}` : "";
   out(`\n${formatTable([...rows, ...result.rows])}${block}\n\n${result.ok ? "SPIKE OK" : "SPIKE FAILED"}: paste this table${block ? " and the premise block" : ""} into the CTO's notes.`);
   return result.ok ? 0 : 1;
