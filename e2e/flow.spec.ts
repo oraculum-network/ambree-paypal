@@ -105,3 +105,22 @@ test("a code typed at human speed survives the page's refresh, and the transcrip
   await page.waitForTimeout(3_400);
   expect(await t.evaluate((e) => e.scrollTop)).toBe(0);
 });
+
+// When the cards DO change mid-typing (here a second request arrives from another device in the same
+// conversation), the rebuilt approval card keeps the typed digits and the cursor stays in the field.
+test("a half-typed code survives a rebuild of the cards, with the cursor still in it", async ({ page }) => {
+  const { code } = await requestAndPrice(page);
+  const input = page.getByTestId("code");
+  await input.click();
+  await input.pressSequentially(code.slice(0, 3), { delay: 150 });
+  const conv = await page.evaluate(() => sessionStorage.getItem("ambree_conv"));
+  const r = await page.request.post("/api/chat", { data: { message: "Find me a hiking guide for Le Morne on Thursday and hold the spot", conversation_id: conv } });
+  expect(r.ok()).toBe(true);
+  await expect(page.getByTestId("booking")).toHaveCount(2); // the cards were rebuilt
+  await expect(input).toHaveValue(code.slice(0, 3));
+  await expect(input).toBeFocused();
+  await page.keyboard.type(code.slice(3), { delay: 150 });
+  await expect(input).toHaveValue(code);
+  await page.getByTestId("approve").click();
+  await expect(page.getByTestId("pay")).toBeVisible();
+});
