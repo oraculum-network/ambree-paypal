@@ -1,6 +1,7 @@
 import { type Page, expect, test } from "@playwright/test";
 
-async function requestAndPay(page: Page) {
+/** Request, the guide prices it, the approval card is up; returns the step-up code from the inbox. */
+async function requestAndPrice(page: Page) {
   await page.goto("/");
   await page.getByRole("button", { name: "Start over" }).click();
   await page.getByLabel("Message").fill("Find me a hiking guide for Le Morne on Thursday and hold the spot");
@@ -21,6 +22,11 @@ async function requestAndPay(page: Page) {
   const msg = await page.getByTestId("inbox-msg").last().innerText();
   const code = msg.match(/\b(\d{6})\b/)![1]!;
   await expect(page.locator("#transcript")).not.toContainText(code);
+  return { guide, link: link!, code };
+}
+
+async function requestAndPay(page: Page) {
+  const { guide, link, code } = await requestAndPrice(page);
   await page.getByTestId("code").fill(code);
   await page.getByTestId("approve").click();
 
@@ -32,7 +38,7 @@ async function requestAndPay(page: Page) {
   await expect(page.getByTestId("paid")).toContainText("Paid EUR 30.00 to Lantern Ridge Walks (demo)");
   await expect(page.locator('#ledger li[data-kind="webhook.PAYMENT.CAPTURE.COMPLETED"]')).toHaveCount(1);
   await expect(page.locator("#chain")).toContainText("Chain OK");
-  return { guide, link: link!, balance: await balance(page) };
+  return { guide, link, balance: await balance(page) };
 }
 
 /** The guide's fake balance builds up across tests (same server, same guide), so tests compare deltas. */
@@ -63,4 +69,39 @@ test("refund path: cyclone → reschedule declined → deposit refunded", async 
   await expect(page.locator('#ledger li[data-kind="webhook.PAYMENT.CAPTURE.REFUNDED"]')).toHaveCount(1);
   await expect(page.locator("#chain")).toContainText("Chain OK");
   await expect(page.getByTestId("guide-balance")).toContainText((paid - 30).toFixed(2));
+});
+
+// The page polls /api/state every 1.5 s. A person types the code over several polls; the card must keep
+// what they typed, where they typed it, and the button must still be the one they press.
+test("a code typed at human speed survives the page's refresh, and the transcript stays where the reader scrolled it", async ({ page }) => {
+  const { code } = await requestAndPrice(page);
+  // The card's expiry reads the same as the chat's ("expires at HH:MM UTC").
+  const said = (await page.locator("#transcript").innerText()).match(/expires at (\d{2}:\d{2}) UTC/)![1]!;
+  await expect(page.getByTestId("approval-card")).toContainText(`${said} UTC`);
+  const input = page.getByTestId("code");
+  await input.click();
+  await input.pressSequentially(code.slice(0, 3), { delay: 250 });
+  await page.waitForTimeout(3_400); // at least two polls in the middle of typing
+  await expect(input).toHaveValue(code.slice(0, 3));
+  await expect(input).toBeFocused();
+  await page.keyboard.type(code.slice(3), { delay: 250 });
+  await expect(input).toHaveValue(code);
+
+  // A wrong first try: its message stays up across polls too.
+  await input.fill("000000");
+  await page.getByTestId("approve").click();
+  await expect(page.getByTestId("approve-msg")).not.toBeEmpty();
+  await page.waitForTimeout(3_400);
+  await expect(page.getByTestId("approve-msg")).not.toBeEmpty();
+  await expect(input).toHaveValue("000000");
+
+  await input.fill(code);
+  await page.getByTestId("approve").click();
+  await expect(page.getByTestId("pay")).toBeVisible();
+
+  // Reading back up the conversation: nothing new arrives, so the poll leaves the scroll alone.
+  const t = page.locator("#transcript");
+  await t.evaluate((e) => { e.style.maxHeight = "120px"; e.scrollTop = 0; });
+  await page.waitForTimeout(3_400);
+  expect(await t.evaluate((e) => e.scrollTop)).toBe(0);
 });
