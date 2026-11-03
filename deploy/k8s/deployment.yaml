@@ -78,8 +78,8 @@ spec:
             # OpenAI-compatible; the app calls ${LLM_BASE_URL}/chat/completions. TODO-CHECK: the model.
             - name: LLM_BASE_URL
               value: https://openrouter.ai/api/v1
-            - name: LLM_MODEL
-              value: ""
+            - name: LLM_MODEL # free on OpenRouter; tool calling checked on the host 3 Nov
+              value: nvidia/nemotron-3-ultra-550b-a55b:free
             # Secret paypal-secrets (created by hand, DEPLOY.md step 3). Every key is required, so a
             # missing Secret or key stops the pod at CreateContainerConfigError. PAYPAL_WEBHOOK_ID,
             # PAYPAL_GUIDE_WEBHOOK_ID and MCP_DEMO_PASSCODE may hold an empty value: no webhook id = its

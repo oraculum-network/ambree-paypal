@@ -1255,10 +1255,16 @@ account back to the traveller; Ambree is never the payee and never holds it.
 
 ### Premises still open
 
-The refund replies above answer P2 and P2b (on the reply and on GET) and show P5's field present. Whether that
-field is the running total (e4, e4b) is still open, and so are:
-- **P1** (dedupe of a repeated `PayPal-Request-Id`) and **P7** (the issue a refused refund carries): rerun the spike
-  on the 3 Nov capture, with `PAYPAL_REFUND_CLIENT_*` set and `--capture <id> --remaining <what is left>`;
+**Answered on the real sandbox, 3 Nov 17:30** (`spike --capture 9VV56716CC533953E --remaining 9.00`, refunds through
+the guide's app; SPIKE OK):
+- **P1 yes.** A repeated `PayPal-Request-Id` replays the first refund (same id; e2 and e6), also once the capture
+  is fully refunded.
+- **P2 and P2b yes**, on the reply and on GET.
+- **P5 yes**: a running total (EUR 2.00 after e1, EUR 10.00 after e4, on the reply and on GET).
+- **P7:** e5 answers 422 with the issue `CAPTURE_FULLY_REFUNDED`, which is already in `ALREADY_REFUNDED_ISSUES`, so
+  no change is needed.
+
+Still open:
 - **P3** (the resource of `PAYMENT.CAPTURE.REFUNDED` and `REVERSED`), **P4** (the refund failure event names) and
   **P6** (PENDING, then FAILED or CANCELLED): the developer dashboard's webhook simulator and event log, now for
   both apps;
