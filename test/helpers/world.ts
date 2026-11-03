@@ -11,7 +11,7 @@ import { Ledger } from "../../src/ledger/ledger.ts";
 import { Mandates } from "../../src/mandate/mandate.ts";
 import type { PaymentsApi } from "../../src/paypal/api.ts";
 import { PayPalRestClient } from "../../src/paypal/client.ts";
-import { FakePayPal, fakeAppFor } from "../../src/paypal/fake.ts";
+import { type FakeApp, FakePayPal, fakeAppFor } from "../../src/paypal/fake.ts";
 import { RoutedPayments } from "../../src/paypal/routed.ts";
 import type { Payee } from "../../src/paypal/types.ts";
 import { openDb } from "../../src/store/db.ts";
@@ -70,13 +70,20 @@ export function makeWorld(opts: WorldOptions = {}) {
     operatorPayees: opts.operatorPayees ?? [],
   });
   const webhookResults: Array<{ status: number; result: string }> = [];
-  fake.deliver = async (raw, headers) => {
-    webhookResults.push(await service.handleWebhook(raw, headers));
+  /**
+   * A webhook as the app's endpoint takes it (DESIGN.md §21, D4): one on the operator's app's webhook (or
+   * `to` absent) as /webhooks/paypal, verified through the service's PaymentsApi (the operator's app); one on
+   * a guide app's webhook as /webhooks/paypal/guide, verified through the payee apps.
+   */
+  const webhook = (d: { raw: string; headers: Record<string, string>; to?: FakeApp }) =>
+    !d.to || d.to.clientId === fake.clientId ? service.handleWebhook(d.raw, d.headers) : service.handleWebhook(d.raw, d.headers, payments.payeeWebhooks);
+  fake.deliver = async (raw, headers, to) => {
+    webhookResults.push(await webhook({ raw, headers, to }));
   };
   /** The first seed guide's own app (g_lantern's, the guide the tests book), for acts outside the service. */
   const lantern = fakeAppFor(guides[0]!.payee.merchant_id);
   const guide = guideApps.get(lantern.ownerMerchantId) ?? new PayPalRestClient({ clientId: lantern.clientId, clientSecret: lantern.clientSecret, fetch: fake.fetch });
-  return { db, fake, payments, operator, guideApps, guide, ledger, mandates, channels, weather, service, webhookResults, now, advance: (ms: number) => (t += ms) };
+  return { db, fake, payments, operator, guideApps, guide, ledger, mandates, channels, weather, service, webhook, webhookResults, now, advance: (ms: number) => (t += ms) };
 }
 
 export function tokenOf(operatorUrl: string): string {

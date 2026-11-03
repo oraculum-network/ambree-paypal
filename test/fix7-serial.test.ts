@@ -229,8 +229,9 @@ describe("S1: a step sent while another waits on the feed or PayPal waits for it
     const g = gate();
     const w = makeWorld({ payments: (p) => slow(p, "refundCapture", g) });
     const { id, token } = await paid(w);
-    w.fake.deliver = async (raw, headers) => {
-      w.webhookResults.push(await w.service.handleWebhook(raw, headers));
+    // The refund's event comes on the guide app's webhook, so to the guide endpoint (DESIGN.md §21).
+    w.fake.deliver = async (raw, headers, to) => {
+      w.webhookResults.push(await w.webhook({ raw, headers, to }));
     };
     await w.service.offerRefund(token);
     g.arm();

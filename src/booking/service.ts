@@ -8,7 +8,7 @@ import type { Guide } from "../guides/seed.ts";
 import { sha256Hex } from "../ledger/canonical.ts";
 import type { Ledger } from "../ledger/ledger.ts";
 import { type Mandate, type MandateView, type Mandates, type Quote, isOperator, quoteHash, samePayee, view } from "../mandate/mandate.ts";
-import type { PaymentsApi } from "../paypal/api.ts";
+import type { PaymentsApi, WebhookVerifier } from "../paypal/api.ts";
 import { PayPalError } from "../paypal/errors.ts";
 import { formatMoney, fromMinor, sameMoney, toMinor } from "../paypal/money.ts";
 import { type Capture, type CurrencyCode, type Money, type Order, type Payee, type Refund, type WebhookEvent, approveLink, firstCapture, transmissionFromHeaders } from "../paypal/types.ts";
@@ -819,10 +819,14 @@ export class BookingService {
   }
 
   /**
-   * POST /webhooks/paypal: verify with PayPal, log once, react. An event is a duplicate only once its
-   * processing completed; if processing fails the reply is 500, so PayPal redelivers and we try again.
+   * POST /webhooks/paypal and /webhooks/paypal/guide: verify with PayPal, log once, react. An event is a
+   * duplicate only once its processing completed; if processing fails the reply is 500, so PayPal redelivers
+   * and we try again. `verifier` is the endpoint's app and webhook id (§21, D4): by default the PaymentsApi's
+   * own (the operator's, for /webhooks/paypal); the guide endpoint passes the payee apps'. After
+   * verification both endpoints are this one handler, so the same event (same id) arriving on both is
+   * processed once: the dedupe by event id, on the booking's queue.
    */
-  async handleWebhook(rawBody: string, headers: Record<string, string | string[] | undefined>): Promise<{ status: number; result: string }> {
+  async handleWebhook(rawBody: string, headers: Record<string, string | string[] | undefined>, verifier: WebhookVerifier = this.#d.payments): Promise<{ status: number; result: string }> {
     const t = transmissionFromHeaders(headers);
     if (!t) return { status: 400, result: "missing PAYPAL-* transmission headers" };
     let event: WebhookEvent;
@@ -836,7 +840,7 @@ export class BookingService {
     }
     let verified = false;
     try {
-      verified = await this.#d.payments.verifyWebhookSignature(t, event);
+      verified = await verifier.verifyWebhookSignature(t, event);
     } catch {
       return { status: 503, result: "could not verify (PayPal will retry)" };
     }

@@ -128,7 +128,8 @@ describe("the booking service through the router", () => {
     calls.length = 0;
     expect(await deliver(w, got[0]!)).toEqual({ status: 200, result: "logged" });
     expect(w.service.get(id)).toMatchObject({ status: "refunded", refund_ops: [{ status: "completed" }] });
-    expect(calls).toEqual(["operator.verifyWebhookSignature", `${LANTERN}.getRefund`]);
+    // The refund's event came on the guide app's webhook (D4/D5), so the guide's app verified it too.
+    expect(calls).toEqual([`${LANTERN}.verifyWebhookSignature`, `${LANTERN}.getRefund`]);
   });
 
   it("a guide with no app of its own: the refund fails closed before any POST, and the reservation is released", async () => {

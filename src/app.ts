@@ -157,9 +157,12 @@ export function createApp(opts: AppOptions): App {
   const payeeApps = new Map<string, PayPalRestClient>();
   if (config.paypal.mode === "fake") {
     fake = new FakePayPal({ checkoutUrl: `${config.publicUrl}/fake-paypal/checkout`, ownerMerchantId: opts.fakeOwnerMerchantId });
-    // Deliver the fake's webhooks over real HTTP to our own endpoint, as PayPal would.
-    fake.deliver = async (raw, headers) => {
-      await fetch(`http://127.0.0.1:${port}/webhooks/paypal`, { method: "POST", headers, body: raw, signal: AbortSignal.timeout(10_000) });
+    // Deliver the fake's webhooks over real HTTP to our own endpoints, as PayPal would: the operator app's to
+    // /webhooks/paypal, a guide app's to /webhooks/paypal/guide.
+    const operatorClientId = fake.clientId;
+    fake.deliver = async (raw, headers, to) => {
+      const path = to.clientId === operatorClientId ? "/webhooks/paypal" : "/webhooks/paypal/guide";
+      await fetch(`http://127.0.0.1:${port}${path}`, { method: "POST", headers, body: raw, signal: AbortSignal.timeout(10_000) });
     };
     operatorApp = new PayPalRestClient({ clientId: fake.clientId, clientSecret: fake.clientSecret, webhookId: fake.webhookId, fetch: fake.fetch });
     // The offline demo's guides each have their own payee, so each has its own fake app.
@@ -422,11 +425,16 @@ export function createApp(opts: AppOptions): App {
     }
     if (path === "/paypal/cancel" && method === "GET") return redirect(res, "/");
 
-    if (path === "/webhooks/paypal" && method === "POST") {
+    if ((path === "/webhooks/paypal" || path === "/webhooks/paypal/guide") && method === "POST") {
+      // Two endpoints (DESIGN.md §21, D4), one handler. /webhooks/paypal is verified through the operator's
+      // app and PAYPAL_WEBHOOK_ID; /webhooks/paypal/guide through the guide's app and PAYPAL_GUIDE_WEBHOOK_ID,
+      // never the other's. A refund made with the guide's app may be notified on either, or both: the handler
+      // dedupes by event id. An empty webhook id makes its endpoint answer 503.
+      const endpoint = path === "/webhooks/paypal/guide" ? "guide" : "operator";
       const raw = await readBody(req, WEBHOOK_LIMIT);
       if (raw === undefined) return sendJson(res, 413, { error: "too large" });
-      const r = await service.handleWebhook(raw, req.headers);
-      log({ event: "webhook", status: r.status, result: r.result });
+      const r = await service.handleWebhook(raw, req.headers, endpoint === "guide" ? payments.payeeWebhooks : operatorApp);
+      log({ event: "webhook", endpoint, status: r.status, result: r.result });
       return sendJson(res, r.status, { result: r.result });
     }
 

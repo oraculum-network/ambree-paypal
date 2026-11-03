@@ -9,20 +9,22 @@
 import { describe, expect, it } from "vitest";
 import { BookingService } from "../src/booking/service.ts";
 import { SEED_GUIDES } from "../src/guides/seed.ts";
+import type { FakeApp } from "../src/paypal/fake.ts";
 import { CONV, DATE, type World, kinds, paid, refundPosts } from "./helpers/race.ts";
 import { makeWorld } from "./helpers/world.ts";
 
 const MOVED = "2026-11-08";
 const GUIDE = SEED_GUIDES[0]!.payee;
-type Delivery = { raw: string; headers: Record<string, string> };
+type Delivery = { raw: string; headers: Record<string, string>; to?: FakeApp };
 
 /** Webhooks are kept, not delivered: each test hands them to the service itself. */
 function keepWebhooks(w: World): Delivery[] {
   const got: Delivery[] = [];
-  w.fake.deliver = (raw, headers) => void got.push({ raw, headers });
+  w.fake.deliver = (raw, headers, to) => void got.push({ raw, headers, to });
   return got;
 }
-const deliver = (w: World, d: Delivery) => w.service.handleWebhook(d.raw, d.headers);
+/** To the endpoint of the app whose webhook it came on (a refund's: the guide's; DESIGN.md §21). */
+const deliver = (w: World, d: Delivery) => w.webhook(d);
 const resourceId = (d: Delivery) => (JSON.parse(d.raw) as { resource: { id: string } }).resource.id;
 
 /** Both of the client's attempts reach PayPal and lose the reply. */

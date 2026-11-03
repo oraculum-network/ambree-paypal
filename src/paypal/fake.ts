@@ -65,8 +65,12 @@ export interface FakePayPalOptions {
   knownPayees?: string[];
   tokenTtlSeconds?: number;
   now?: () => Date;
-  /** Receives each webhook as PayPal would POST it: the raw body and the PAYPAL-* headers. */
-  deliver?: (rawBody: string, headers: Record<string, string>) => Promise<void> | void;
+  /**
+   * Receives each webhook as PayPal would POST it: the raw body, the PAYPAL-* headers, and the app on whose
+   * webhook it is sent (each app has its own webhook id: the operator's goes to /webhooks/paypal, a guide
+   * app's to /webhooks/paypal/guide).
+   */
+  deliver?: (rawBody: string, headers: Record<string, string>, to: FakeApp) => Promise<void> | void;
 }
 
 interface StoredOrder {
@@ -156,6 +160,12 @@ export class FakePayPal {
    * The real field's semantics are UNVERIFIED (§19).
    */
   refundTotals = true;
+  /**
+   * `true`: each refund event goes to the webhook of the app that made the refund (the guide's) and also,
+   * as the same event (same id), to that of the app that created the order (the operator's). Default false:
+   * the refunding app's only. Which app PayPal notifies is UNVERIFIED (DESIGN.md §21); the app takes either.
+   */
+  refundEventsOnBoth = false;
 
   readonly #opts: FakePayPalOptions;
   readonly #orders = new Map<string, StoredOrder>();
@@ -174,7 +184,10 @@ export class FakePayPal {
   readonly #balances = new Map<string, number>();
   readonly #failures: Failure[] = [];
   readonly #signingKey = randomBytes(32);
-  readonly #transmissions = new Map<string, string>();
+  /** Each transmission sent: its signature and the webhook id it was sent for. */
+  readonly #transmissions = new Map<string, { sig: string; webhookId: string }>();
+  /** Each refund's maker (client id): its events go to that app's webhook. */
+  readonly #refundMaker = new Map<string, string>();
   #deliveries: Promise<unknown> = Promise.resolve();
 
   constructor(opts: FakePayPalOptions = {}) {
@@ -248,11 +261,11 @@ export class FakePayPal {
     if (status === "COMPLETED") {
       const stored = this.#orders.get(c.orderId)!;
       this.#balances.set(stored.payeeKey, (this.#balances.get(stored.payeeKey) ?? 0) - held.minor);
-      this.#emit("PAYMENT.CAPTURE.REFUNDED", "refund", this.#refundView(r), `A ${r.amount!.currency_code} ${r.amount!.value} capture payment was refunded`);
+      this.#emit("PAYMENT.CAPTURE.REFUNDED", "refund", this.#refundView(r), `A ${r.amount!.currency_code} ${r.amount!.value} capture payment was refunded`, this.#refundTargets(refundId));
     } else {
       c.refundedMinor -= held.minor;
       c.capture.status = c.refundedMinor <= 0 ? "COMPLETED" : c.refundedMinor >= capturedMinor ? "REFUNDED" : "PARTIALLY_REFUNDED";
-      this.#emit("PAYMENT.REFUND.FAILED", "refund", this.#refundView(r), `A ${r.amount!.currency_code} ${r.amount!.value} refund failed`);
+      this.#emit("PAYMENT.REFUND.FAILED", "refund", this.#refundView(r), `A ${r.amount!.currency_code} ${r.amount!.value} refund failed`, this.#refundTargets(refundId));
     }
   }
 
@@ -298,7 +311,7 @@ export class FakePayPal {
     stored.order.status = "APPROVED";
     stored.order.payer = { ...payer, name: { given_name: "Sandbox", surname: "Traveller" } };
     stored.order.update_time = this.#now();
-    this.#emit("CHECKOUT.ORDER.APPROVED", "checkout-order", structuredClone(stored.order), `An order was approved by the buyer`);
+    this.#emit("CHECKOUT.ORDER.APPROVED", "checkout-order", structuredClone(stored.order), `An order was approved by the buyer`, [this.#creatorOf(orderId)]);
     return structuredClone(stored.order);
   }
 
@@ -443,7 +456,7 @@ export class FakePayPal {
       const stored = this.#orders.get(this.#captures.get(this.#refundCapture.get(r.id)!)!.orderId)!;
       return this.#owns(caller, stored.payeeKey) ? json(200, this.#refundView(r)) : denied();
     }
-    if (method === "POST" && path === "/v1/notifications/verify-webhook-signature") return this.#verify(body);
+    if (method === "POST" && path === "/v1/notifications/verify-webhook-signature") return this.#verify(body, caller);
     // No userinfo: the spike (S11) found it has no payer_id for an app token; the app owner comes from the
     // payee echo of an order with no payee (#createOrder), as at PayPal.
     return ppError(404, "NOT_FOUND", "INVALID_RESOURCE_ID", "The specified resource does not exist.");
@@ -518,7 +531,7 @@ export class FakePayPal {
     o.update_time = this.#now();
     this.#captures.set(captureId, { capture, orderId, refundedMinor: 0 });
     this.#balances.set(stored.payeeKey, (this.#balances.get(stored.payeeKey) ?? 0) + toMinor(unit.amount.value));
-    this.#emit("PAYMENT.CAPTURE.COMPLETED", "capture", structuredClone(capture), `Payment completed for ${unit.amount.currency_code} ${unit.amount.value}`);
+    this.#emit("PAYMENT.CAPTURE.COMPLETED", "capture", structuredClone(capture), `Payment completed for ${unit.amount.currency_code} ${unit.amount.value}`, [this.#creatorOf(orderId)]);
     return json(201, o);
   }
 
@@ -562,23 +575,54 @@ export class FakePayPal {
     };
     this.#refunds.set(refundId, refund);
     this.#refundCapture.set(refundId, captureId);
+    this.#refundMaker.set(refundId, caller.clientId);
     if (pending) this.#pendingRefunds.set(refundId, { captureId, minor });
-    else this.#emit("PAYMENT.CAPTURE.REFUNDED", "refund", this.#refundView(refund), `A ${refund.amount!.currency_code} ${refund.amount!.value} capture payment was refunded`);
+    else this.#emit("PAYMENT.CAPTURE.REFUNDED", "refund", this.#refundView(refund), `A ${refund.amount!.currency_code} ${refund.amount!.value} capture payment was refunded`, this.#refundTargets(refundId));
     return json(201, this.#refundView(refund));
   }
 
   // ---------- webhooks ----------
 
-  #sign(transmissionId: string, time: string, event: unknown): string {
-    return createHmac("sha256", this.#signingKey).update(`${transmissionId}|${time}|${this.webhookId}|${JSON.stringify(event)}`).digest("base64");
+  #sign(transmissionId: string, time: string, webhookId: string, event: unknown): string {
+    return createHmac("sha256", this.#signingKey).update(`${transmissionId}|${time}|${webhookId}|${JSON.stringify(event)}`).digest("base64");
   }
 
-  /** Sends a signed webhook of any type (e.g. PAYMENT.REFUND.FAILED), as PayPal would on its own. */
-  emitWebhook(eventType: string, resourceType: string, resource: object): void {
-    this.#emit(eventType, resourceType, structuredClone(resource), `${eventType} (fake)`);
+  /** The default app (the operator's): the first registered. */
+  #defaultApp(): AppState {
+    return this.#apps.values().next().value!;
   }
 
-  #emit(eventType: string, resourceType: string, resource: object, summary: string): void {
+  /** The app that created an order (its order and capture events go to that app's webhook). */
+  #creatorOf(orderId: string): AppState {
+    return this.#apps.get(this.#orders.get(orderId)!.creator) ?? this.#defaultApp();
+  }
+
+  /**
+   * Where a refund's events go: the webhook of the app that made the refund and, with `refundEventsOnBoth`,
+   * also that of the app that created its order (the operator's), as the same event.
+   */
+  #refundTargets(refundId: string): AppState[] {
+    const maker = this.#apps.get(this.#refundMaker.get(refundId) ?? "") ?? this.#defaultApp();
+    const creator = this.#creatorOf(this.#captures.get(this.#refundCapture.get(refundId)!)!.orderId);
+    return this.refundEventsOnBoth && creator !== maker ? [maker, creator] : [maker];
+  }
+
+  /**
+   * Sends a signed webhook of any type (e.g. PAYMENT.REFUND.FAILED), as PayPal would on its own: on the
+   * webhook of each app in `opts.to` (client ids), by default the default app's (the operator's). Which
+   * app PayPal notifies about a refund made by another app is UNVERIFIED (DESIGN.md §21); tests choose.
+   */
+  emitWebhook(eventType: string, resourceType: string, resource: object, opts: { to?: string[] } = {}): void {
+    const to = (opts.to ?? [this.#defaultApp().clientId]).map((id) => {
+      const app = this.#apps.get(id);
+      if (!app) throw new Error(`fake: no app ${id}`);
+      return app;
+    });
+    this.#emit(eventType, resourceType, structuredClone(resource), `${eventType} (fake)`, to);
+  }
+
+  /** One event (one id), delivered once on each app's webhook: its own transmission, signed for that webhook id. */
+  #emit(eventType: string, resourceType: string, resource: object, summary: string, to: AppState[]): void {
     const event: WebhookEvent = {
       id: `WH-${newId()}`,
       event_version: "1.0",
@@ -593,32 +637,41 @@ export class FakePayPal {
     this.sentWebhooks.push(event);
     const deliver = this.deliver;
     if (!deliver) return;
-    const transmissionId = randomUUID();
-    const time = this.#now();
-    const sig = this.#sign(transmissionId, time, event);
-    this.#transmissions.set(transmissionId, sig);
-    const headers: Record<string, string> = {
-      "content-type": "application/json",
-      [WEBHOOK_HEADERS.auth_algo]: "SHA256withRSA",
-      [WEBHOOK_HEADERS.cert_url]: `${SANDBOX_API_BASE}/v1/notifications/certs/CERT-FAKE-0001`,
-      [WEBHOOK_HEADERS.transmission_id]: transmissionId,
-      [WEBHOOK_HEADERS.transmission_sig]: sig,
-      [WEBHOOK_HEADERS.transmission_time]: time,
-    };
     const raw = JSON.stringify(event);
-    // Delivered after the API reply, as PayPal does; errors are swallowed (PayPal would retry).
-    this.#deliveries = this.#deliveries.then(() => new Promise((r) => setTimeout(r, 0))).then(() => deliver(raw, headers)).catch(() => undefined);
+    for (const app of to) {
+      const transmissionId = randomUUID();
+      const time = this.#now();
+      const sig = this.#sign(transmissionId, time, app.webhookId, event);
+      this.#transmissions.set(transmissionId, { sig, webhookId: app.webhookId });
+      const headers: Record<string, string> = {
+        "content-type": "application/json",
+        [WEBHOOK_HEADERS.auth_algo]: "SHA256withRSA",
+        [WEBHOOK_HEADERS.cert_url]: `${SANDBOX_API_BASE}/v1/notifications/certs/CERT-FAKE-0001`,
+        [WEBHOOK_HEADERS.transmission_id]: transmissionId,
+        [WEBHOOK_HEADERS.transmission_sig]: sig,
+        [WEBHOOK_HEADERS.transmission_time]: time,
+      };
+      const target = FakePayPal.#view(app);
+      // Delivered after the API reply, as PayPal does; errors are swallowed (PayPal would retry).
+      this.#deliveries = this.#deliveries.then(() => new Promise((r) => setTimeout(r, 0))).then(() => deliver(raw, headers, target)).catch(() => undefined);
+    }
   }
 
-  #verify(body: Record<string, unknown>): Response {
+  /**
+   * SUCCESS only for the calling app's own webhook id, on a transmission the fake sent for that webhook,
+   * whose signature matches: an app can't verify another app's webhook, and a transmission never verifies
+   * against another webhook id.
+   */
+  #verify(body: Record<string, unknown>, caller: AppState): Response {
     const required = ["auth_algo", "cert_url", "transmission_id", "transmission_sig", "transmission_time", "webhook_id", "webhook_event"];
     const missing = required.find((k) => body[k] === undefined || body[k] === "");
     if (missing) return ppError(400, "VALIDATION_ERROR", "MISSING_REQUIRED_PARAMETER", `${missing} is required.`);
     const tid = String(body.transmission_id);
-    const sentSig = this.#transmissions.get(tid);
+    const webhookId = String(body.webhook_id);
+    const sent = this.#transmissions.get(tid);
     const given = Buffer.from(String(body.transmission_sig));
-    const expected = Buffer.from(this.#sign(tid, String(body.transmission_time), body.webhook_event));
-    const ok = body.webhook_id === this.webhookId && sentSig !== undefined && given.length === expected.length && timingSafeEqual(given, expected);
+    const expected = Buffer.from(this.#sign(tid, String(body.transmission_time), webhookId, body.webhook_event));
+    const ok = webhookId === caller.webhookId && sent?.webhookId === webhookId && given.length === expected.length && timingSafeEqual(given, expected);
     return json(200, { verification_status: ok ? "SUCCESS" : "FAILURE" });
   }
 }

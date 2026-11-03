@@ -27,3 +27,6 @@ export interface PaymentsApi {
   /** POST /v2/checkout/orders with no payee (a probe order, never approved): who owns this REST app (see AppOwner). */
   getAppOwner(): Promise<AppOwner>;
 }
+
+/** What a webhook endpoint verifies with: one app's client and its own webhook id (DESIGN.md §21, D4). */
+export type WebhookVerifier = Pick<PaymentsApi, "verifyWebhookSignature">;

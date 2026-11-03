@@ -9,7 +9,7 @@
 // app fails closed here, before anything is sent: a definitive PayPalError (kind invalid_request, never
 // maybe-delivered), which the service handles as PayPal refusing the request outright.
 
-import type { PaymentsApi } from "./api.ts";
+import type { PaymentsApi, WebhookVerifier } from "./api.ts";
 import { PayPalError } from "./errors.ts";
 import type { AppOwner, Capture, CreateOrderRequest, Order, Refund, RefundRequest, WebhookEvent, WebhookTransmission } from "./types.ts";
 
@@ -93,9 +93,32 @@ export class RoutedPayments implements PaymentsApi {
     return this.#payeeApp(capture, GET_REFUND_CALL).getRefund(refundId, capture);
   }
 
+  /** /webhooks/paypal: the operator's app and PAYPAL_WEBHOOK_ID. */
   verifyWebhookSignature(transmission: WebhookTransmission, event: WebhookEvent): Promise<boolean> {
     return this.#operator.verifyWebhookSignature(transmission, event);
   }
+
+  /**
+   * /webhooks/paypal/guide (D4): verified by a payee app against its own webhook id (PAYPAL_GUIDE_WEBHOOK_ID),
+   * never the operator's. True once one payee app's PayPal answers SUCCESS (the hosted demo has one). If none
+   * does and one couldn't ask (e.g. no webhook id set), that error is thrown, so the endpoint answers 503 and
+   * PayPal retries.
+   */
+  readonly payeeWebhooks: WebhookVerifier = {
+    verifyWebhookSignature: async (transmission, event) => {
+      let failure: unknown;
+      for (const app of this.#payees.values()) {
+        try {
+          if (await app.verifyWebhookSignature(transmission, event)) return true;
+        } catch (e) {
+          failure ??= e;
+        }
+      }
+      if (this.#payees.size === 0) throw new Error("no payee app is configured to verify this webhook");
+      if (failure !== undefined) throw failure;
+      return false;
+    },
+  };
 
   /** The operator app's owner; each payee app's own is asked of that app directly (the startup check). */
   getAppOwner(): Promise<AppOwner> {
