@@ -27,11 +27,17 @@ describe("repo hygiene", () => {
 
   it("the k8s manifests match the host's paypal block: credentials from Secret paypal-secrets, sqlite on paypal-data", () => {
     const d = read("deploy/k8s/deployment.yaml");
-    // The five keys of the hand-made Secret, each required (no optional: the pod waits for the Secret).
-    for (const k of ["PAYPAL_CLIENT_ID", "PAYPAL_CLIENT_SECRET", "PAYPAL_WEBHOOK_ID", "LLM_API_KEY", "MCP_DEMO_PASSCODE"]) {
-      expect(d).toContain(`secretKeyRef: { name: paypal-secrets, key: ${k} }`);
+    // The eight keys of the hand-made Secret, each required (no optional: the pod waits for the Secret). Since
+    // 3 Nov (DESIGN.md §21) the guide's own REST app and its webhook id are three of them.
+    const keys = ["PAYPAL_CLIENT_ID", "PAYPAL_CLIENT_SECRET", "PAYPAL_WEBHOOK_ID", "PAYPAL_GUIDE_CLIENT_ID", "PAYPAL_GUIDE_CLIENT_SECRET", "PAYPAL_GUIDE_WEBHOOK_ID", "LLM_API_KEY", "MCP_DEMO_PASSCODE"];
+    for (const k of keys) {
+      expect(d).toContain(`- name: ${k}\n              valueFrom: { secretKeyRef: { name: paypal-secrets, key: ${k} } }`);
     }
-    expect(d.match(/secretKeyRef/g)).toHaveLength(5);
+    expect(d.match(/secretKeyRef/g)).toHaveLength(keys.length);
+    // DEPLOY.md names the same keys for the Secret, and the guide's webhook URL.
+    const deploy = read("DEPLOY.md");
+    for (const k of keys) expect(deploy).toContain(`\`${k}\``);
+    expect(deploy).toContain("https://paypal.ambree.ai/webhooks/paypal/guide");
     expect(d).not.toMatch(/optional:|paypal-sandbox|envFrom/);
     // The safe default: the operator check runs (never config-only), and no live PayPal base URL.
     expect(d).not.toMatch(/- name: PAYPAL_OPERATOR_IDENTITY|- name: PAYPAL_BASE_URL|_EMAIL/);

@@ -17,9 +17,14 @@ never creates or changes the Secret. Every `TODO-CHECK` line is unverified from 
 | `deploy/k8s/` | Deployment, Service and Ingress `paypal-web` for `paypal.ambree.ai`, namespace `paypal`, image `oraculum/ambree-paypal` (`kubectl kustomize deploy/k8s` renders 3 objects: no Secret, no PVC) |
 | `scripts/spike.ts` | The sandbox check (third-party payee, capture, refund); it can also run in the pod |
 
-**It fails closed, never open.** The app refuses any live PayPal URL. With `PAYPAL_OPERATOR_IDENTITY` unset (the
-default, `paypal`) it asks PayPal at startup which merchant owns the REST app, and refuses to start unless that is
-`PAYPAL_OPERATOR_MERCHANT_ID` and no guide's payee. Every Secret key is required, so with no Secret `paypal-secrets`
+**It fails closed, never open.** The app refuses any live PayPal URL. It uses two sandbox REST apps (DESIGN.md
+§21): the operator's (`PAYPAL_CLIENT_ID`) makes and captures the orders, and the guide's own (`PAYPAL_GUIDE_CLIENT_ID`,
+owned by the guide's sandbox business account) makes the refunds, which PayPal refuses to the operator's app. With
+`PAYPAL_OPERATOR_IDENTITY` unset (the default, `paypal`) it asks PayPal at startup who owns each app: it creates an
+order with no payee under each app's token (an identity check, never approved; it lapses) and reads the payee
+PayPal echoes. It refuses to start, naming the check that failed ("Operator identity check failed" or "Guide
+identity check failed"), unless the operator's app is owned by `PAYPAL_OPERATOR_MERCHANT_ID`, which is no guide's
+payee, and the guide's app by `PAYPAL_GUIDE_PAYEE_MERCHANT_ID`. Every Secret key is required, so with no Secret `paypal-secrets`
 (or a missing key) the pod stays at `CreateContainerConfigError`. Empty merchant ids or an empty `LLM_MODEL` make it
 refuse to start. So a pod that won't start after step 3 is a config or Secret problem, not an infra one: its log
 names the variable (never the value). Unlike qloo, there is no demo-mode fallback: deleting the Secret takes the site
@@ -60,9 +65,14 @@ into `main`. The deploy builds `main`, and `deploy-paypal.sh` refuses a render w
   guide's.
 - TODO-CHECK: `LLM_MODEL`, and that the provider is OpenRouter (`LLM_BASE_URL` is `https://openrouter.ai/api/v1`;
   the app calls `<LLM_BASE_URL>/chat/completions`).
-- TODO-CHECK: the spike's S11 row shows that PayPal returns a `payer_id` for the app's token. If it doesn't, the pod
-  refuses to start. `PAYPAL_OPERATOR_IDENTITY=config-only` would start it on the configured id alone (unconfirmed):
-  that is a CEO/CTO decision, never a default, and this repo doesn't set it.
+- The identity check: the spike (3 Nov) found that userinfo has no `payer_id` for an app token (S11: no), and that
+  the payee echo of an order with no payee names each app's owner (equal to the dashboard's merchant id, for the
+  operator's app and the guide's). The check uses the echo. `PAYPAL_OPERATOR_IDENTITY=config-only` would start the
+  pod on the configured ids alone (unconfirmed, for both apps): that is a CEO/CTO decision, never a default, and
+  this repo doesn't set it.
+- TODO-CHECK: the guide's REST app, created in the guide's sandbox business account (DE), is the one whose
+  credentials go into the Secret: its payee echo must be `PAYPAL_GUIDE_PAYEE_MERCHANT_ID`, or the pod refuses to
+  start.
 - TODO-CHECK: the base image's Node is at least 22.18 (TypeScript type stripping on by default) and has `node:sqlite`
   without a flag (22.13+). Qloo runs `node src/server.ts` on the same digest; step 6's `/healthz` proves both here.
 
@@ -94,13 +104,20 @@ scheduled in step 5. `deploy-paypal.sh --go check` reads all of this back (read-
 
 ## 3. The Secret, by hand
 
-Secret `paypal/paypal-secrets`, created by the admin, never by a manifest or a script that holds values. Its keys
-(names only): `PAYPAL_CLIENT_ID`, `PAYPAL_CLIENT_SECRET`, `PAYPAL_WEBHOOK_ID`, `LLM_API_KEY`, `MCP_DEMO_PASSCODE`.
+Secret `paypal/paypal-secrets`, created by the admin, never by a manifest or a script that holds values. Its eight
+keys (names only): `PAYPAL_CLIENT_ID`, `PAYPAL_CLIENT_SECRET`, `PAYPAL_WEBHOOK_ID`, `PAYPAL_GUIDE_CLIENT_ID`,
+`PAYPAL_GUIDE_CLIENT_SECRET`, `PAYPAL_GUIDE_WEBHOOK_ID`, `LLM_API_KEY`, `MCP_DEMO_PASSCODE`.
 
-- `PAYPAL_CLIENT_ID`, `PAYPAL_CLIENT_SECRET`: the sandbox REST app's credentials. Required, not empty.
+- `PAYPAL_CLIENT_ID`, `PAYPAL_CLIENT_SECRET`: the operator's sandbox REST app (orders and captures). Required, not
+  empty.
+- `PAYPAL_GUIDE_CLIENT_ID`, `PAYPAL_GUIDE_CLIENT_SECRET`: the guide's own sandbox REST app, created in the guide's
+  sandbox business account (the refunds). Required, not empty, and not the operator's app.
 - `LLM_API_KEY`: the model key. Required, not empty.
-- `PAYPAL_WEBHOOK_ID`: may be empty at first (the endpoint then answers 503, PayPal retries, and capture still
-  happens on the return URL); set it in step 6.
+- `PAYPAL_WEBHOOK_ID`: the operator app's webhook. May be empty at first (`/webhooks/paypal` then answers 503,
+  PayPal retries, and capture still happens on the return URL); set it in step 6.
+- `PAYPAL_GUIDE_WEBHOOK_ID`: the guide app's webhook. May be empty at first (`/webhooks/paypal/guide` then answers
+  503 and PayPal retries). A refund's own reply still records it, and `get_booking` reads a pending one, but a
+  refund whose reply was lost waits for a notice that only an endpoint with its id can verify; set it in step 6.
 - `MCP_DEMO_PASSCODE`: may be empty (then `/mcp` answers 401). Clients send it as a Bearer token.
 
 Each value is typed at a hidden prompt on the host (`read -s`: not echoed). It reaches kubectl on stdin only:
@@ -125,7 +142,7 @@ for key in "$@"; do
 done
 k get secret paypal-secrets -o json | jq -r '.data // {} | to_entries[] | "\(.key) \(if (.value | length) > 0 then "set" else "EMPTY" end)"'
 EOS
-ssh -t "${K[@]}" "sudo bash -c $(printf %q "$S") store-secrets PAYPAL_CLIENT_ID PAYPAL_CLIENT_SECRET PAYPAL_WEBHOOK_ID LLM_API_KEY MCP_DEMO_PASSCODE"
+ssh -t "${K[@]}" "sudo bash -c $(printf %q "$S") store-secrets PAYPAL_CLIENT_ID PAYPAL_CLIENT_SECRET PAYPAL_WEBHOOK_ID PAYPAL_GUIDE_CLIENT_ID PAYPAL_GUIDE_CLIENT_SECRET PAYPAL_GUIDE_WEBHOOK_ID LLM_API_KEY MCP_DEMO_PASSCODE"
 ```
 
 To change one key later, run the same `ssh` line with only that key's name, then restart the pod (a Secret is read
@@ -162,7 +179,7 @@ ssh "${D[@]}" "apply" < "$O/rendered.yaml"
 ssh "${D[@]}" "rollout-status paypal deployment/paypal-web 300"
 ```
 
-The `grep` must print `image: oraculum/ambree-paypal:<T>`, `claimName: paypal-data` and five
+The `grep` must print `image: oraculum/ambree-paypal:<T>`, `claimName: paypal-data` and eight
 `name: paypal-secrets`. The render holds no `kind: Secret` and no `kind: PersistentVolumeClaim`.
 `deploy-paypal.sh --go apply` checks all of that, plus the plain values from step 0, and runs `rollout-undo` itself
 if a changed rollout fails.
@@ -174,18 +191,20 @@ curl -s https://paypal.ambree.ai/healthz
 ssh "${K[@]}" 'sudo k3s kubectl -n paypal get pods -l app.kubernetes.io/name=ambree-paypal'
 ```
 
-`/healthz` must show `"ok":true`, `"paypal":"sandbox"`, `"model":"openai"` and `"operator_identity":"confirmed"`.
-The server listens only after the operator check passed, so an answer at all means the config loaded, sqlite opened
-`/data/ambree.sqlite` and PayPal confirmed the operator. `deploy-paypal.sh --go verify` checks the same, and the
-certificate (`cert` step).
+`/healthz` must show `"ok":true`, `"paypal":"sandbox"`, `"model":"openai"`, `"operator_identity":"confirmed"` and
+`"guide_identity":"confirmed"`. The server listens only after both identity checks passed, so an answer at all means
+the config loaded, sqlite opened `/data/ambree.sqlite` and PayPal confirmed who owns each app. Each check leaves one
+probe order (no payee, never approved) in its app's sandbox account; it lapses. `deploy-paypal.sh --go verify` checks
+the same, and the certificate (`cert` step). TODO-CHECK: `deploy-paypal.sh --go verify` also expects
+`guide_identity` (it lives in the CTO's folder, not this repo).
 
 - TODO-CHECK: the pod shows 0 restarts. k3s admits a new pod's IP to its NetworkPolicies about 1 s after it starts,
   and the app calls PayPal at startup; one early restart there is that race, not a fault.
 - The data survives a restart: `curl -s https://paypal.ambree.ai/api/ledger/head` gives the same checkpoint
   before and after the restart command in step 3.
 
-Then the webhook, once the site answers:
-1. In the sandbox app, add a webhook:
+Then the two webhooks, once the site answers (each app has its own; DESIGN.md §21):
+1. In the operator's sandbox app, add a webhook:
    - URL: `https://paypal.ambree.ai/webhooks/paypal`.
    - Events: `CHECKOUT.ORDER.APPROVED`, `PAYMENT.CAPTURE.COMPLETED`, `PAYMENT.CAPTURE.REFUNDED`,
      `PAYMENT.CAPTURE.PENDING`, `PAYMENT.CAPTURE.DECLINED`, `PAYMENT.CAPTURE.REVERSED`.
@@ -194,9 +213,18 @@ Then the webhook, once the site answers:
      The handler already takes any `PAYMENT.REFUND.*`, such as a refund that was PENDING and then failed.
      Without them, such a refund held for an unknown outcome gets no notice, and a person reconciles it
      (DESIGN.md §19).
-2. Store its id with step 3's `ssh` line for `PAYPAL_WEBHOOK_ID` alone, then restart.
-3. TODO-CHECK: one `POST /v1/notifications/simulate-event`, or a real checkout, shows a `webhook.*` row in the
-   ledger.
+2. In the guide's own sandbox app (the one in `PAYPAL_GUIDE_CLIENT_ID`), add a second webhook:
+   - URL: `https://paypal.ambree.ai/webhooks/paypal/guide`.
+   - Events: the same refund events: `PAYMENT.CAPTURE.REFUNDED`, `PAYMENT.CAPTURE.REVERSED`, and the refund
+     failure events of step 1's TODO-CHECK.
+   - Which app's webhook PayPal uses for a refund made with the guide's app is unknown, so both subscribe. The
+     same event arriving on both is processed once (the handler dedupes by event id), and each endpoint accepts
+     only its own app's webhook id.
+3. Store each id with step 3's `ssh` line for that key alone (`PAYPAL_WEBHOOK_ID`, `PAYPAL_GUIDE_WEBHOOK_ID`),
+   then restart.
+4. TODO-CHECK: one `POST /v1/notifications/simulate-event`, or a real checkout and refund, shows a `webhook.*` row
+   in the ledger. The pod's log line `{"event":"webhook","endpoint":...}` names the endpoint each came on: which
+   app PayPal notifies about the guide's refund is DESIGN.md §21's open question.
 
 Run the README's judge steps once with the sandbox buyer.
 
@@ -230,5 +258,5 @@ Then, in this order:
    entries, merge, reinstall the gate. `security.sh` only applies, so then delete by hand:
    `ssh "${K[@]}" 'sudo k3s kubectl delete ns paypal && sudo k3s kubectl delete priorityclass paypal-low'`
    (the namespace takes the PVC, the quotas and the NetworkPolicies with it).
-5. PayPal and the model: delete the sandbox webhook and REST app; revoke the OpenRouter key (TODO-CHECK: who holds
-   that account).
+5. PayPal and the model: delete both sandbox webhooks and both REST apps (the operator's and the guide's); revoke
+   the OpenRouter key (TODO-CHECK: who holds that account).

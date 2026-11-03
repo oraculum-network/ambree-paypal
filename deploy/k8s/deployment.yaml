@@ -1,4 +1,4 @@
-# One small Node pod: the chat page, the operator page, the PayPal webhook endpoint and MCP. The
+# One small Node pod: the chat page, the operator page, the two PayPal webhook endpoints and MCP. The
 # bookings and the ledger live in sqlite at DB_PATH on the PVC paypal-data (mounted at /data, the
 # only writable path; the root filesystem is read-only). The label app.kubernetes.io/name:
 # ambree-paypal is what the namespace's NetworkPolicies select (in from Traefik on :8080, out to DNS
@@ -54,8 +54,10 @@ spec:
           ports:
             - name: http
               containerPort: 8080
-          # PAYPAL_OPERATOR_IDENTITY is deliberately unset: the default ("paypal") confirms the
-          # operator's merchant id with PayPal at startup and refuses to start if it can't.
+          # PAYPAL_OPERATOR_IDENTITY is deliberately unset: the default ("paypal") confirms with PayPal
+          # at startup who owns each REST app (the payee echo of a probe order that is never approved,
+          # DESIGN.md §21): the operator's app must be PAYPAL_OPERATOR_MERCHANT_ID's, the guide's app
+          # PAYPAL_GUIDE_PAYEE_MERCHANT_ID's; otherwise the pod refuses to start, naming the check.
           # PAYPAL_BASE_URL is unset too: the sandbox (the app refuses any live PayPal URL).
           env:
             - name: PORT
@@ -79,15 +81,24 @@ spec:
             - name: LLM_MODEL
               value: ""
             # Secret paypal-secrets (created by hand, DEPLOY.md step 3). Every key is required, so a
-            # missing Secret or key stops the pod at CreateContainerConfigError. PAYPAL_WEBHOOK_ID and
-            # MCP_DEMO_PASSCODE may hold an empty value: no webhook id = the endpoint answers 503;
-            # no passcode = /mcp answers 401.
+            # missing Secret or key stops the pod at CreateContainerConfigError. PAYPAL_WEBHOOK_ID,
+            # PAYPAL_GUIDE_WEBHOOK_ID and MCP_DEMO_PASSCODE may hold an empty value: no webhook id = its
+            # endpoint answers 503; no passcode = /mcp answers 401.
+            # The operator's REST app: orders and captures; its webhook -> /webhooks/paypal.
             - name: PAYPAL_CLIENT_ID
               valueFrom: { secretKeyRef: { name: paypal-secrets, key: PAYPAL_CLIENT_ID } }
             - name: PAYPAL_CLIENT_SECRET
               valueFrom: { secretKeyRef: { name: paypal-secrets, key: PAYPAL_CLIENT_SECRET } }
             - name: PAYPAL_WEBHOOK_ID
               valueFrom: { secretKeyRef: { name: paypal-secrets, key: PAYPAL_WEBHOOK_ID } }
+            # The guide's own REST app (owned by the guide's sandbox account): the refunds, which PayPal
+            # refuses to the operator's app (DESIGN.md §21); its webhook -> /webhooks/paypal/guide.
+            - name: PAYPAL_GUIDE_CLIENT_ID
+              valueFrom: { secretKeyRef: { name: paypal-secrets, key: PAYPAL_GUIDE_CLIENT_ID } }
+            - name: PAYPAL_GUIDE_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: paypal-secrets, key: PAYPAL_GUIDE_CLIENT_SECRET } }
+            - name: PAYPAL_GUIDE_WEBHOOK_ID
+              valueFrom: { secretKeyRef: { name: paypal-secrets, key: PAYPAL_GUIDE_WEBHOOK_ID } }
             - name: LLM_API_KEY
               valueFrom: { secretKeyRef: { name: paypal-secrets, key: LLM_API_KEY } }
             - name: MCP_DEMO_PASSCODE
@@ -114,8 +125,8 @@ spec:
             limits:
               cpu: 200m
               memory: 256Mi
-          # The server listens only after the operator check passed, so /healthz answering means
-          # the config loaded, sqlite opened DB_PATH and PayPal confirmed the operator.
+          # The server listens only after the identity checks passed, so /healthz answering means the
+          # config loaded, sqlite opened DB_PATH and PayPal confirmed both apps' owners.
           readinessProbe:
             httpGet:
               path: /healthz

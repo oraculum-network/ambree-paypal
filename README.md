@@ -92,7 +92,7 @@ Ambree never holds your money. PayPal sandbox only.
 come out of the guide's capture. Accounts are identified by **PayPal merchant id only**, because one account
 can have several email addresses (aliases), so an email can't prove two payees are different accounts. In
 sandbox mode:
-- **Configuration:** `PAYPAL_OPERATOR_MERCHANT_ID` (the REST app owner's account) and
+- **Configuration:** `PAYPAL_OPERATOR_MERCHANT_ID` (the operator app owner's account) and
   `PAYPAL_GUIDE_PAYEE_MERCHANT_ID` are required, and the `*_EMAIL` variables are refused.
 - **At startup,** the app refuses to start if any guide's merchant id equals the operator's.
 - **Orders are sent with `payee.merchant_id`,** never an email. When creating an order, the app refuses an
@@ -100,20 +100,31 @@ sandbox mode:
 - **Before capture,** it re-reads the order and compares its `payee.merchant_id` with the guide's. It
   refuses one that is the operator's, and one that has no merchant id.
 
-**Confirming the operator with PayPal.** Before serving, the app asks PayPal which merchant owns the REST
-app. It calls `GET /v1/identity/openidconnect/userinfo` with the app's own token and refuses to start unless
-the reply's `payer_id` equals `PAYPAL_OPERATOR_MERCHANT_ID` and matches no guide. It also refuses if the call
-fails or carries no `payer_id`.
-- **The limit:** PayPal's docs don't say that this call accepts an app (client-credentials) token or that it
-  describes the app owner. Its documented sample has no `payer_id`, and the token reply carries only an
-  `app_id`.
-- **So it is UNVERIFIED (DESIGN.md §5 S11),** and `node scripts/spike.ts` prints what PayPal returns.
-- **Opt-out:** if the call can't confirm the owner, `PAYPAL_OPERATOR_IDENTITY=config-only` lets the app run
-  on the configured id. `/healthz` then says `operator_identity: "config-only (unconfirmed)"` and the log
-  warns. Otherwise it says `"confirmed"`.
+**Two PayPal apps (since the 3 Nov spike, DESIGN.md §21).** The sandbox refuses the operator's REST app a refund
+of a capture paid to the guide (403 PERMISSION_DENIED), and refusing it is right: acting for another merchant
+needs PayPal's partner features, which we don't have. A REST app owned by the guide's own sandbox account can
+refund that capture. So:
+- the operator's app (`PAYPAL_CLIENT_ID`) creates, reads and captures the orders;
+- the guide's own app (`PAYPAL_GUIDE_CLIENT_ID`) makes and reads the refunds of captures paid to
+  `PAYPAL_GUIDE_PAYEE_MERCHANT_ID`. The booking service still calls one payments interface; `RoutedPayments`
+  (`src/paypal/routed.ts`) sends each refund to the app of the capture's payee, and a payee with no app is refused
+  before anything is sent;
+- in plain words: **Ambree triggers the refund with the guide's own PayPal app credentials.** The money still goes
+  from the guide's account back to the traveller; Ambree never holds it.
 
-Also **UNVERIFIED:** that PayPal's order replies echo `payee.merchant_id`. If they don't, every capture is
-refused (it fails closed); the spike checks this (DESIGN.md §5 S6).
+**Confirming who owns each app.** Before serving, the app asks PayPal who owns each app: under each app's token it
+creates an order with no payee (an identity check that nobody approves; it lapses) and reads the payee PayPal
+echoes, which is that app's owner. It refuses to start, naming the check that failed, unless the operator's app is
+owned by `PAYPAL_OPERATOR_MERCHANT_ID`, which is no guide's payee, and the guide's app by
+`PAYPAL_GUIDE_PAYEE_MERCHANT_ID`. The spike found this echo equal to the dashboard's merchant id for both apps;
+`userinfo`, used before, carries no `payer_id` for an app's token (S11).
+- **Opt-out:** `PAYPAL_OPERATOR_IDENTITY=config-only` lets the app run on the configured ids, for both checks.
+  `/healthz` then says `operator_identity` and `guide_identity` `"config-only (unconfirmed)"` and the log warns.
+  Otherwise both say `"confirmed"`.
+
+The capture check needs PayPal's order replies to echo `payee.merchant_id` for the guide's payee; without it, every
+capture is refused (it fails closed). The 3 Nov run created, approved and captured such an order (DESIGN.md §5, S1-S3
+and S6).
 
 A refund whose PayPal reply doesn't match what was sent puts the booking in `needs_review`, and it stays
 there even if a later refund completes. While any refund is in review, new refunds and retries on that
@@ -145,12 +156,15 @@ other than `https://api-m.sandbox.paypal.com`.
 
 | Variable | What |
 |---|---|
-| `PAYPAL_CLIENT_ID`, `PAYPAL_CLIENT_SECRET` | The sandbox REST app (developer.paypal.com → Apps & Credentials → Sandbox) |
-| `PAYPAL_WEBHOOK_ID` | The id of the sandbox webhook pointing at `{PUBLIC_URL}/webhooks/paypal` |
-| `PAYPAL_GUIDE_PAYEE_MERCHANT_ID` | The merchant id of the sandbox **business** account that plays every guide (emails are refused) |
+| `PAYPAL_CLIENT_ID`, `PAYPAL_CLIENT_SECRET` | The operator's sandbox REST app (developer.paypal.com → Apps & Credentials → Sandbox): orders and captures |
+| `PAYPAL_WEBHOOK_ID` | The id of the operator app's sandbox webhook, pointing at `{PUBLIC_URL}/webhooks/paypal`. Empty: that endpoint answers 503 |
+| `PAYPAL_GUIDE_CLIENT_ID`, `PAYPAL_GUIDE_CLIENT_SECRET` | The guide's own sandbox REST app, created in the guide's sandbox business account: the refunds. Required in sandbox mode, and not the operator's app |
+| `PAYPAL_GUIDE_WEBHOOK_ID` | The id of the guide app's sandbox webhook, pointing at `{PUBLIC_URL}/webhooks/paypal/guide`, with the refund events. Empty: that endpoint answers 503 |
+| `PAYPAL_GUIDE_PAYEE_MERCHANT_ID` | The merchant id of the sandbox **business** account that plays every guide, and owns the guide's app (emails are refused) |
 | `PUBLIC_URL` | Where PayPal sends the buyer back to (`/paypal/return`) |
 | `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL` | Any OpenAI-compatible `/chat/completions` endpoint with tool calling |
-| `PAYPAL_OPERATOR_MERCHANT_ID` | The REST app owner's own merchant id, which must never be a payee (required in sandbox mode) |
+| `PAYPAL_OPERATOR_MERCHANT_ID` | The operator app owner's own merchant id, which must never be a payee (required in sandbox mode) |
+| `PAYPAL_OPERATOR_IDENTITY` | Unset (the default): PayPal confirms both apps' owners at startup. `config-only`: trust the configured ids (unconfirmed) |
 | `MCP_DEMO_PASSCODE` | Turns on `POST /mcp`; clients send it as `Authorization: Bearer …` |
 | `DB_PATH` | The sqlite file for bookings and the ledger (default `:memory:`). It carries a schema version, and a file of any other version is refused (no migrations yet) |
 
@@ -172,11 +186,25 @@ Each refund POST is sent once. If a reply is lost, its row says "no answer", the
 Rerun with a new order.
 
 ```bash
-PAYPAL_CLIENT_ID=... PAYPAL_CLIENT_SECRET=... node scripts/spike.ts --payee-merchant-id GUIDEMERCHANT1
+PAYPAL_CLIENT_ID=... PAYPAL_CLIENT_SECRET=... PAYPAL_REFUND_CLIENT_ID=... PAYPAL_REFUND_CLIENT_SECRET=... node scripts/spike.ts --payee-merchant-id GUIDEMERCHANT1
 ```
 
 Keep the default amount (10.00): the refund calls need A of at least 2.00, and below that they are refused
 and nothing is refunded. `--no-refund` skips them.
+
+- **The refund app.** `PAYPAL_REFUND_CLIENT_ID` and `PAYPAL_REFUND_CLIENT_SECRET` (both or neither) are the payee's
+  own REST app, the guide's: every refund call (POST and GET) goes through it. Without them the refunds go through
+  the operator's app, which PayPal refuses (403, DESIGN.md §21). Row a2 prints the owner PayPal echoes for the
+  operator's app and, when set, for the refund app.
+- **On an existing capture.** `--capture CAPTURE_ID --remaining 9.00` makes no order (a-d are skipped) and runs e1-e6
+  on that capture, with A = `--remaining`, what is left on it: the money guard never lets PayPal refund more than
+  that. Row e0 reads the capture first, and the run refuses an A that can't be what is left (more than the capture,
+  or not matching its status). e1's `total_refunded_amount` must then equal the capture's amount less A, plus e1's
+  1.00; otherwise the run stops before e2 (row "e1 check"). It takes no other flag.
+
+```bash
+PAYPAL_CLIENT_ID=... PAYPAL_CLIENT_SECRET=... PAYPAL_REFUND_CLIENT_ID=... PAYPAL_REFUND_CLIENT_SECRET=... node scripts/spike.ts --capture CAPTURE_ID --remaining 9.00
+```
 
 **What to paste back:**
 - Everything from the table's `step | call` header to the `SPIKE OK` or `SPIKE FAILED` line: the table, the
@@ -247,6 +275,10 @@ npx playwright test
     - log redaction;
     - the ledger checkpoint;
     - spike run ids.
+  - the two apps (`test/guide-*.test.ts` and `test/spike-capture.test.ts`, DESIGN.md §21): refunds routed to the payee's own app and refused before
+    any POST when it has none; the fake refusing the operator's app a refund, as PayPal did; the owner check by the
+    payee echo; the two webhook endpoints, each taking only its own app's webhook id, and one event on both
+    processed once; and the spike's refund app and `--capture`;
   - the hosted demo (`test/fix4-hosted.test.ts`), in sandbox mode with no network: the cyclone simulation on
     the caller's own paid booking only, once, with no PayPal call; the page's Demo controls; Start over staying
     in the caller's session.
@@ -275,6 +307,10 @@ All of this repository was written from 31 Oct 2026, inside the PayPal AI Hackat
 
 - **Sandbox only, made-up guides.** A real version would raise a regulatory question we have not settled:
   booking for someone may count as tour-operator work even without holding money.
+- **Ambree triggers the refund with the guide's own PayPal app credentials.** That works for the demo's one sandbox
+  guide. A real version would not hold a guide's credentials: it would use PayPal's partner onboarding, with the
+  guide's consent to refunds, and send `PayPal-Auth-Assertion` from Ambree's own app. That needs PayPal to enable
+  partner features for the app; the sandbox refused it on 3 Nov (DESIGN.md §21).
 - **Conversations live in memory**; bookings and the ledger live in sqlite.
 - **The real GDACS cyclone feed is not wired yet.** The "Simulate a cyclone warning (demo)" control stands in
   for it, labelled as simulated. On the hosted sandbox it marks only your own paid booking's day, and it never
