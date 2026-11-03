@@ -186,8 +186,9 @@ export function createApp(opts: AppOptions): App {
   /**
    * Confirms with PayPal who owns each app before serving (DESIGN.md §21, D3), by the payee echo of a probe
    * order with no payee (getAppOwner; it is never approved and lapses). The operator app's owner must be
-   * PAYPAL_OPERATOR_MERCHANT_ID and no guide's payee. Any other answer, or none, refuses to start, naming the
-   * check that failed. userinfo, used before, has no payer_id for an app token (spike S11, 3 Nov).
+   * PAYPAL_OPERATOR_MERCHANT_ID and no payee; each payee app's owner must be that payee (sandbox:
+   * PAYPAL_GUIDE_PAYEE_MERCHANT_ID). Any other answer, or none, refuses to start, naming the check that
+   * failed. config-only skips both. userinfo, used before, has no payer_id for an app token (spike S11, 3 Nov).
    */
   type IdentityStatus = "pending" | "confirmed" | "config-only (unconfirmed)";
   let operatorIdentity: IdentityStatus = "pending";
