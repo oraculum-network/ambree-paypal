@@ -141,7 +141,7 @@ npm ci
 npm start
 ```
 
-Open http://localhost:8080 and try the whole flow offline:
+Open http://127.0.0.1:8080 (not `localhost`: with no `PUBLIC_URL` set, the server accepts the page's requests only from `http://127.0.0.1:<PORT>`) and try the whole flow offline:
 
 - **The fake PayPal** (`src/paypal/fake.ts`) speaks the same JSON as the sandbox for OAuth, Orders v2,
   refunds and webhook verification. It even sends webhooks to the app's own endpoint over HTTP.
