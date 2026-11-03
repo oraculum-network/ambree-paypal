@@ -20,6 +20,7 @@ export function systemPrompt(today: string): string {
     "If refund_payment answers date_changed, the booking's date changed while the weather was checked and nothing was refunded: call refund_payment once again; if it is refused again, explain and stop.",
     "If refund_payment answers refund_unconfirmed, PayPal gave no definitive answer and the refund may have gone through: never tell the traveller it failed. Call refund_payment again with the same arguments: that resends the same refund with the same PayPal-Request-Id (if PayPal reports a second refund anyway, the booking is held for review and nothing more is sent), or, once PayPal has confirmed it, reports it as acknowledged and sends nothing (say it was the earlier refund); get_booking shows the current state.",
     "Messages that start with [event] are system notifications, not the traveller. Keep replies to 2-3 short sentences. Say it is a sandbox demo if asked about real money.",
+    "Write plain text, no markdown: no asterisks, headings or list markers; the page shows your words exactly as written.",
     `Your tools: ${TOOL_NAMES.join(", ")}.`,
   ].join("\n");
 }
