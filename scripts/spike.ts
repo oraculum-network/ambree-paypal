@@ -206,16 +206,25 @@ function describeError(e: unknown): string {
   return e instanceof PayPalError ? e.summary() : e instanceof Error ? e.message : "unknown error";
 }
 
+export interface SpikeResult {
+  rows: Row[];
+  ok: boolean;
+  /** Why the run is not OK, for the SPIKE FAILED line (refundProblems for (e)). */
+  problem?: string;
+  refunds?: RefundRun;
+}
+
 /**
  * Runs (b)-(e). Returns the rows, whether every step that ran succeeded (for (e), every planned call ran:
- * refundOk), and what the refund sequence saw, for the premise block.
+ * refundOk) and why not, and what the refund sequence saw, for the premise block.
  */
-export async function runSpike(d: SpikeDeps): Promise<{ rows: Row[]; ok: boolean; refunds?: RefundRun }> {
+export async function runSpike(d: SpikeDeps): Promise<SpikeResult> {
   const rows: Row[] = [];
   const status = () => String(d.lastStatus() || "-");
+  const stopped = (step: string): SpikeResult => ({ rows, ok: false, problem: `stopped at ${step} (see its row)` });
   const fail = (step: string, call: string, e: unknown) => {
     rows.push({ step, call, status: e instanceof PayPalError ? String(e.status || e.kind) : "-", id: "", note: scrub(describeError(e)) });
-    return { rows, ok: false };
+    return stopped(step);
   };
 
   let order: Order;
@@ -229,7 +238,7 @@ export async function runSpike(d: SpikeDeps): Promise<{ rows: Row[]; ok: boolean
   const link = approveLink(order);
   if (!link) {
     rows.push({ step: "c approve", call: "-", status: "-", id: order.id, note: "no approve or payer-action link" });
-    return { rows, ok: false };
+    return stopped("c approve");
   }
   d.print(`\nApprove the order as the sandbox BUYER (personal account) in a browser:\n  ${link}\nPolling every ${d.args.pollSec}s for up to ${d.args.timeoutSec}s…`);
 
@@ -245,7 +254,7 @@ export async function runSpike(d: SpikeDeps): Promise<{ rows: Row[]; ok: boolean
     if (order.status === "APPROVED") break;
     if (Date.now() >= deadline) {
       rows.push({ step: "c poll", call: "GET /v2/checkout/orders/{id}", status: status(), id: order.id, note: `timed out at status ${order.status} after ${polls} polls` });
-      return { rows, ok: false };
+      return stopped("c poll");
     }
     await d.sleep(d.args.pollSec * 1000);
   }
@@ -259,7 +268,7 @@ export async function runSpike(d: SpikeDeps): Promise<{ rows: Row[]; ok: boolean
   } catch (e) {
     return fail("d capture", "POST /v2/checkout/orders/{id}/capture", e);
   }
-  if (!capture) return { rows, ok: false };
+  if (!capture) return stopped("d capture");
 
   if (!d.args.refund) {
     rows.push({ step: "e refund", call: "-", status: "-", id: "", note: "skipped (--no-refund)" });
@@ -267,7 +276,8 @@ export async function runSpike(d: SpikeDeps): Promise<{ rows: Row[]; ok: boolean
   }
   const refunds = await runRefundPremises(d, capture);
   rows.push(...refundRows(refunds));
-  return { rows, ok: refundOk(refunds), refunds };
+  const problems = refundProblems(refunds);
+  return { rows, ok: problems.length === 0, problem: problems.join("; ") || undefined, refunds };
 }
 
 // ---------- (e) the refund premises (DESIGN.md §5 S12; §19 "Verify in spike S11"; §20) ----------
@@ -524,13 +534,25 @@ const STEPS = [
 type StepKey = (typeof STEPS)[number][0];
 
 const is4xx = (c: RefundCall) => c.http >= 400 && c.http < 500;
-/** A 4xx PayPal answered without any earlier attempt of the call having maybe reached it. */
-const answered4xx = (c: RefundCall) => is4xx(c) && !c.error?.maybeDelivered;
 const isGet = (key: StepKey) => key === "e3" || key === "e4b";
+/** The steps a refusal answers: P1's repeats (e2, e6) and P7's probes (e5, e6). */
+const isPremise = (key: StepKey) => key === "e2" || key === "e5" || key === "e6";
+
+/**
+ * A refusal, which answers P1 or P7: a 422, or another 4xx that names at least one issue and isn't 401, 403
+ * or 429 (the token, a permission or a rate limit say nothing about the refund). Never when an earlier
+ * attempt's reply may have been lost. Any other reply without a refund is no answer.
+ */
+function isRefusal(c: RefundCall): boolean {
+  if (c.refund || !c.error || c.error.maybeDelivered) return false;
+  if (c.http === 422) return true;
+  return is4xx(c) && c.http !== 401 && c.http !== 403 && c.http !== 429 && c.error.issues.length > 0;
+}
 
 /**
  * Why a call has no answer. A refund POST whose reply was lost (a network error, a timeout or a 5xx), or
- * refused after an earlier attempt's reply was lost, may have refunded.
+ * refused after an earlier attempt's reply was lost, may have refunded. A 4xx that isn't a refusal (see
+ * isRefusal) says nothing about the refund.
  */
 function noAnswer(c: RefundCall, post: boolean): string {
   const e = c.error;
@@ -538,6 +560,7 @@ function noAnswer(c: RefundCall, post: boolean): string {
     if (!post) return "no answer (the reply was lost)";
     return is4xx(c) ? "no answer (an earlier attempt's reply may have been lost; PayPal may have refunded)" : "no answer (the reply may have been lost; PayPal may have refunded)";
   }
+  if (is4xx(c)) return `no answer (HTTP ${c.http} is not a refusal)`;
   return `no answer (${e?.summary ?? "nothing came back"})`;
 }
 
@@ -605,9 +628,11 @@ function noteOf(key: StepKey, c: RefundCall, run: RefundRun): string {
   const r = c.refund;
   if (!r) {
     const e = c.error!;
-    if (e.maybeDelivered && !isGet(key)) return `${noAnswer(c, true)}: ${errorNote(c)}`;
-    if (key === "e5" && is4xx(c)) return `refused as expected: HTTP ${c.http}; issues ${e.issues.join(", ") || "none"}; ${e.summary}`;
-    if (key === "e6" && is4xx(c)) return `refused: HTTP ${c.http}; issues ${e.issues.join(", ") || "none"}; ${e.summary}`;
+    // e2, e5 and e6 are answered only by a refusal; e1, e3, e4 and e4b show PayPal's error as it is (S4)
+    // unless the reply may have been lost.
+    if (isPremise(key) ? !isRefusal(c) : e.maybeDelivered && !isGet(key)) return `${noAnswer(c, !isGet(key))}: ${errorNote(c)}`;
+    if (key === "e5") return `refused as expected: HTTP ${c.http}; issues ${e.issues.join(", ") || "none"}; ${e.summary}`;
+    if (key === "e6") return `refused: HTTP ${c.http}; issues ${e.issues.join(", ") || "none"}; ${e.summary}`;
     return errorNote(c);
   }
   switch (key) {
@@ -645,19 +670,49 @@ export function refundRows(run: RefundRun): Row[] {
   return rows;
 }
 
+/** What a call came to, in a few words, for refundProblems. */
+function outcomeOf(key: StepKey, c: RefundCall | undefined): string {
+  if (!c) return "not run";
+  if (c.skipped) return `not run (${c.skipped})`;
+  if (c.guard) return "not sent (the money guard)";
+  if (c.refund) return `refund ${c.refund.id}`;
+  const e = c.error;
+  const answered = isPremise(key) ? isRefusal(c) : Boolean(e && !e.maybeDelivered);
+  if (!answered || !e) return noAnswer(c, !isGet(key));
+  const what = `HTTP ${c.http || e.kind}${e.issues.length ? ` ${e.issues.join(", ")}` : ""}`;
+  return isPremise(key) ? `refused (${what})` : what;
+}
+
 /**
- * The run is ok when every planned call ran and answered as a step can: e1-e4 with a refund (e2 deduped or
- * not; e4 may be not needed), e5 with a 4xx, e6 with e4's refund or a 4xx (or not needed when e4 wasn't).
+ * Why the sequence is not OK, one entry per call that didn't answer as its step can (none: OK). OK means
+ * every planned call ran: e1-e4 with a refund (e2 deduped or not; e4 may be not needed), e5 with a refusal
+ * (isRefusal), e6 with e4's refund or a refusal (or not needed when e4 wasn't). e4b is informational.
  */
-export function refundOk(run: RefundRun): boolean {
-  if (run.refused) return false;
+export function refundProblems(run: RefundRun): string[] {
+  if (run.refused) return ["the refund sequence didn't run (see its row)"];
   const { e1, e2, e3, e4, e5, e6 } = run;
-  if (!e1?.refund || !e2?.refund || !e3?.refund || !e4 || !e5 || !e6) return false;
-  if (!e4.refund && !e4.skipped) return false;
-  if (!(e5.error && answered4xx(e5))) return false;
-  if (e6.skipped) return Boolean(e4.skipped);
-  if (e6.refund) return e6.refund.id === e4.refund?.id;
-  return Boolean(e6.error && answered4xx(e6));
+  const out: string[] = [];
+  const bad = (key: StepKey, c: RefundCall | undefined, more = "") => out.push(`${key}: ${outcomeOf(key, c)}${more}`);
+  if (!e1?.refund) {
+    bad("e1", e1);
+    return out;
+  }
+  if (!e2?.refund) bad("e2", e2, e2 && isRefusal(e2) ? ", not the expected answer" : "");
+  if (!e3?.refund) bad("e3", e3);
+  if (!e4 || (!e4.refund && !e4.skipped)) bad("e4", e4);
+  if (e5?.refund) out.push(`e5: PayPal accepted it (refund ${e5.refund.id}): UNEXPECTED`);
+  else if (!e5 || !isRefusal(e5)) bad("e5", e5);
+  if (e6?.refund) {
+    if (e6.refund.id !== e4?.refund?.id) out.push(`e6: a new refund ${e6.refund.id}: UNEXPECTED`);
+  } else if (e6?.skipped) {
+    if (!e4?.skipped) bad("e6", e6);
+  } else if (!e6 || !isRefusal(e6)) bad("e6", e6);
+  return out;
+}
+
+/** OK: no refundProblems. */
+export function refundOk(run: RefundRun): boolean {
+  return refundProblems(run).length === 0;
 }
 
 type RepeatKind = "same" | "new" | "refused" | "error" | "notsent" | "notrun";
@@ -667,7 +722,7 @@ function repeatAnswer(c: RefundCall | undefined, firstId: string | undefined, sa
   if (c.skipped) return { kind: "notrun", text: `not run (${c.skipped})` };
   if (c.guard) return { kind: "notsent", text: `not sent (${c.guard})` };
   if (c.refund) return c.refund.id === firstId ? { kind: "same", text: `DEDUPED (${sameText})` } : { kind: "new", text: `NOT DEDUPED (new refund id ${c.refund.id})` };
-  if (answered4xx(c)) return { kind: "refused", text: `refused (HTTP ${c.http} ${c.error!.issues.join(", ") || "with no issue names"})` };
+  if (isRefusal(c)) return { kind: "refused", text: `refused (HTTP ${c.http} ${c.error!.issues.join(", ") || "with no issue names"})` };
   return { kind: "error", text: noAnswer(c, true) };
 }
 
@@ -686,7 +741,7 @@ function refusalAnswer(c: RefundCall | undefined, replayOf: string | undefined):
   if (c.skipped) return `not run (${c.skipped})`;
   if (c.guard) return `not sent (${c.guard})`;
   if (c.refund) return replayOf !== undefined && c.refund.id === replayOf ? "replayed (same refund id as e4), not refused" : `ACCEPTED (refund id ${c.refund.id}): UNEXPECTED`;
-  if (!answered4xx(c)) return noAnswer(c, true);
+  if (!isRefusal(c)) return noAnswer(c, true);
   const issues = c.error!.issues;
   if (!issues.length) return `HTTP ${c.http} with no issue names`;
   return `HTTP ${c.http} ${issues.join(", ")}${issues.length > 1 ? ` (the service reads only the first, ${issues[0]})` : ""}`;
@@ -836,7 +891,7 @@ async function main(): Promise<number> {
 
   const result = await runSpike({ api: client, args, runId, print: out, sleep: (ms) => new Promise((r) => setTimeout(r, ms)), lastStatus, refundPosts });
   const block = result.refunds ? `\n\n${refundPremises(result.refunds).join("\n")}` : "";
-  out(`\n${formatTable([...rows, ...result.rows])}${block}\n\n${result.ok ? "SPIKE OK" : "SPIKE FAILED"}: paste this table${block ? " and the premise block" : ""} into the CTO's notes.`);
+  out(`\n${formatTable([...rows, ...result.rows])}${block}\n\n${result.ok ? "SPIKE OK" : `SPIKE FAILED (${result.problem ?? "see the table"})`}: paste this table${block ? " and the premise block" : ""} into the CTO's notes.`);
   return result.ok ? 0 : 1;
 }
 

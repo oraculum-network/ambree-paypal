@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
-import { RefundBudget, type RefundCall, RefundGuardRefused, type RefundRun, type Row, buildOrder, formatTable, parseArgs, readEnv, redact, refundOk, refundPremises, refundRows, runSpike, scrub, spikeClient } from "../scripts/spike.ts";
+import { RefundBudget, type RefundCall, RefundGuardRefused, type RefundRun, type Row, buildOrder, formatTable, parseArgs, readEnv, redact, refundOk, refundPremises, refundProblems, refundRows, runSpike, scrub, spikeClient } from "../scripts/spike.ts";
 import { FakePayPal } from "../src/paypal/fake.ts";
 import { toMinor } from "../src/paypal/money.ts";
 import { LiveEnvironmentRefused } from "../src/paypal/sandbox.ts";
@@ -189,8 +189,8 @@ describe("spike run against the fake", () => {
 
   it("create → approve → capture → the refund premise sequence, with statuses and ids", async () => {
     const h = harness(["--payee-email", "guide@business.example.com", "--poll", "1"]);
-    const { rows, ok, refunds } = await h.run();
-    expect(ok).toBe(true);
+    const { rows, ok, refunds, problem } = await h.run();
+    expect([ok, problem]).toEqual([true, undefined]);
     expect(rows.map((r) => [r.step, r.status])).toEqual([
       ["b create", "201"],
       ["c poll", "200"],
@@ -370,9 +370,11 @@ describe("spike run against the fake", () => {
         const h = harness(["--payee-email", "g@business.example.com", "--amount", c.amount, "--poll", "1"], { dedupe: c.dedupe });
         // PayPal acts on the request, then its reply is lost.
         onRefundPost(h.fake, c.n, { dropResponse: true, status: c.status ?? 0 });
-        const { rows, ok, refunds } = await h.run();
+        const { rows, ok, refunds, problem } = await h.run();
         expectAsksFit(h.asks);
         expect(ok).toBe(false);
+        // SPIKE FAILED names the call.
+        expect(problem).toMatch(new RegExp(`(^|; )${c.lost}: no answer \\(the reply may have been lost; PayPal may have refunded\\)`));
         const captureId = rows.find((r) => r.step === "d capture")!.id;
         const row = rows.find((r) => r.step === LABEL[c.lost])!;
         expect(row.status).toBe(c.status ? String(c.status) : "network");
@@ -426,8 +428,9 @@ describe("spike run against the fake", () => {
     it("is no answer, not a refusal: its premise reads unanswered and the run is not OK", async () => {
       const h = harness(["--payee-email", "g@business.example.com", "--poll", "1"]);
       onRefundPost(h.fake, c.n, ...Array.from({ length: c.times ?? 1 }, () => ({ status: c.status, body: c.body })));
-      const { rows, ok, refunds } = await h.run();
+      const { rows, ok, refunds, problem } = await h.run();
       expect(ok).toBe(false);
+      expect(problem).toBe(`${c.step}: no answer (HTTP ${c.status} is not a refusal)`);
       const row = rows.find((r) => r.step === LABEL[c.step])!;
       expect(row.status).toBe(String(c.status));
       expect(row.note).toMatch(new RegExp(`^no answer \\(HTTP ${c.status} is not a refusal\\): POST /v2/payments/captures/\\{id\\}/refund · HTTP ${c.status}`));
@@ -525,8 +528,8 @@ describe("spike run against the fake", () => {
   it("stops after e1 when PayPal refuses the first refund (S4), with no further refund POST", async () => {
     const h = harness(["--payee-email", "g@business.example.com", "--poll", "1"]);
     h.fake.failNext({ method: "POST", path: /\/refund$/, status: 403, body: { name: "NOT_AUTHORIZED", debug_id: "d5", details: [{ issue: "PERMISSION_DENIED", description: "no" }] } });
-    const { rows, ok, refunds } = await h.run();
-    expect(ok).toBe(false);
+    const { rows, ok, refunds, problem } = await h.run();
+    expect([ok, problem]).toEqual([false, "e1: HTTP 403 PERMISSION_DENIED"]);
     expect(rows.at(-1)).toMatchObject({ step: "e1 refund", status: "403" });
     expect(rows.at(-1)!.note).toBe("POST /v2/payments/captures/{id}/refund · HTTP 403 · PERMISSION_DENIED · debug_id d5; issues PERMISSION_DENIED");
     expect(refundPostsIn(h.fake)).toHaveLength(1);
@@ -580,6 +583,21 @@ describe("refund premises as a pure function of the replies", () => {
     expect(refundPremises(run)[1]).toBe("P1 dedupe (e2, e6): e2 refused (HTTP 422 DUPLICATE_REQUEST_ID); e6 DEDUPED (same refund id as e4) → NO: PayPal refused the repeat rather than replaying it");
     expect(refundRows(run).find((r) => r.step === "e2 dedupe")!.note).toBe("POST /v2/payments/captures/{id}/refund · HTTP 422; issues DUPLICATE_REQUEST_ID");
     expect(refundOk(run)).toBe(false);
+    expect(refundProblems(run)).toEqual(["e2: refused (HTTP 422 DUPLICATE_REQUEST_ID), not the expected answer"]);
+  });
+
+  it("names every call that didn't answer as its step can", () => {
+    expect(refundProblems(base())).toEqual([]);
+    const run = base();
+    run.e3 = refused(404, "INVALID_RESOURCE_ID");
+    run.e5 = refused(429, "RATE_LIMIT_REACHED");
+    run.e6 = { http: 0, guard: "x" };
+    expect(refundProblems(run)).toEqual(["e3: HTTP 404 INVALID_RESOURCE_ID", "e5: no answer (HTTP 429 is not a refusal)", "e6: not sent (the money guard)"]);
+    const odd = base();
+    odd.e5 = ok(refund("R5", "1.00"));
+    odd.e6 = ok(refund("R6", "9.00"));
+    expect(refundProblems(odd)).toEqual(["e5: PayPal accepted it (refund R5): UNEXPECTED", "e6: a new refund R6: UNEXPECTED"]);
+    expect(refundProblems({ ...base(), refused: "the capture is EUR 1.00" })).toEqual(["the refund sequence didn't run (see its row)"]);
   });
 
   it("e2 deduped and e6 refused: dedupe holds only while the capture has room", () => {
