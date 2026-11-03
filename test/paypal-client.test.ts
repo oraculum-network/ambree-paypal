@@ -274,6 +274,53 @@ describe("transport failures", () => {
     expect(e.debugId).toBe("dbg1");
   });
 
+  describe("writeRetries: 0 (the spike's refund POSTs: one exchange each)", () => {
+    function once(fake = new FakePayPal()) {
+      const calls: string[] = [];
+      const opts = { clientId: fake.clientId, clientSecret: fake.clientSecret, fetch: fake.fetch, writeRetries: 0, onCall: (c: { call: string; status: number }) => void calls.push(`${c.call} ${c.status}`) };
+      return { fake, calls, client: new PayPalRestClient(opts) };
+    }
+    const CREATE = "POST /v2/checkout/orders";
+
+    it("doesn't resend a write after a lost reply: the error says it may have been delivered", async () => {
+      const { client, fake, calls } = once();
+      fake.failNext({ path: /^\/v2\/checkout\/orders$/, status: 0, dropResponse: true });
+      const e = await caught(client.createOrder(orderBody(), "once-1"));
+      expect([e.kind, e.maybeDelivered]).toEqual(["network", true]);
+      expect(calls.filter((c) => c.startsWith(CREATE))).toEqual([`${CREATE} 0`]);
+    });
+
+    it("doesn't resend a write after a 5xx", async () => {
+      const { client, fake, calls } = once();
+      fake.failNext({ path: /^\/v2\/checkout\/orders$/, status: 503, body: { name: "SERVICE_UNAVAILABLE", debug_id: "d503", details: [] } });
+      const e = await caught(client.createOrder(orderBody(), "once-2"));
+      expect([e.status, e.maybeDelivered]).toEqual([503, true]);
+      expect(calls.filter((c) => c.startsWith(CREATE))).toEqual([`${CREATE} 503`]);
+    });
+
+    it("still fetches a new token on a 401 and sends the write again (PayPal didn't act on it)", async () => {
+      const { client, fake, calls } = once();
+      await client.createOrder(orderBody(), "warm");
+      fake.expireTokens();
+      expect((await client.createOrder(orderBody(), "once-3")).id).toBeTruthy();
+      expect(calls.slice(-3)).toEqual([`${CREATE} 401`, "POST /v1/oauth2/token 200", `${CREATE} 201`]);
+    });
+
+    it("still retries a GET once", async () => {
+      const { client, fake } = once();
+      const o = await client.createOrder(orderBody(), "once-4");
+      fake.failNext({ method: "GET", path: /^\/v2\/checkout\/orders\//, status: 0, network: true });
+      expect((await client.getOrder(o.id)).id).toBe(o.id);
+    });
+
+    it("must be a whole number, 0 or more", () => {
+      for (const writeRetries of [-1, 0.5, Number.NaN]) {
+        const opts = { clientId: "a", clientSecret: "b", writeRetries };
+        expect(() => new PayPalRestClient(opts), String(writeRetries)).toThrow(RangeError);
+      }
+    });
+  });
+
   it("a non-JSON 2xx reply is invalid_response", async () => {
     const f = (async (input: string | URL | Request) =>
       String(input).endsWith("/v1/oauth2/token") ? new Response(JSON.stringify({ access_token: "t", expires_in: 3600 })) : new Response("<html>", { status: 200 })) as typeof fetch;
