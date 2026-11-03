@@ -201,6 +201,21 @@ client's `writeRetries` (default 1) sets the writes' count; the spike passes 0 (
 | S11 | (The refund premises at the end of §19 and §20 are S12.) Does `GET /v1/identity/openidconnect/userinfo?schema=openid`, called with the **app's client-credentials token**, describe the REST app's owner, and is its `payer_id` the owner's merchant id (equal to the id in the sandbox dashboard)? If not, which documented call returns the app owner's merchant id? | row "a2 identity": prints payer_id, user_id, account_type and the field names (never a token). Compare payer_id with the dashboard's merchant id |
 | S12 | The **refund premises** the code now depends on (§19 "Verify in spike S11", and §20), numbered in that list's order: **P1** dedupe of a repeated `PayPal-Request-Id`; **P2** `custom_id` on the refund; **P2b** its `links[rel=up]` to the capture; **P3** the resource of `PAYMENT.CAPTURE.REFUNDED` and of `PAYMENT.CAPTURE.REVERSED` (§20); **P4** the refund failure event names; **P5** `seller_payable_breakdown.total_refunded_amount`; **P6** a refund PENDING then FAILED or CANCELLED; **P7** the issue a refused refund carries | (e1)-(e6) on the captured amount A, which must be at least 2.00: e1 refunds 1.00 (`custom_id` "spike-{runId}", request id "spike-refund1-{runId}"); e2 repeats that POST exactly; e3 GETs e1's refund; e4 refunds the rest of A (less e2's 1.00 if it was a second refund or its reply was lost); e4b GETs e1's refund again; e5 asks 1.00 more of the fully refunded capture under a new request id; e6 repeats e4's request. Each refund POST is one exchange: the spike's client doesn't resend a write (`writeRetries` 0), so a lost reply is "no answer", never a resend mixed into the answer. The block "Refund premises (DESIGN.md §19-§20)" answers P1, P2, P2b, P5 and P7. P3, P4 and P6 need the developer dashboard's webhook simulator and the sandbox webhook event log |
 
+**Spike results, 3 Nov 16:06 (sandbox, app 1999c59; the full table is in the CTO's notes).**
+- S1-S3, S6: an order with `payee.merchant_id` of another sandbox business account (the guide, DE) is created,
+  approved by a sandbox buyer and captured by the operator's app: capture COMPLETED, `custom_id` echoed.
+- S9: a German (EUR) guide account takes the EUR deposit as COMPLETED. The MU sandbox accounts hold USD.
+- **S11: NO.** `userinfo` with the app's token answers 200 with only `user_id` and `sub`: no `payer_id`. The
+  startup check as built refuses to start. **Verified instead:** `POST /v2/checkout/orders` with no `payee` (and
+  `Prefer: return=representation`) echoes `purchase_units[0].payee.merchant_id` = the app owner's merchant id
+  (equal to the dashboard's). The probe order is never approved and lapses.
+- **S4: NO.** The operator's app gets 403 PERMISSION_DENIED refunding the guide's capture. `PayPal-Auth-Assertion`
+  is refused (400 "No permissions to set target_client_id"), and Partner Referrals answers 403 NOT_AUTHORIZED:
+  acting for a seller needs PayPal's partner features. **Open:** whether a REST app owned by the guide's own
+  account can refund a capture the operator's app created (decides whether only the refund legs move to the
+  guide's credentials, or the order too).
+- S12 (P1, P2, P2b, P5, P7): not answered, because e1 was refused. Rerun on the existing capture once refunds work.
+
 **S12, what each answer changes in the code.** P2 and P2b are read on the POST reply and on GET only; whether
 refund *webhooks* carry them too is P3, read in the event log.
 
