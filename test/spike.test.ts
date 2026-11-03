@@ -611,6 +611,25 @@ describe("refund premises as a pure function of the replies", () => {
     expect(refundRows(run).find((r) => r.step === "e4 rest")!.note).toBe("COMPLETED; EUR 9.00; total_refunded_amount EUR 9.00 (= A: no, A is EUR 10.00)");
   });
 
+  it("e4b, e1 read again after e4: GET shows the running total, the total when e1 was made, or another", () => {
+    const run = base();
+    const t = (v: string) => ({ seller_payable_breakdown: { total_refunded_amount: { currency_code: "EUR" as const, value: v } } });
+    run.e1 = ok(refund("R1", "1.00", t("1.00")));
+    const again = (v?: string) => {
+      run.e4b = ok(refund("R1", "1.00", v ? t(v) : {}), 200);
+      return refundPremises(run)[4]!.replace(/^.*; GET after e4 /, "");
+    };
+    expect(again("10.00")).toBe("running total yes (EUR 10.00)");
+    expect(again("1.00")).toBe("running total no (EUR 1.00, as on e1's reply; the refunds so far sum to EUR 10.00)");
+    expect(again("7.00")).toBe("running total no (EUR 7.00; the refunds so far sum to EUR 10.00)");
+    expect(again()).toBe("absent");
+    run.e4b = { http: 404, error: { kind: "http", issues: ["INVALID_RESOURCE_ID"], summary: "GET /v2/payments/refunds/{id} · HTTP 404", maybeDelivered: false } };
+    expect(refundPremises(run)[4]).toMatch(/; GET after e4 not seen$/);
+    // Informational: a failed e4b doesn't fail the run.
+    expect(refundOk(run)).toBe(true);
+    expect(refundRows(run).find((r) => r.step === "e4b get")).toMatchObject({ call: "GET /v2/payments/refunds/{id}", status: "404" });
+  });
+
   it("e5 accepted, or e6 a new refund, is loud and not ok", () => {
     const run = base();
     run.e5 = ok(refund("R5", "1.00"));

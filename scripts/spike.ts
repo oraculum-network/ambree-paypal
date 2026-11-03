@@ -5,8 +5,8 @@
 // (a) OAuth token, (b) a CAPTURE order of 10.00 with purchase_units[0].payee, (c) the approve link, then polls
 // GET /v2/checkout/orders/{id} until APPROVED, (d) captures, (e) the refund-premise sequence on the captured
 // amount A (DESIGN.md §5 S12): e1 refunds 1.00, e2 repeats it with the same PayPal-Request-Id, e3 reads e1
-// back, e4 refunds the rest, e5 asks 1.00 more of the fully refunded capture (a refusal is expected), e6
-// repeats e4's request; (f) a table of HTTP statuses and ids, and the premise block. It never prints a
+// back, e4 refunds the rest, e4b reads e1 again, e5 asks 1.00 more of the fully refunded capture (a refusal
+// is expected), e6 repeats e4's request; (f) a table of HTTP statuses and ids, and the premise block. It never prints a
 // secret, a token or the client id, refuses any base URL but the sandbox, and never lets PayPal refund more
 // than A (RefundBudget). It answers DESIGN.md §5 S1-S6, S9, S11 and S12. PAYPAL_WEBHOOK_ID is not needed.
 
@@ -273,6 +273,8 @@ export interface RefundRun {
   e2?: RefundCall;
   e3?: RefundCall;
   e4?: RefundCall;
+  /** e1 read again after e4 (P5: does GET show the running total?). Informational: not part of refundOk. */
+  e4b?: RefundCall;
   e5?: RefundCall;
   e6?: RefundCall;
 }
@@ -431,13 +433,17 @@ async function runRefundPremises(d: SpikeDeps, capture: Capture): Promise<Refund
   if (!r1) return run;
   run.e2 = await post("e2", b1, id1, "room");
 
+  const get = async (refundId: string): Promise<RefundCall> => {
+    try {
+      const refund = await d.api.getRefund(refundId);
+      return { http: d.lastStatus(), refund };
+    } catch (e) {
+      return callFromError(e);
+    }
+  };
+
   // e3: e1 read back.
-  try {
-    const refund = await d.api.getRefund(r1.id);
-    run.e3 = { http: d.lastStatus(), refund };
-  } catch (e) {
-    run.e3 = callFromError(e);
-  }
+  run.e3 = await get(r1.id);
 
   // e4: the rest of A (less e2's 1.00 if PayPal may have made it a second refund).
   const rest = capturedMinor - budget.worstMinor;
@@ -452,6 +458,9 @@ async function runRefundPremises(d: SpikeDeps, capture: Capture): Promise<Refund
     b4 = body(rest);
     run.e4 = await post("e4", b4, id2, "room");
   }
+  // e4b: e1 read again, now that e4 has refunded the rest: does GET show the running total, or the total
+  // from when e1 was made (P5)? Read-only, so it is sent whenever e4 was.
+  run.e4b = b4 && !run.e4.guard ? await get(r1.id) : { http: 0, skipped: "e4 wasn't sent" };
 
   // e5: 1.00 more of the fully refunded capture, under a new request id; e6: e4's request again.
   run.e5 = await post("e5", body(STEP_MINOR), `spike-refund3-${d.runId}`, "probe");
@@ -464,6 +473,7 @@ const STEPS = [
   ["e2", "e2 dedupe", REFUND_CALL],
   ["e3", "e3 get", GET_REFUND_CALL],
   ["e4", "e4 rest", REFUND_CALL],
+  ["e4b", "e4b get", GET_REFUND_CALL],
   ["e5", "e5 refusal", REFUND_CALL],
   ["e6", "e6 replay", REFUND_CALL],
 ] as const;
@@ -537,6 +547,8 @@ function noteOf(key: StepKey, c: RefundCall, run: RefundRun): string {
       const isA = !t ? "" : minorIn(t, cur) === minorIn(run.captured, cur) ? " (= A: yes)" : ` (= A: no, A is ${fmtMoney(run.captured)})`;
       return `${r.status}; ${amountOf(r)}; total_refunded_amount ${totalOf(r)}${isA}`;
     }
+    case "e4b":
+      return `${r.status}; total_refunded_amount ${totalOf(r)}`;
     case "e5":
       return `UNEXPECTED: PayPal accepted it (refund ${r.id}, ${r.status}, ${amountOf(r)})`;
     case "e6":
@@ -604,8 +616,11 @@ function refusalAnswer(c: RefundCall | undefined, replayOf: string | undefined):
   return `HTTP ${c.http} ${issues.join(", ")}${issues.length > 1 ? ` (the service reads only the first, ${issues[0]})` : ""}`;
 }
 
-/** P5's running total: the last refund POST reply that made a new refund, against the refunds made so far. */
-function runningTotal(run: RefundRun): string {
+/**
+ * The distinct refunds e1, e2 and e4 made, as their replies show them (FAILED and CANCELLED ones count 0):
+ * their sum, whether every amount was readable, and the last one with the sum up to it.
+ */
+function refundsSeen(run: RefundRun): { sum: number; readable: boolean; last?: { label: string; refund: Refund; sum: number } } {
   const currency = run.captured.currency_code;
   const ids = new Set<string>();
   let sum = 0;
@@ -622,13 +637,41 @@ function runningTotal(run: RefundRun): string {
     }
     last = { label, refund: r, sum };
   }
+  return { sum, readable, last };
+}
+
+/** P5's running total: the last refund POST reply that made a new refund, against the refunds made so far. */
+function runningTotal(run: RefundRun): string {
+  const { readable, last } = refundsSeen(run);
   if (!last) return "not seen";
   const t = last.refund.seller_payable_breakdown?.total_refunded_amount;
   if (!t) return `unknown (absent on ${last.label})`;
   if (!readable) return `unknown (${last.label} shows ${fmtMoney(t)}; a refund's amount was unreadable)`;
+  const currency = run.captured.currency_code;
   return minorIn(t, currency) === last.sum
     ? `yes (${last.label} shows ${fmtMoney(t)}, the sum of the refunds so far)`
     : `no (${last.label} shows ${fmtMoney(t)}; the refunds so far sum to ${fmtMoney(money(currency, last.sum))})`;
+}
+
+/**
+ * P5 on GET: e4b's total (e1 read again after e4) against the refunds made by then. "yes" means GET shows the
+ * capture's running total; "no ..., as on e1's reply" means it shows the total from when e1 was made.
+ */
+function getAfterE4(run: RefundRun): string {
+  const c = run.e4b;
+  if (!c) return "not run";
+  if (c.skipped) return `not run (${c.skipped})`;
+  const t = c.refund?.seller_payable_breakdown?.total_refunded_amount;
+  if (!c.refund) return "not seen";
+  if (!t) return "absent";
+  const { sum, readable } = refundsSeen(run);
+  if (!readable) return `unknown (${fmtMoney(t)}; a refund's amount was unreadable)`;
+  const currency = run.captured.currency_code;
+  const shown = minorIn(t, currency);
+  if (shown === sum) return `running total yes (${fmtMoney(t)})`;
+  const atE1 = run.e1?.refund?.seller_payable_breakdown?.total_refunded_amount;
+  const asOnE1 = atE1 && minorIn(atE1, currency) === shown ? ", as on e1's reply" : "";
+  return `running total no (${fmtMoney(t)}${asOnE1}; the refunds so far sum to ${fmtMoney(money(currency, sum))})`;
 }
 
 export const PREMISES_HEADING = "Refund premises (DESIGN.md §19-§20)";
@@ -648,7 +691,7 @@ export function refundPremises(run: RefundRun): string[] {
     `P1 dedupe (e2, e6): e2 ${e2.text}; e6 ${e6.text} → ${dedupeVerdict(e2.kind, e6.kind)}`,
     `P2 custom_id: on the reply ${seen(run.e1, custom)}; on GET ${seen(run.e3, custom)}`,
     `P2b up link to this capture: on the reply ${seen(run.e1, up)}; on GET ${seen(run.e3, up)}`,
-    `P5 total_refunded_amount: on the reply ${seen(run.e1, totalOf)}; on GET ${seen(run.e3, totalOf)}; running total ${runningTotal(run)}`,
+    `P5 total_refunded_amount: on the reply ${seen(run.e1, totalOf)}; on GET ${seen(run.e3, totalOf)}; running total ${runningTotal(run)}; GET after e4 ${getAfterE4(run)}`,
     `P7 refusal issues: e5 ${refusalAnswer(run.e5, undefined)}; e6 ${refusalAnswer(run.e6, run.e4?.refund?.id)}`,
     NOT_ANSWERED,
   ].map(scrub);
