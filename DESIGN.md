@@ -181,7 +181,8 @@ capture or refund id it already stored.
 tokens or credentials. Issue names we handle (all **UNVERIFIED**): `ORDER_NOT_APPROVED`, `ORDER_ALREADY_CAPTURED`,
 `CAPTURE_FULLY_REFUNDED`, `REFUND_AMOUNT_EXCEEDED`, `PAYEE_ACCOUNT_RESTRICTED`, `PAYEE_NOT_ENABLED_FOR_CARD_PROCESSING`.
 The OAuth error body is `{error, error_description}`. Timeouts: 15 s per call (`AbortSignal.timeout`). One retry,
-only on network errors or 5xx, and only for calls that carry a `PayPal-Request-Id`.
+only on network errors or 5xx: for a GET always, for a write only if it carries a `PayPal-Request-Id`. The
+client's `writeRetries` (default 1) sets the writes' count; the spike passes 0 (§5 S12).
 
 ## 5. Unknown until the spike (Mon 2 Nov)
 
@@ -198,7 +199,7 @@ only on network errors or 5xx, and only for calls that carry a `PayPal-Request-I
 | S9 | Currency: EUR versus USD for an MU business sandbox account | run once with each |
 | S10 | JS SDK v6 buttons versus the redirect approve link for a third-party payee | not in the spike; the build uses the approve link (redirect) first |
 | S11 | (The refund premises at the end of §19 and §20 are S12.) Does `GET /v1/identity/openidconnect/userinfo?schema=openid`, called with the **app's client-credentials token**, describe the REST app's owner, and is its `payer_id` the owner's merchant id (equal to the id in the sandbox dashboard)? If not, which documented call returns the app owner's merchant id? | row "a2 identity": prints payer_id, user_id, account_type and the field names (never a token). Compare payer_id with the dashboard's merchant id |
-| S12 | The **refund premises** the code now depends on (§19 "Verify in spike S11", and §20), numbered in that list's order: **P1** dedupe of a repeated `PayPal-Request-Id`; **P2** `custom_id` on the refund; **P2b** its `links[rel=up]` to the capture; **P3** the resource of `PAYMENT.CAPTURE.REFUNDED` and of `PAYMENT.CAPTURE.REVERSED` (§20); **P4** the refund failure event names; **P5** `seller_payable_breakdown.total_refunded_amount`; **P6** a refund PENDING then FAILED or CANCELLED; **P7** the issue a refused refund carries | (e1)-(e6) on the captured amount A, which must be at least 2.00: e1 refunds 1.00 (`custom_id` "spike-{runId}", request id "spike-refund1-{runId}"); e2 repeats that POST exactly; e3 GETs e1's refund; e4 refunds the rest of A (less e2's 1.00 if it was a second refund); e5 asks 1.00 more of the fully refunded capture under a new request id; e6 repeats e4's request. The block "Refund premises (DESIGN.md §19-§20)" answers P1, P2, P2b, P5 and P7. P3, P4 and P6 need the developer dashboard's webhook simulator and the sandbox webhook event log |
+| S12 | The **refund premises** the code now depends on (§19 "Verify in spike S11", and §20), numbered in that list's order: **P1** dedupe of a repeated `PayPal-Request-Id`; **P2** `custom_id` on the refund; **P2b** its `links[rel=up]` to the capture; **P3** the resource of `PAYMENT.CAPTURE.REFUNDED` and of `PAYMENT.CAPTURE.REVERSED` (§20); **P4** the refund failure event names; **P5** `seller_payable_breakdown.total_refunded_amount`; **P6** a refund PENDING then FAILED or CANCELLED; **P7** the issue a refused refund carries | (e1)-(e6) on the captured amount A, which must be at least 2.00: e1 refunds 1.00 (`custom_id` "spike-{runId}", request id "spike-refund1-{runId}"); e2 repeats that POST exactly; e3 GETs e1's refund; e4 refunds the rest of A (less e2's 1.00 if it was a second refund or its reply was lost); e4b GETs e1's refund again; e5 asks 1.00 more of the fully refunded capture under a new request id; e6 repeats e4's request. Each refund POST is one exchange: the spike's client doesn't resend a write (`writeRetries` 0), so a lost reply is "no answer", never a resend mixed into the answer. The block "Refund premises (DESIGN.md §19-§20)" answers P1, P2, P2b, P5 and P7. P3, P4 and P6 need the developer dashboard's webhook simulator and the sandbox webhook event log |
 
 **S12, what each answer changes in the code.** P2 and P2b are read on the POST reply and on GET only; whether
 refund *webhooks* carry them too is P3, read in the event log.
@@ -208,10 +209,14 @@ refund *webhooks* carry them too is P3, read in the event log.
   - e2 NOT DEDUPED: one intent can cost two refunds. I5 and F1 hold the booking, but only after the money
     moved. The path to revisit is the client's own retry of a refund POST (`#api` retries a write with a
     request id once on a network error or a 5xx). Whether refund POSTs stop retrying and go straight to
-    `refund_unconfirmed` is a CTO decision.
-  - e2 refused (a 4xx): the client's retry and the resend are refused rather than replayed. A refused resend is
+    `refund_unconfirmed` is a CTO decision; the switch exists (`writeRetries: 0`, which the spike uses).
+  - e2 refused: the client's retry and the resend are refused rather than replayed. A refused resend is
     held as `unknown` until its refund's own evidence settles it (§18), so this fails closed. The run is then
-    not OK, since this answer is not the expected one.
+    not OK, since this answer is not the expected one. A refusal is a 422, or another 4xx that names at
+    least one issue and is not 401, 403 or 429.
+  - e2 or e6 "no answer": its reply was lost (a network error, a timeout or a 5xx), was a 2xx with no
+    refund in it, or was a 4xx that isn't a refusal (401, 403, 429, or no issue named). PayPal may have
+    refunded, so the premise reads unanswered and the run is not OK: rerun with a new order.
   - e2 DEDUPED, e6 refused: dedupe holds while the capture has room, but not once it is fully refunded. A
     resend after a lost reply of the refund that emptied the capture is held as `unknown`, as above.
 - **P2, `custom_id` (reply, GET).** "yes": the service finds the booking by `custom_id` (`namesBooking`).
@@ -228,6 +233,10 @@ refund *webhooks* carry them too is P3, read in the event log.
     under-detects, never over-holds, since `paypal_refunded_minor` keeps the largest total seen. I5 still
     applies. A larger total than the refunds made (fees, the gross, pending counted twice) would hold
     falsely, and F1's reading must change.
+  - "GET after e4" answers the GET half: e4b reads e1 again once e4 has refunded the rest. "running total
+    yes", or "no ..., as on e1's reply" for the total from when e1 was made.
+  - "unanswered": e1's, e2's or e4's reply was lost or had no refund in it, so PayPal may have made a refund
+    the spike never saw, and no sum can be trusted.
   - The run can't tell whether a PENDING refund is counted: sandbox refunds complete at once.
 - **P7, the refusal issues (e5, e6).** The service matches only the first issue (`PayPalError.issue`) against
   `ALREADY_REFUNDED_ISSUES` (`CAPTURE_FULLY_REFUNDED`, `REFUND_AMOUNT_EXCEEDED` in `src/booking/service.ts`).
@@ -243,13 +252,21 @@ refund *webhooks* carry them too is P3, read in the event log.
   - P6: if a sandbox refund can't go PENDING and then FAILED, R9-3 and R9-4 (C2) stay tested on the fake only.
 
 **The run's money guard** (`RefundBudget` in the spike) is asserted before every refund POST.
+- The spike's client sends each refund POST once (`spikeClient`, `writeRetries` 0), so a POST is one
+  exchange. A 401 isn't counted as one: PayPal refused the token without acting, and the client resends the
+  request with a new token.
 - A POST that may make a new refund (e1, e2, e4) must keep the worst case within A. The worst case counts the
-  amount once for every exchange that may have reached PayPal, the client's own retry included; e2 counts as
-  new.
+  amount once for every exchange that may have reached PayPal: a lost reply, a 5xx and a 2xx with no refund
+  in it all count. e2 counts as new.
 - A probe (e5, e6) is sent only once PayPal's own replies show all of A refunded. The probe asks beyond A on
-  purpose, but PayPal can only refuse it or replay an earlier reply.
+  purpose, but PayPal can only refuse it or replay an earlier reply. After a lost e1, e2 or e4 reply the
+  replies never show all of A, so the probes aren't sent, P7 reads unanswered, and part of A can stay on the
+  sandbox capture.
 - The run is OK when every planned call ran: e1-e4 answer with a refund (e4 may be not needed, at A = 2.00
-  without dedupe), e5 with a 4xx, and e6 with e4's refund or a 4xx.
+  without dedupe), e5 with a refusal (a 422, or another 4xx that names at least one issue and is not 401,
+  403 or 429), and e6 with e4's refund or a refusal. e4b is informational. Any other answer, a 4xx that
+  isn't a refusal included, is "no answer": the run is then SPIKE FAILED, and that line names each call,
+  e.g. "SPIKE FAILED (e5: no answer (HTTP 429 is not a refusal))".
 
 ## 6. The agent's tools (one registry: `src/tools/`; served to the model and over MCP)
 
@@ -898,7 +915,7 @@ retry or resend) is never resent, and `get_booking` doesn't read it (it has no r
 nothing could clear it. Now its refund's webhook settles it by the capture link. It still stays held until a
 person reconciles it if PayPal's refund webhooks carry neither `custom_id` nor that link, or if the event never
 comes. A failure event the hosted webhook isn't subscribed to yet is one case (DEPLOY.md's new TODO-CHECK for the
-refund failure events, whose exact names are to be read off the dashboard in spike S11).
+refund failure events, whose exact names are DESIGN.md §5 S12's P4, read off the developer dashboard).
 
 The traveller's card no longer promises the notice: "Nothing more is refunded meanwhile: if PayPal's notice
 doesn't settle it, a person will reconcile it." The agent-facing `refund_under_review` texts say the same. An
@@ -983,7 +1000,7 @@ of an optional field.
 ## 20. After round 10: a reversal is refund evidence; the resend texts promise no dedupe (2 Nov)
 
 Round 10's two re-attacks closed R9-1..R9-4 and the code half of R9-5 (its other half, the refund failure event
-names, is DEPLOY.md's TODO-CHECK for spike S11). They found two more, both resting on unverified PayPal
+names, is DEPLOY.md's TODO-CHECK for §5 S12's P4). They found two more, both resting on unverified PayPal
 behaviour; the CTO fixed them inline (tests first: `test/fix11-reversed.test.ts`, 3 of 4 red at 1460608).
 
 - **A reversal's refund was dropped (medium, not reachable on the demo: a reversal needs a dispute).**

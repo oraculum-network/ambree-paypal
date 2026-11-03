@@ -157,15 +157,19 @@ other than `https://api-m.sandbox.paypal.com`.
 ### Check PayPal itself: the spike
 
 `scripts/spike.ts` runs one real sandbox order whose payee is another sandbox account. The steps are the
-token, create, your approval in a browser and the capture. Then come six refund calls on the captured amount
-A, which answer the refund premises the code depends on (DESIGN.md §5 S12):
+token, create, your approval in a browser and the capture. Then come seven refund calls on the captured
+amount A, which answer the refund premises the code depends on (DESIGN.md §5 S12):
 - e1 refunds 1.00, and e2 sends the same request again;
 - e3 reads e1 back;
-- e4 refunds the rest;
+- e4 refunds the rest, and e4b reads e1 again;
 - e5 asks 1.00 more of the emptied capture, and e6 repeats e4.
 
 PayPal refunds all of A in the end, never more. The run prints a table of HTTP statuses and ids, then a block
 "Refund premises (DESIGN.md §19-§20)". It never prints a token, a secret or the client id.
+
+Each refund POST is sent once. If a reply is lost, its row says "no answer", the premises that need it read
+"unanswered", and the run ends SPIKE FAILED with the reason. Some of A may then stay on the sandbox capture.
+Rerun with a new order.
 
 ```bash
 PAYPAL_CLIENT_ID=... PAYPAL_CLIENT_SECRET=... node scripts/spike.ts --payee-merchant-id GUIDEMERCHANT1
