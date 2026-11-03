@@ -327,7 +327,7 @@ refund *webhooks* carry them too is P3, read in the event log.
 | `POST /api/conversations` | Starts a new conversation in this session ("Start over") |
 | `GET /api/ledger/head` | The ledger checkpoint kept outside the database `{count, head}` and the verify result against it |
 | `POST /api/mandates/{id}/approve` | `{code}`. **Human only**: no tool can call it; 404 unless the session owns the booking |
-| `GET /o/{token}`, `POST /o/{token}` | The operator page: price, accept or decline a reschedule, offer a refund. The token is 256-bit base64url and stored as sha256; there is no login. A reschedule answer names the proposal it answers (hidden `proposal`); one for an earlier proposal, or none, answers 422 and the page shows the current question (§17) |
+| `GET /o/{token}`, `POST /o/{token}` | The operator page: price, accept or decline a reschedule, offer a refund. The token is 256-bit base64url and stored as sha256; there is no login. A post, answered or refused, answers 303 to `/o/{token}` (no query string), and the next GET shows its message once (§22). A reschedule answer names the proposal it answers (hidden `proposal`); one for an earlier proposal, or none, is refused and the page then shows the current question (§17) |
 | `GET /paypal/return`, `GET /paypal/cancel` | The PayPal redirects, both to `/` (never a conversation id). Return captures if the session owns the booking |
 | `POST /webhooks/paypal` | Verify via call 7 (the operator's app, `PAYPAL_WEBHOOK_ID`), log to the ledger once, process. Only completed processing makes a redelivery a duplicate; a processing failure answers 500 |
 | `POST /webhooks/paypal/guide` | The same handler, verified through the guide's own app and `PAYPAL_GUIDE_WEBHOOK_ID` (§21 D4); the same event on both endpoints is processed once |
@@ -1270,3 +1270,33 @@ Still open:
   both apps;
 - **new: which app's webhook** PayPal notifies about a refund made with the guide's app, or both. Both are
   subscribed and the app takes either. The pod's `{"event":"webhook","endpoint":...}` log lines will answer it.
+
+## 22. Judge polish (4 Nov)
+
+Two things a judge would hit; no rule of the service changed (§16-§21 hold as they were).
+
+### The guide's page: POST, then redirect, then GET
+
+`POST /o/{token}` used to apply the answer and render the page in its own reply (200, or 422 on a refusal). A
+reload of that tab re-sent the form: the browser asked to resubmit, and if the guide agreed, the same answer was
+applied again and refused in red ("This request already has an answer.").
+
+- **The post.** An unknown or malformed token still gets the invalid-link page (404) before anything is read or
+  applied, and the Origin check (`refuseMutation`) runs first, as before. Otherwise the answer is applied, and the
+  reply is **303** with `Location: /o/{token}`, the same token and no query string, whether the answer was taken
+  or refused.
+- **The message.** The `{ ok, text }` that `applyOperatorAction` returns waits on the server in `Flashes`
+  (`src/operator/flash.ts`), keyed by a hash of the token. The next GET of that page renders it and removes it, so
+  it shows once. A HEAD leaves it. Neither the text nor any id goes in the URL.
+- **In memory, capped.** There is one replica, and a message lost on a restart only means the page shows without
+  it. At most `FLASH_LIMIT` (500) wait; past that the oldest goes first, and a new message for a token replaces
+  its old one.
+- **A GET with nothing waiting** renders the page exactly as before.
+- **One link, two tabs.** The message is per link, not per tab: if two tabs of one link post at once, the later
+  answer's message is the one shown, to whichever tab loads first. Both answers are still decided one at a time
+  on the booking's queue (§16).
+
+Tests: `test/fix13-prg.test.ts` (6 of its 8 failed at 52244cb; the 2 that passed are guards: the invalid link and
+the Origin refusal). `e2e/flow.spec.ts` reloads the guide's tab after pricing and sees no error and no second
+answer (red at 52244cb). Three earlier assertions of a 200 on the post (`test/app.test.ts`,
+`test/fix4-hosted.test.ts`) now assert the 303, its `Location`, and the message on the GET that follows.

@@ -17,6 +17,7 @@ import { guidesWithPayee } from "./guides/seed.ts";
 import { Ledger } from "./ledger/ledger.ts";
 import { Mandates } from "./mandate/mandate.ts";
 import { handleMcp } from "./mcp/server.ts";
+import { Flashes } from "./operator/flash.ts";
 import { applyOperatorAction, esc, renderInvalidLink, renderOperatorPage } from "./operator/page.ts";
 import type { PaymentsApi } from "./paypal/api.ts";
 import { PayPalRestClient } from "./paypal/client.ts";
@@ -60,6 +61,8 @@ export interface AppOptions {
    * sandbox-mode routes run with no network. The client still refuses any base URL but the sandbox's.
    */
   paypalFetch?: typeof fetch;
+  /** Tests only: how many guide-page messages to keep waiting for their GET (default FLASH_LIMIT). */
+  flashLimit?: number;
 }
 
 export interface App {
@@ -284,6 +287,8 @@ export function createApp(opts: AppOptions): App {
   const model: ChatModel =
     opts.model ?? (config.llm.mode === "openai" ? new OpenAICompatModel({ baseUrl: config.llm.baseUrl, apiKey: config.llm.apiKey, model: config.llm.model }) : new ScriptedModel(today));
   const toolCtx = { service, channels, sendOperatorLink: channels.sendOperatorLink.bind(channels) };
+  /** The guide page's one-time messages, between a form post's 303 and the GET that shows them. */
+  const flashes = new Flashes(opts.flashLimit);
   const agent = new Agent(model, toolCtx, today);
 
   const statics = Object.fromEntries(Object.entries(STATIC).map(([path, s]) => [path, { ...s, body: readFileSync(join(PUBLIC_DIR, s.file)) }]));
@@ -400,11 +405,13 @@ export function createApp(opts: AppOptions): App {
       const booking = service.byToken(token);
       if (!booking) return send(res, 404, renderInvalidLink(), "text/html; charset=utf-8");
       if (method === "POST") {
+        // POST, redirect, GET (DESIGN.md §22): the answer's message waits on the server for the next GET,
+        // so a reload of the tab is a GET and never applies the answer twice. Answered or refused, a 303.
         const raw = await readBody(req, JSON_LIMIT);
-        const flash = await applyOperatorAction(service, token, new URLSearchParams(raw ?? ""));
-        return send(res, flash.ok ? 200 : 422, renderOperatorPage(token, service.get(booking.id)!, flash), "text/html; charset=utf-8");
+        flashes.put(token, await applyOperatorAction(service, token, new URLSearchParams(raw ?? "")));
+        return redirect(res, `/o/${token}`);
       }
-      return send(res, 200, renderOperatorPage(token, booking), "text/html; charset=utf-8");
+      return send(res, 200, renderOperatorPage(token, booking, method === "GET" ? flashes.take(token) : undefined), "text/html; charset=utf-8");
     }
     if (path.startsWith("/o/")) return send(res, 404, renderInvalidLink(), "text/html; charset=utf-8");
 

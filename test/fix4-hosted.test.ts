@@ -29,8 +29,17 @@ const SIMULATED_KIND = "weather.simulated_alert";
 
 type State = Record<string, any>;
 
+/** The guide page's form post, not following its 303 (DESIGN.md §22: POST, redirect, GET). */
 function form(url: string, fields: Record<string, string>): Promise<Response> {
-  return fetch(url, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: new URLSearchParams(fields) });
+  return fetch(url, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: new URLSearchParams(fields), redirect: "manual" });
+}
+
+/** The guide prices the request: a 303 to the same page, whose next GET says the price was sent. */
+async function price(url: string): Promise<void> {
+  const res = await form(url, { action: "price", total: "80", deposit: "30" });
+  expect(res.status).toBe(303);
+  expect(res.headers.get("location")).toBe(new URL(url).pathname);
+  expect(await (await fetch(url)).text()).toContain("Price sent to the traveller.");
 }
 
 /** Polls the tab's state, letting the agent handle pending events, until `pred` holds. */
@@ -49,7 +58,7 @@ async function pricedBooking(base: string): Promise<{ tab: Browser; id: string; 
   const tab = new Browser(base);
   const first = await tab.json("/api/chat", { message: REQUEST });
   const link = first.guide_phone[0].url as string;
-  expect((await form(link, { action: "price", total: "80", deposit: "30" })).status).toBe(200);
+  await price(link);
   return { tab, id: first.bookings[0].booking_id as string, link };
 }
 
@@ -135,7 +144,7 @@ describe("round 4: the cyclone simulation in sandbox mode (no PayPal call allowe
     const first = await tab.json("/api/chat", { message: REQUEST });
     const id = first.bookings[0].booking_id as string;
     for (const step of ["requested", "priced"]) {
-      if (step === "priced") expect((await form(first.guide_phone[0].url, { action: "price", total: "80", deposit: "30" })).status).toBe(200);
+      if (step === "priced") await price(first.guide_phone[0].url);
       const res = await simulate(tab, id);
       expect(res.status, step).toBe(409);
       expect(await res.json(), step).toMatchObject({ ok: false, reason: "not_paid", error: expect.stringMatching(/pay for the booking first, then simulate/) });

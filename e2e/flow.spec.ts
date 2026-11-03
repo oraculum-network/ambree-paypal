@@ -71,6 +71,34 @@ test("refund path: cyclone → reschedule declined → deposit refunded", async 
   await expect(page.getByTestId("guide-balance")).toContainText((paid - 30).toFixed(2));
 });
 
+// The guide's page is POST, then redirect, then GET: reloading the tab after pricing is a plain GET. No
+// resubmit prompt, no "already has an answer" error, and no second answer reaches the booking.
+test("reloading the guide's tab after pricing shows no error and sends no second answer", async ({ page }) => {
+  const { guide, link } = await requestAndPrice(page);
+  expect(guide.url()).toBe(link);
+  await expect(page.locator('#ledger li[data-kind="quote.priced"]')).toHaveCount(1);
+  const ledgerBefore = await page.locator("#ledger li").count();
+  const dialogs: string[] = [];
+  guide.on("dialog", (d) => {
+    dialogs.push(d.message());
+    void d.dismiss();
+  });
+
+  await guide.reload();
+  expect(guide.url()).toBe(link);
+  await expect(guide.getByRole("heading", { name: "Your quote" })).toBeVisible();
+  await expect(guide.getByRole("status")).toHaveCount(0);
+  await expect(guide.locator(".flash")).toHaveCount(0);
+  await expect(guide.locator("main")).not.toContainText("already has an answer");
+  expect(dialogs).toEqual([]);
+
+  // A poll or two later, the traveller's page still holds one answer.
+  await page.waitForTimeout(3_400);
+  await expect(page.locator('#ledger li[data-kind="quote.priced"]')).toHaveCount(1);
+  await expect(page.locator("#ledger li")).toHaveCount(ledgerBefore);
+  await expect(page.getByTestId("approval-card")).toBeVisible();
+});
+
 // The page polls /api/state every 1.5 s. A person types the code over several polls; the card must keep
 // what they typed, where they typed it, and the button must still be the one they press.
 test("a code typed at human speed survives the page's refresh, and the transcript stays where the reader scrolled it", async ({ page }) => {

@@ -40,8 +40,9 @@ async function until(pred: (s: State) => boolean, label: string): Promise<State>
   }
   throw new Error(`timed out waiting for ${label}`);
 }
+/** The guide page's form post, not following its 303 (DESIGN.md §22: POST, redirect, GET). */
 async function operator(url: string, form: Record<string, string>): Promise<Response> {
-  return fetch(url, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: new URLSearchParams(form) });
+  return fetch(url, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: new URLSearchParams(form), redirect: "manual" });
 }
 
 describe("the whole flow over HTTP (fake PayPal, scripted model)", () => {
@@ -56,7 +57,10 @@ describe("the whole flow over HTTP (fake PayPal, scripted model)", () => {
     expect(opPage.status).toBe(200);
     expect(opPage.headers.get("referrer-policy")).toBe("same-origin");
     expect(await opPage.text()).toContain("Your price");
-    expect((await operator(link, { action: "price", total: "80", deposit: "30", note: "06:30 car park" })).status).toBe(200);
+    const priced = await operator(link, { action: "price", total: "80", deposit: "30", note: "06:30 car park" });
+    expect(priced.status).toBe(303);
+    expect(priced.headers.get("location")).toBe(new URL(link).pathname);
+    expect(await (await fetch(link)).text()).toContain("Price sent to the traveller.");
 
     let s = await until((x) => x.bookings[0]?.status === "mandate_proposed", "mandate");
     expect(s.transcript.at(-1).text).toMatch(/approve the deposit of EUR 30.00/);
