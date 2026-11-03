@@ -11,7 +11,7 @@ import { Ledger } from "../../src/ledger/ledger.ts";
 import { Mandates } from "../../src/mandate/mandate.ts";
 import type { PaymentsApi } from "../../src/paypal/api.ts";
 import { PayPalRestClient } from "../../src/paypal/client.ts";
-import { FakePayPal } from "../../src/paypal/fake.ts";
+import { FakePayPal, fakeAppFor } from "../../src/paypal/fake.ts";
 import { RoutedPayments } from "../../src/paypal/routed.ts";
 import type { Payee } from "../../src/paypal/types.ts";
 import { openDb } from "../../src/store/db.ts";
@@ -39,8 +39,14 @@ export function makeWorld(opts: WorldOptions = {}) {
   const wrap = (name: string, c: PaymentsApi) => (opts.apps ? opts.apps(name, c) : c);
   const operator = new PayPalRestClient({ clientId: fake.clientId, clientSecret: fake.clientSecret, webhookId: fake.webhookId, fetch: fake.fetch });
   const payeeIds = opts.payeeApps ?? [...new Set(guides.map((g) => g.payee.merchant_id))];
-  /** Each guide payee's own app (until the fake models several apps, a client of its one app). */
-  const guideApps = new Map(payeeIds.map((m) => [m, new PayPalRestClient({ clientId: fake.clientId, clientSecret: fake.clientSecret, webhookId: fake.webhookId, fetch: fake.fetch })]));
+  /** Each guide payee's own app, registered with the fake (which refuses the operator's app its refunds). */
+  const guideApps = new Map(
+    payeeIds.map((m) => {
+      const a = fakeAppFor(m);
+      const registered = fake.addApp(a);
+      return [m, new PayPalRestClient({ clientId: a.clientId, clientSecret: a.clientSecret, webhookId: registered.webhookId, fetch: fake.fetch })];
+    }),
+  );
   let service!: BookingService;
   const payments = new RoutedPayments({
     operator: wrap("operator", operator),
@@ -67,8 +73,9 @@ export function makeWorld(opts: WorldOptions = {}) {
   fake.deliver = async (raw, headers) => {
     webhookResults.push(await service.handleWebhook(raw, headers));
   };
-  /** The first seed guide's own app (g_lantern's, the guide every test books): PayPal acting on its own. */
-  const guide = guideApps.get(guides[0]!.payee.merchant_id) ?? new PayPalRestClient({ clientId: fake.clientId, clientSecret: fake.clientSecret, fetch: fake.fetch });
+  /** The first seed guide's own app (g_lantern's, the guide the tests book), for acts outside the service. */
+  const lantern = fakeAppFor(guides[0]!.payee.merchant_id);
+  const guide = guideApps.get(lantern.ownerMerchantId) ?? new PayPalRestClient({ clientId: lantern.clientId, clientSecret: lantern.clientSecret, fetch: fake.fetch });
   return { db, fake, payments, operator, guideApps, guide, ledger, mandates, channels, weather, service, webhookResults, now, advance: (ms: number) => (t += ms) };
 }
 

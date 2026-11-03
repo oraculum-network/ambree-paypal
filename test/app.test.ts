@@ -149,7 +149,7 @@ describe("config", () => {
   it("needs both PayPal credentials and a guide payee for sandbox", () => {
     expect(() => loadConfig({ PAYPAL_CLIENT_ID: "a" })).toThrow(ConfigError);
     expect(() => loadConfig({ PAYPAL_CLIENT_ID: "a", PAYPAL_CLIENT_SECRET: "b" })).toThrow(/PAYPAL_GUIDE_PAYEE_MERCHANT_ID/);
-    const c = loadConfig({ PAYPAL_CLIENT_ID: "a", PAYPAL_CLIENT_SECRET: "secret-b", PAYPAL_GUIDE_PAYEE_MERCHANT_ID: "GUIDEACCOUNT1", PAYPAL_OPERATOR_MERCHANT_ID: "OPERATORACCT1" });
+    const c = loadConfig({ PAYPAL_CLIENT_ID: "a", PAYPAL_CLIENT_SECRET: "secret-b", PAYPAL_GUIDE_CLIENT_ID: "g", PAYPAL_GUIDE_CLIENT_SECRET: "secret-g", PAYPAL_GUIDE_PAYEE_MERCHANT_ID: "GUIDEACCOUNT1", PAYPAL_OPERATOR_MERCHANT_ID: "OPERATORACCT1" });
     expect(c.paypal).toMatchObject({ mode: "sandbox", baseUrl: "https://api-m.sandbox.paypal.com" });
     expect(c.guidePayee).toEqual({ merchant_id: "GUIDEACCOUNT1" });
   });

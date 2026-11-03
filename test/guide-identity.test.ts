@@ -8,8 +8,9 @@ import { describe, expect, it } from "vitest";
 import { identityRow } from "../scripts/spike.ts";
 import { createApp } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
+import { SEED_GUIDES } from "../src/guides/seed.ts";
 import { PayPalRestClient } from "../src/paypal/client.ts";
-import { FakePayPal } from "../src/paypal/fake.ts";
+import { FAKE_CLIENT_ID, FAKE_CLIENT_SECRET, FakePayPal, fakeAppFor } from "../src/paypal/fake.ts";
 
 /** A client of the fake whose requests are kept (url, method, headers, body). */
 function watched(fake: FakePayPal) {
@@ -116,5 +117,100 @@ describe("D3: startup confirms the operator app's owner by the payee echo", () =
     expect(row).toMatchObject({ step: "a2 identity", call: "POST /v2/checkout/orders", status: "201", id: "OWNERACCOUNT1" });
     expect(row.note).toMatch(/^payee echo merchant_id OWNERACCOUNT1; probe order [A-Z0-9]+ CREATED \(never approved; it lapses\); payee fields merchant_id$/);
     expect(row.note).not.toMatch(/A21AA|Bearer/);
+  });
+});
+
+describe("D1: the guide's own app in sandbox mode", () => {
+  const BASE = { PAYPAL_CLIENT_ID: "op-id", PAYPAL_CLIENT_SECRET: "op-secret", PAYPAL_GUIDE_PAYEE_MERCHANT_ID: "GUIDEACCOUNT1", PAYPAL_OPERATOR_MERCHANT_ID: "OPERATORACCT1" };
+  const GUIDE_APP = { PAYPAL_GUIDE_CLIENT_ID: "guide-id", PAYPAL_GUIDE_CLIENT_SECRET: "guide-secret" };
+
+  it("needs PAYPAL_GUIDE_CLIENT_ID and PAYPAL_GUIDE_CLIENT_SECRET, as the operator's are needed; the guide's webhook id may be empty", () => {
+    expect(() => loadConfig(BASE)).toThrow(/^Sandbox mode needs PAYPAL_GUIDE_CLIENT_ID and PAYPAL_GUIDE_CLIENT_SECRET/);
+    expect(() => loadConfig({ ...BASE, PAYPAL_GUIDE_CLIENT_ID: "guide-id" })).toThrow(/PAYPAL_GUIDE_CLIENT_SECRET/);
+    const c = loadConfig({ ...BASE, ...GUIDE_APP, PAYPAL_GUIDE_WEBHOOK_ID: "" });
+    expect(c.paypal).toMatchObject({ mode: "sandbox", clientId: "op-id", guideClientId: "guide-id", guideClientSecret: "guide-secret" });
+    if (c.paypal.mode !== "sandbox") throw new Error("expected sandbox mode");
+    expect(c.paypal.guideWebhookId).toBeUndefined();
+    expect(loadConfig({ ...BASE, ...GUIDE_APP, PAYPAL_GUIDE_WEBHOOK_ID: "WH-GUIDE-1" }).paypal).toMatchObject({ guideWebhookId: "WH-GUIDE-1" });
+  });
+
+  it("refuses the operator's own app as the guide's, and guide credentials without the operator's; errors name variables, never values", () => {
+    for (const env of [{ ...BASE, PAYPAL_GUIDE_CLIENT_ID: "op-id", PAYPAL_GUIDE_CLIENT_SECRET: "op-secret" }, { PAYPAL_GUIDE_CLIENT_ID: "guide-id", PAYPAL_GUIDE_CLIENT_SECRET: "guide-secret" }]) {
+      let message = "";
+      try {
+        loadConfig(env);
+      } catch (x) {
+        message = String(x);
+      }
+      expect(message).toMatch(/PAYPAL_GUIDE_CLIENT_ID/);
+      expect(message).not.toMatch(/op-secret|guide-secret/);
+    }
+  });
+});
+
+describe("D3: startup confirms the guide app's owner too", () => {
+  const GUIDE_APP = fakeAppFor("GUIDEACCOUNT1");
+  const ENV = {
+    PAYPAL_CLIENT_ID: FAKE_CLIENT_ID,
+    PAYPAL_CLIENT_SECRET: FAKE_CLIENT_SECRET,
+    PAYPAL_GUIDE_CLIENT_ID: GUIDE_APP.clientId,
+    PAYPAL_GUIDE_CLIENT_SECRET: GUIDE_APP.clientSecret,
+    PAYPAL_GUIDE_PAYEE_MERCHANT_ID: "GUIDEACCOUNT1",
+    PAYPAL_OPERATOR_MERCHANT_ID: "AMBREEOPER001",
+  };
+  async function sandbox(fake: FakePayPal, env: Record<string, string> = {}) {
+    const app = createApp({ config: loadConfig({ PORT: "0", HOST: "127.0.0.1", ...ENV, ...env }), paypalFetch: fake.fetch });
+    try {
+      const port = await app.listen();
+      return { started: true as const, health: (await (await fetch(`http://127.0.0.1:${port}/healthz`)).json()) as Record<string, unknown> };
+    } catch (e) {
+      return { started: false as const, error: String(e) };
+    } finally {
+      await app.close().catch(() => undefined);
+    }
+  }
+
+  it("each app's owner is as configured: it starts, and /healthz reports operator_identity and guide_identity", async () => {
+    const fake = new FakePayPal({ apps: [GUIDE_APP] });
+    expect(await sandbox(fake)).toMatchObject({ started: true, health: { paypal: "sandbox", operator_identity: "confirmed", guide_identity: "confirmed" } });
+    // One probe order per app, each made by its own app (the fake pays each to that app's owner).
+    const probes = fake.calls.filter((c) => c.method === "POST" && c.path === "/v2/checkout/orders");
+    expect(probes.map((c) => c.app)).toEqual([FAKE_CLIENT_ID, GUIDE_APP.clientId]);
+  });
+
+  it("the guide's app is owned by another account: it refuses to start, naming the guide check", async () => {
+    const fake = new FakePayPal({ apps: [{ ...GUIDE_APP, ownerMerchantId: "SOMEONEELSE01" }] });
+    const r = await sandbox(fake);
+    expect(r.started).toBe(false);
+    expect(r).toMatchObject({ error: expect.stringMatching(/Guide identity check failed: PayPal says the guide's REST app for payee GUIDEACCOUNT1 is owned by merchant SOMEONEELSE01, not GUIDEACCOUNT1 \(PAYPAL_GUIDE_PAYEE_MERCHANT_ID\); refusing to start/) });
+  });
+
+  it("the guide's app can't be asked (wrong credentials): it refuses to start, naming the guide check", async () => {
+    const fake = new FakePayPal({ apps: [{ ...GUIDE_APP, clientSecret: "another-secret" }] });
+    const r = await sandbox(fake);
+    expect(r).toMatchObject({ started: false, error: expect.stringMatching(/Guide identity check failed: could not ask PayPal who owns the guide's REST app for payee GUIDEACCOUNT1 .*HTTP 401/) });
+  });
+
+  it("the operator's app owned by the guide's payee: it refuses, naming the operator check", async () => {
+    const fake = new FakePayPal({ ownerMerchantId: "GUIDEACCOUNT1", apps: [GUIDE_APP] });
+    const r = await sandbox(fake);
+    expect(r).toMatchObject({ started: false, error: expect.stringMatching(/^Error: Operator identity check failed/) });
+  });
+
+  it("config-only applies to both checks: no probe order, both unconfirmed", async () => {
+    const fake = new FakePayPal({ apps: [{ ...GUIDE_APP, ownerMerchantId: "SOMEONEELSE01" }] });
+    expect(await sandbox(fake, { PAYPAL_OPERATOR_IDENTITY: "config-only" })).toMatchObject({ started: true, health: { operator_identity: "config-only (unconfirmed)", guide_identity: "config-only (unconfirmed)" } });
+    expect(fake.calls).toEqual([]);
+  });
+
+  it("fake mode: each guide payee has its own app, each confirmed", async () => {
+    const app = createApp({ config: loadConfig({ PORT: "0", HOST: "127.0.0.1" }) });
+    try {
+      const port = await app.listen();
+      expect(await (await fetch(`http://127.0.0.1:${port}/healthz`)).json()).toMatchObject({ operator_identity: "confirmed", guide_identity: "confirmed" });
+      expect(app.fake!.apps().map((a) => a.ownerMerchantId)).toEqual(["AMBREEOPER001", ...new Set(SEED_GUIDES.map((g) => g.payee.merchant_id))]);
+    } finally {
+      await app.close();
+    }
   });
 });

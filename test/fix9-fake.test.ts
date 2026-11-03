@@ -5,21 +5,24 @@
 import { describe, expect, it } from "vitest";
 import { PayPalRestClient } from "../src/paypal/client.ts";
 import { PayPalError } from "../src/paypal/errors.ts";
-import { FakePayPal } from "../src/paypal/fake.ts";
+import { FakePayPal, fakeAppFor } from "../src/paypal/fake.ts";
 import { firstCapture } from "../src/paypal/types.ts";
 
 const GUIDE = { email_address: "guide@business.example" };
 
 async function captured() {
-  const fake = new FakePayPal();
+  // The guide's own app: PayPal lets only it refund, and read refunds of, a capture paid to the guide (§21).
+  const guideApp = { ...fakeAppFor("GUIDEACCOUNT1"), ownerEmails: [GUIDE.email_address] };
+  const fake = new FakePayPal({ apps: [guideApp] });
   const sent: Array<{ event_type: string; resource: Record<string, unknown> }> = [];
   fake.deliver = (raw) => void sent.push(JSON.parse(raw) as { event_type: string; resource: Record<string, unknown> });
-  const client = new PayPalRestClient({ clientId: fake.clientId, clientSecret: fake.clientSecret, fetch: fake.fetch });
-  const o = await client.createOrder({ intent: "CAPTURE", purchase_units: [{ amount: { currency_code: "EUR", value: "30.00" }, payee: GUIDE, custom_id: "bk_000000000001" }] }, "o1");
+  const operator = new PayPalRestClient({ clientId: fake.clientId, clientSecret: fake.clientSecret, fetch: fake.fetch });
+  const o = await operator.createOrder({ intent: "CAPTURE", purchase_units: [{ amount: { currency_code: "EUR", value: "30.00" }, payee: GUIDE, custom_id: "bk_000000000001" }] }, "o1");
   fake.approve(o.id);
-  const cap = firstCapture(await client.captureOrder(o.id, "c1"))!;
+  const cap = firstCapture(await operator.captureOrder(o.id, "c1"))!;
   await fake.flush();
   sent.length = 0;
+  const client = new PayPalRestClient({ clientId: guideApp.clientId, clientSecret: guideApp.clientSecret, fetch: fake.fetch });
   return { fake, client, captureId: cap.id, sent };
 }
 

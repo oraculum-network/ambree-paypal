@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
 import { RefundBudget, type RefundCall, RefundGuardRefused, type RefundRun, type Row, buildOrder, formatTable, parseArgs, readEnv, redact, refundOk, refundPremises, refundProblems, refundRows, runSpike, scrub, spikeClient, spikeReport, type SpikeDeps, type SpikeProgress } from "../scripts/spike.ts";
-import { FakePayPal } from "../src/paypal/fake.ts";
+import { FakePayPal, fakeAppFor } from "../src/paypal/fake.ts";
 import { toMinor } from "../src/paypal/money.ts";
 import { LiveEnvironmentRefused } from "../src/paypal/sandbox.ts";
 import type { Money, Refund } from "../src/paypal/types.ts";
@@ -106,7 +106,10 @@ describe("spike run against the fake", () => {
     room: number;
   }
   function harness(argv: string[], opts: Opts = {}) {
-    const fake = new FakePayPal();
+    // The payee's own app (PAYPAL_REFUND_CLIENT_*): PayPal refuses the operator's app a refund of another
+    // account's capture (DESIGN.md §21), so every refund call of the run goes through this one.
+    const refundApp = { ...fakeAppFor("GUIDEMERCHANT1"), ownerEmails: ["guide@business.example.com", "g@business.example.com"] };
+    const fake = new FakePayPal({ apps: [refundApp] });
     if (opts.dedupe !== undefined) fake.dedupe = opts.dedupe;
     if (opts.customId !== undefined) fake.refundCustomId = opts.customId;
     if (opts.totals !== undefined) fake.refundTotals = opts.totals;
@@ -132,8 +135,8 @@ describe("spike run against the fake", () => {
       const res = await fake.fetch(input, init);
       return replace && res.ok ? new Response(opts.replyBody!.body || null, { status: res.status, headers: { "Content-Type": "application/json" } }) : res;
     }) as typeof globalThis.fetch;
-    // The client and its counters as main builds them: writes sent once, a 401 not counted as a refund exchange.
-    const { client: api, lastStatus, refundPosts } = spikeClient({ clientId: fake.clientId, clientSecret: fake.clientSecret, fetch });
+    // The clients and their counters as main builds them: writes sent once, a 401 not counted as a refund exchange.
+    const { client: api, refunder, lastStatus, refundPosts } = spikeClient({ clientId: fake.clientId, clientSecret: fake.clientSecret, fetch }, { clientId: refundApp.clientId, clientSecret: refundApp.clientSecret });
     const printed: string[] = [];
     let sleeps = 0;
     const approveAfterPolls = opts.approveAfterPolls ?? 2;
@@ -144,6 +147,7 @@ describe("spike run against the fake", () => {
       run: (progress?: SpikeProgress) => {
         const deps: SpikeDeps = {
           api,
+          refundApi: refunder,
           args: parseArgs(argv),
           runId: "T1",
           print: (l) => printed.push(l),

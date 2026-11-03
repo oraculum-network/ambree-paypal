@@ -59,7 +59,7 @@ describe("finding 2: the operator is never the payee", () => {
 
   it("refuses a guide payee equal to the operator (merchant id)", () => {
     expect(() => loadConfig({ ...SANDBOX, PAYPAL_GUIDE_PAYEE_MERCHANT_ID: "ABCDEFGH12345", PAYPAL_OPERATOR_MERCHANT_ID: "ABCDEFGH12345" })).toThrow(ConfigError);
-    const ok = loadConfig({ ...SANDBOX, PAYPAL_GUIDE_PAYEE_MERCHANT_ID: "GUIDEACCOUNT1", PAYPAL_OPERATOR_MERCHANT_ID: "OPERATORACCT1" });
+    const ok = loadConfig({ ...SANDBOX, PAYPAL_GUIDE_CLIENT_ID: "g", PAYPAL_GUIDE_CLIENT_SECRET: "h", PAYPAL_GUIDE_PAYEE_MERCHANT_ID: "GUIDEACCOUNT1", PAYPAL_OPERATOR_MERCHANT_ID: "OPERATORACCT1" });
     expect(ok.operatorPayees).toEqual([{ merchant_id: "OPERATORACCT1" }]);
   });
 

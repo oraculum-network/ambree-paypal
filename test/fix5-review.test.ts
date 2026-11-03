@@ -11,7 +11,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { type Booking, type BookingStatus, ServiceError, proposalKey } from "../src/booking/service.ts";
 import { applyOperatorAction, renderOperatorPage } from "../src/operator/page.ts";
 import type { PaymentsApi } from "../src/paypal/api.ts";
-import { FAKE_CLIENT_ID, FAKE_CLIENT_SECRET, FAKE_WEBHOOK_ID, FakePayPal } from "../src/paypal/fake.ts";
+import { FAKE_CLIENT_ID, FAKE_CLIENT_SECRET, FAKE_WEBHOOK_ID, FakePayPal, fakeAppFor } from "../src/paypal/fake.ts";
 import { Records } from "../src/store/db.ts";
 import type { CycloneAlert } from "../src/weather/cyclones.ts";
 // @ts-expect-error plain browser module, no types
@@ -413,10 +413,12 @@ describe("F4: Content-Type is matched case-insensitively by the mutation check a
 
 describe("F1 + F4 over HTTP in sandbox mode (the fake stands in for PayPal's sandbox)", () => {
   let s: Awaited<ReturnType<typeof startApp>>;
-  const fake = new FakePayPal({ checkoutUrl: "http://127.0.0.1:9/checkout" });
+  // The guide's own app too (DESIGN.md §21), registered with the fake as PayPal holds both.
+  const guideApp = fakeAppFor("GUIDEACCOUNT1");
+  const fake = new FakePayPal({ checkoutUrl: "http://127.0.0.1:9/checkout", apps: [guideApp] });
   beforeAll(async () => {
     s = await startApp(
-      { PAYPAL_CLIENT_ID: FAKE_CLIENT_ID, PAYPAL_CLIENT_SECRET: FAKE_CLIENT_SECRET, PAYPAL_WEBHOOK_ID: FAKE_WEBHOOK_ID, PAYPAL_GUIDE_PAYEE_MERCHANT_ID: "GUIDEACCOUNT1", PAYPAL_OPERATOR_MERCHANT_ID: "AMBREEOPER001" },
+      { PAYPAL_CLIENT_ID: FAKE_CLIENT_ID, PAYPAL_CLIENT_SECRET: FAKE_CLIENT_SECRET, PAYPAL_WEBHOOK_ID: FAKE_WEBHOOK_ID, PAYPAL_GUIDE_CLIENT_ID: guideApp.clientId, PAYPAL_GUIDE_CLIENT_SECRET: guideApp.clientSecret, PAYPAL_GUIDE_PAYEE_MERCHANT_ID: "GUIDEACCOUNT1", PAYPAL_OPERATOR_MERCHANT_ID: "AMBREEOPER001" },
       { paypalFetch: fake.fetch },
     );
   });

@@ -7,16 +7,20 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createApp } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
-import { FAKE_CLIENT_ID, FAKE_CLIENT_SECRET, FAKE_WEBHOOK_ID, FakePayPal } from "../src/paypal/fake.ts";
+import { FAKE_CLIENT_ID, FAKE_CLIENT_SECRET, FAKE_WEBHOOK_ID, FakePayPal, fakeAppFor } from "../src/paypal/fake.ts";
 import { LiveEnvironmentRefused } from "../src/paypal/sandbox.ts";
 // @ts-expect-error plain browser module, no types
 import * as labels from "../public/labels.js";
 import { Browser, startApp } from "./helpers/server.ts";
 
+// The guide's own app (DESIGN.md §21): each FakePayPal here registers it, as PayPal holds both apps.
+const GUIDE_APP = fakeAppFor("GUIDEACCOUNT1");
 const SANDBOX_ENV = {
   PAYPAL_CLIENT_ID: FAKE_CLIENT_ID,
   PAYPAL_CLIENT_SECRET: FAKE_CLIENT_SECRET,
   PAYPAL_WEBHOOK_ID: FAKE_WEBHOOK_ID,
+  PAYPAL_GUIDE_CLIENT_ID: GUIDE_APP.clientId,
+  PAYPAL_GUIDE_CLIENT_SECRET: GUIDE_APP.clientSecret,
   PAYPAL_GUIDE_PAYEE_MERCHANT_ID: "GUIDEACCOUNT1",
   PAYPAL_OPERATOR_MERCHANT_ID: "AMBREEOPER001",
 };
@@ -145,7 +149,7 @@ describe("round 4: the cyclone simulation in sandbox mode (no PayPal call allowe
 
 describe("round 4: the simulation on a paid booking in sandbox mode (the fake stands in for PayPal; the simulation itself calls none)", () => {
   let s: Awaited<ReturnType<typeof startApp>>;
-  const fake = new FakePayPal({ checkoutUrl: "http://127.0.0.1:9/checkout" });
+  const fake = new FakePayPal({ checkoutUrl: "http://127.0.0.1:9/checkout", apps: [GUIDE_APP] });
   beforeAll(async () => {
     s = await startApp({ ...SANDBOX_ENV, PAYPAL_OPERATOR_IDENTITY: "config-only" }, { paypalFetch: fake.fetch });
   });
@@ -208,7 +212,7 @@ describe("round 4: the simulation on a paid booking in sandbox mode (the fake st
 
 describe("round 4: sandbox mode end to end (the fake stands in for PayPal's sandbox)", () => {
   let s: Awaited<ReturnType<typeof startApp>>;
-  const fake = new FakePayPal({ checkoutUrl: "http://127.0.0.1:9/checkout" });
+  const fake = new FakePayPal({ checkoutUrl: "http://127.0.0.1:9/checkout", apps: [GUIDE_APP] });
 
   beforeAll(async () => {
     s = await startApp(SANDBOX_ENV, { paypalFetch: fake.fetch });

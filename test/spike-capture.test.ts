@@ -8,11 +8,14 @@ import { spawnSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
 import { type SpikeDeps, identityRows, parseArgs, readEnv, refundPremises, runSpike, spikeClient } from "../scripts/spike.ts";
 import type { PaymentsApi } from "../src/paypal/api.ts";
-import { FakePayPal } from "../src/paypal/fake.ts";
+import { FakePayPal, fakeAppFor } from "../src/paypal/fake.ts";
 import { firstCapture } from "../src/paypal/types.ts";
 
 const PAYEE = { merchant_id: "GUIDEMERCHANT1" };
 const eur = (value: string) => ({ currency_code: "EUR" as const, value });
+/** The payee's own app (PAYPAL_REFUND_CLIENT_*); the fake, like PayPal, refuses the operator's app its refunds. */
+const REFUND_APP = fakeAppFor(PAYEE.merchant_id);
+const refundCreds = { clientId: REFUND_APP.clientId, clientSecret: REFUND_APP.clientSecret };
 
 describe("spike arguments: --capture and --remaining", () => {
   it("takes an existing capture and what is left on it", () => {
@@ -66,8 +69,8 @@ function recorded<T extends object>(name: string, inner: T, log: string[]): T {
  * app; then the spike as main runs it, with the operator's client and the refund app's sharing the counters.
  */
 async function onCapture(o: { captured?: string; before?: string; argvRemaining?: string; totals?: boolean; captureId?: string } = {}) {
-  const fake = new FakePayPal();
-  const shared = spikeClient({ clientId: fake.clientId, clientSecret: fake.clientSecret, fetch: fake.fetch }, { clientId: fake.clientId, clientSecret: fake.clientSecret });
+  const fake = new FakePayPal({ apps: [REFUND_APP] });
+  const shared = spikeClient({ clientId: fake.clientId, clientSecret: fake.clientSecret, fetch: fake.fetch }, refundCreds);
   const order = await shared.client.createOrder({ intent: "CAPTURE", purchase_units: [{ amount: eur(o.captured ?? "10.00"), payee: PAYEE, custom_id: "spike-old" }] }, "old-order");
   fake.approve(order.id);
   const captureId = firstCapture(await shared.client.captureOrder(order.id, "old-capture"))!.id;
@@ -170,8 +173,8 @@ describe("spike --capture: e1-e6 on an existing capture, A = --remaining", () =>
 
 describe("spike: the refund app", () => {
   it("one counter for both clients: refund POSTs through the refund app count, and the last status is either's", async () => {
-    const fake = new FakePayPal();
-    const s = spikeClient({ clientId: fake.clientId, clientSecret: fake.clientSecret, fetch: fake.fetch }, { clientId: fake.clientId, clientSecret: fake.clientSecret });
+    const fake = new FakePayPal({ apps: [REFUND_APP] });
+    const s = spikeClient({ clientId: fake.clientId, clientSecret: fake.clientSecret, fetch: fake.fetch }, refundCreds);
     expect(s.refunder).not.toBe(s.client);
     const o = await s.client.createOrder({ intent: "CAPTURE", purchase_units: [{ amount: eur("5.00"), payee: PAYEE }] }, "o1");
     expect(s.lastStatus()).toBe(201);
@@ -186,20 +189,31 @@ describe("spike: the refund app", () => {
     expect(alone.refunder).toBe(alone.client);
   });
 
-  it("the a2 rows: the operator's app, and the refund app when it is set", async () => {
-    const fake = new FakePayPal({ ownerMerchantId: "OWNERACCOUNT1" });
-    const s = spikeClient({ clientId: fake.clientId, clientSecret: fake.clientSecret, fetch: fake.fetch }, { clientId: fake.clientId, clientSecret: fake.clientSecret });
+  it("the a2 rows: the operator's app, and the refund app when it is set, each with its own owner", async () => {
+    const fake = new FakePayPal({ ownerMerchantId: "OWNERACCOUNT1", apps: [REFUND_APP] });
+    const s = spikeClient({ clientId: fake.clientId, clientSecret: fake.clientSecret, fetch: fake.fetch }, refundCreds);
     const both = await identityRows(s.client, s.refunder);
     expect(both.map((r) => [r.step, r.call, r.id])).toEqual([
       ["a2 identity", "POST /v2/checkout/orders", "OWNERACCOUNT1"],
-      ["a2 identity (refund app)", "POST /v2/checkout/orders", "OWNERACCOUNT1"],
+      ["a2 identity (refund app)", "POST /v2/checkout/orders", PAYEE.merchant_id],
     ]);
     expect((await identityRows(s.client)).map((r) => r.step)).toEqual(["a2 identity"]);
   });
 
+  it("without a refund app the operator's app refunds, and PayPal (the fake) refuses e1 with 403 PERMISSION_DENIED, as on 3 Nov", async () => {
+    const fake = new FakePayPal({ apps: [REFUND_APP] });
+    const s = spikeClient({ clientId: fake.clientId, clientSecret: fake.clientSecret, fetch: fake.fetch });
+    const order = await s.client.createOrder({ intent: "CAPTURE", purchase_units: [{ amount: eur("10.00"), payee: PAYEE }] }, "o-s4");
+    fake.approve(order.id);
+    const captureId = firstCapture(await s.client.captureOrder(order.id, "c-s4"))!.id;
+    const result = await runSpike({ api: s.client, args: parseArgs(["--capture", captureId, "--remaining", "10.00"]), runId: "T4", print: () => {}, sleep: async () => {}, lastStatus: s.lastStatus, refundPosts: s.refundPosts });
+    expect([result.ok, result.problem]).toEqual([false, "e1: HTTP 403 PERMISSION_DENIED"]);
+    expect(fake.refundedFrom(captureId)).toBe(0);
+  });
+
   it("a normal run sends every refund call through the refund app, and the rest through the operator's", async () => {
-    const fake = new FakePayPal();
-    const s = spikeClient({ clientId: fake.clientId, clientSecret: fake.clientSecret, fetch: fake.fetch }, { clientId: fake.clientId, clientSecret: fake.clientSecret });
+    const fake = new FakePayPal({ apps: [REFUND_APP] });
+    const s = spikeClient({ clientId: fake.clientId, clientSecret: fake.clientSecret, fetch: fake.fetch }, refundCreds);
     const log: string[] = [];
     let printed = "";
     const result = await runSpike({

@@ -2,7 +2,7 @@ import { inspect } from "node:util";
 import { describe, expect, it } from "vitest";
 import { PayPalRestClient } from "../src/paypal/client.ts";
 import { PayPalError, errorFromBody } from "../src/paypal/errors.ts";
-import { FakePayPal } from "../src/paypal/fake.ts";
+import { FakePayPal, fakeAppFor } from "../src/paypal/fake.ts";
 import { formatMoney, fromMinor, sameMoney, toMinor } from "../src/paypal/money.ts";
 import { LiveEnvironmentRefused, SANDBOX_API_BASE, assertSandboxBase } from "../src/paypal/sandbox.ts";
 import { type CreateOrderRequest, type WebhookEvent, approveLink, firstCapture, transmissionFromHeaders } from "../src/paypal/types.ts";
@@ -208,12 +208,14 @@ describe("orders", () => {
 });
 
 describe("refunds", () => {
+  /** Captured by the operator's app; `client` is then the guide's own app, which alone may refund it (DESIGN.md §21). */
   async function captured() {
-    const s = setup();
+    const guideApp = { ...fakeAppFor("GUIDEACCOUNT1"), ownerEmails: [GUIDE.email_address] };
+    const s = setup({ apps: [guideApp] });
     const o = await s.client.createOrder(orderBody("30.00"), "r");
     s.fake.approve(o.id);
     const c = firstCapture(await s.client.captureOrder(o.id, "c"))!;
-    return { ...s, captureId: c.id };
+    return { ...s, client: new PayPalRestClient({ clientId: guideApp.clientId, clientSecret: guideApp.clientSecret, fetch: s.fake.fetch, timeoutMs: 2_000 }), captureId: c.id };
   }
 
   it("partial, then the rest, then refused", async () => {

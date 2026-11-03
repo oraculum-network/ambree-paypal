@@ -8,6 +8,7 @@ import { isDefinitive } from "../src/booking/service.ts";
 import { SEED_GUIDES } from "../src/guides/seed.ts";
 import type { PaymentsApi } from "../src/paypal/api.ts";
 import { PayPalError } from "../src/paypal/errors.ts";
+import { fakeAppFor } from "../src/paypal/fake.ts";
 import { RoutedPayments } from "../src/paypal/routed.ts";
 import { runTool } from "../src/tools/registry.ts";
 import { CONV, type World, deliver, keepWebhooks, paid, refundPosts } from "./helpers/race.ts";
@@ -145,6 +146,18 @@ describe("the booking service through the router", () => {
     const out = await runTool("refund_payment", { booking_id: id }, { service: w.service, channels: w.channels, conversationId: CONV, sendOperatorLink: () => {} });
     expect(out).toMatchObject({ ok: false, message: expect.stringMatching(/^PayPal error: .*PAYEE_APP_NOT_CONFIGURED/) });
     expect(refundPosts(w)).toBe(0);
+  });
+
+  it("at the fake, the refund POST and GET carry the guide app's token, the order and capture the operator's", async () => {
+    const w = makeWorld();
+    const { id, token } = await paid(w);
+    await w.service.offerRefund(token);
+    w.fake.pendNextRefund();
+    await w.service.refund(id, "10.00");
+    await w.service.refreshRefunds(id);
+    const by = (pred: (c: { method: string; path: string }) => boolean) => [...new Set(w.fake.calls.filter(pred).map((c) => c.app))];
+    expect(by((c) => /\/refund$/.test(c.path) || c.path.startsWith("/v2/payments/refunds/"))).toEqual([fakeAppFor(LANTERN).clientId]);
+    expect(by((c) => c.path.startsWith("/v2/checkout/orders"))).toEqual([w.fake.clientId]);
   });
 
   it("the service names each capture's payee (from the booking's checked quote) and each recorded refund's capture", async () => {

@@ -3,6 +3,13 @@
 // unchanged, so tests and the offline demo exercise the real client code. It also plays the buyer
 // (approve) and PayPal's webhook sender (deliver), and keeps payee balances so the demo can show the
 // guide being paid. Shapes marked UNVERIFIED in DESIGN.md are this fake's best guess until the spike.
+//
+// Several REST apps (DESIGN.md §21, D5), as the sandbox showed on 3 Nov: each has a client id and secret and
+// an owner merchant id, and the bearer token says which app calls. The options' own clientId/secret/owner
+// are the default app (the operator's); `apps` adds more (a guide's own). An order with no payee is paid to
+// the calling app's owner. Only the app owned by a capture's payee may refund it or read its refunds: anyone
+// else gets 403 NOT_AUTHORIZED / PERMISSION_DENIED and nothing moves. The capture may be read by its order's
+// creator and by its payee. Idempotency (PayPal-Request-Id) is per app.
 
 import { createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { fromMinor, isCurrency, toMinor } from "./money.ts";
@@ -10,10 +17,46 @@ import { SANDBOX_API_BASE } from "./sandbox.ts";
 import type { Capture, CreateOrderRequest, Link, Order, Payee, Refund, WebhookEvent } from "./types.ts";
 import { WEBHOOK_HEADERS } from "./types.ts";
 
+/** One fake REST app. */
+export interface FakeAppOptions {
+  clientId: string;
+  clientSecret: string;
+  /** The account that owns the app: a no-payee order is paid to it; it alone refunds captures paid to it. */
+  ownerMerchantId: string;
+  /** The same account's email addresses: a payee given by one of these is this owner. */
+  ownerEmails?: string[];
+  /** The app's own webhook id. Default WH-FAKE-{owner}. */
+  webhookId?: string;
+}
+
+/** What the fake shows of an app (never its secret). */
+export interface FakeApp {
+  clientId: string;
+  ownerMerchantId: string;
+  webhookId: string;
+}
+
+/** A guide's own fake app, owned by `ownerMerchantId`: fixed, low-value credentials, so a test can rebuild them. */
+export function fakeAppFor(ownerMerchantId: string): FakeAppOptions {
+  const m = ownerMerchantId.toLowerCase();
+  return { clientId: `fake-app-${m}`, clientSecret: `fake-app-secret-${m}`, ownerMerchantId, webhookId: `WH-FAKE-${ownerMerchantId}` };
+}
+
+interface AppState {
+  clientId: string;
+  clientSecret: string;
+  owner: string;
+  emails: Set<string>;
+  webhookId: string;
+}
+
 export interface FakePayPalOptions {
+  /** The default app (the operator's): its client id, secret and webhook id. */
   clientId?: string;
   clientSecret?: string;
   webhookId?: string;
+  /** More apps (e.g. each guide's own), with the default app's rules. */
+  apps?: FakeAppOptions[];
   /** Where the approve link points. The demo server serves its own stand-in checkout page there. */
   checkoutUrl?: string;
   /** The merchant id that owns the fake REST app: an order with no payee is paid to it (and echoes it). Default AMBREEOPER001. */
@@ -29,6 +72,8 @@ export interface FakePayPalOptions {
 interface StoredOrder {
   order: Order;
   payeeKey: string;
+  /** The client id of the app that created it. */
+  creator: string;
 }
 
 interface Failure {
@@ -79,11 +124,17 @@ function ppError(status: number, name: string, issue: string, description: strin
   return json(status, { name, message: status === 422 ? UNPROCESSABLE : description, debug_id: newId("D").toLowerCase(), details: [{ issue, description }] });
 }
 
+/** What the sandbox answered the operator's app refunding (or reading a refund of) the guide's capture, 3 Nov. */
+function denied(): Response {
+  return ppError(403, "NOT_AUTHORIZED", "PERMISSION_DENIED", "Authorization failed due to insufficient permissions.");
+}
+
 export class FakePayPal {
   readonly clientId: string;
   readonly clientSecret: string;
   readonly webhookId: string;
-  readonly calls: Array<{ method: string; path: string; status: number; requestId?: string }> = [];
+  /** Every request: `app` is the client id of the app whose token it carried (none for the token request). */
+  readonly calls: Array<{ method: string; path: string; status: number; requestId?: string; app?: string }> = [];
   readonly sentWebhooks: WebhookEvent[] = [];
   readonly fetch: typeof fetch;
   deliver: FakePayPalOptions["deliver"];
@@ -116,7 +167,10 @@ export class FakePayPal {
   readonly #pendingRefunds = new Map<string, { captureId: string; minor: number }>();
   #pendNext = 0;
   readonly #idem = new Map<string, { status: number; body: unknown }>();
-  readonly #tokens = new Map<string, number>();
+  /** Each token's expiry and app (client id). */
+  readonly #tokens = new Map<string, { exp: number; app: string }>();
+  /** The apps by client id; the first is the default app. */
+  readonly #apps = new Map<string, AppState>();
   readonly #balances = new Map<string, number>();
   readonly #failures: Failure[] = [];
   readonly #signingKey = randomBytes(32);
@@ -130,9 +184,40 @@ export class FakePayPal {
     this.webhookId = opts.webhookId ?? FAKE_WEBHOOK_ID;
     this.deliver = opts.deliver;
     this.fetch = ((input: string | URL | Request, init?: RequestInit) => this.#handle(input, init)) as typeof fetch;
+    this.addApp({ clientId: this.clientId, clientSecret: this.clientSecret, ownerMerchantId: opts.ownerMerchantId ?? "AMBREEOPER001", webhookId: this.webhookId });
+    for (const a of opts.apps ?? []) this.addApp(a);
   }
 
   // ---------- test and demo controls ----------
+
+  /** Registers another REST app (e.g. a guide's own). Its client id must be new. */
+  addApp(a: FakeAppOptions): FakeApp {
+    if (this.#apps.has(a.clientId)) throw new Error(`fake: app ${a.clientId} is already registered`);
+    const app: AppState = { clientId: a.clientId, clientSecret: a.clientSecret, owner: a.ownerMerchantId, emails: new Set((a.ownerEmails ?? []).map((e) => e.toLowerCase())), webhookId: a.webhookId ?? `WH-FAKE-${a.ownerMerchantId}` };
+    this.#apps.set(app.clientId, app);
+    return FakePayPal.#view(app);
+  }
+
+  /** The apps, default (the operator's) first, without their secrets. */
+  apps(): FakeApp[] {
+    return [...this.#apps.values()].map(FakePayPal.#view);
+  }
+
+  static #view(a: AppState): FakeApp {
+    return { clientId: a.clientId, ownerMerchantId: a.owner, webhookId: a.webhookId };
+  }
+
+  /** Whether `app`'s owner is the account behind payee key `key` (its merchant id, or one of its emails). */
+  #owns(app: AppState, key: string): boolean {
+    return key === `merchant:${app.owner}` || (key.startsWith("email:") && app.emails.has(key.slice("email:".length)));
+  }
+
+  /** The app whose bearer token the headers carry, if it is a live one. */
+  #caller(headers: Headers): AppState | undefined {
+    const auth = headers.get("Authorization") ?? "";
+    const t = auth.startsWith("Bearer ") ? this.#tokens.get(auth.slice(7)) : undefined;
+    return t && t.exp >= Date.now() ? this.#apps.get(t.app) : undefined;
+  }
 
   /** The next request matching `path` (and `method`) fails this way. */
   failNext(f: Failure): void {
@@ -256,6 +341,7 @@ export class FakePayPal {
     const headers = new Headers(init?.headers);
     const requestId = headers.get("PayPal-Request-Id") ?? undefined;
     if (url.origin !== SANDBOX_API_BASE) throw new TypeError(`fake PayPal: unexpected host ${url.host}`);
+    const app = this.#caller(headers)?.clientId;
 
     const failure = this.#failures.findIndex((f) => f.path.test(url.pathname) && (!f.method || f.method === method));
     if (failure >= 0) {
@@ -263,7 +349,7 @@ export class FakePayPal {
       if (f.wait) await f.wait.catch(() => undefined);
       if (f.pass) {
         const res = await this.#route(method, url.pathname, headers, typeof init?.body === "string" ? init.body : undefined, requestId);
-        this.calls.push({ method, path: url.pathname, status: res.status, requestId });
+        this.calls.push({ method, path: url.pathname, status: res.status, requestId, app });
         if (f.replyAfter) await f.replyAfter.catch(() => undefined);
         return res;
       }
@@ -276,29 +362,25 @@ export class FakePayPal {
       if (f.network) throw new TypeError("fetch failed");
       if (f.dropResponse) {
         const lost = await this.#route(method, url.pathname, headers, typeof init?.body === "string" ? init.body : undefined, requestId);
-        this.calls.push({ method, path: url.pathname, status: lost.status, requestId });
+        this.calls.push({ method, path: url.pathname, status: lost.status, requestId, app });
         if (f.replyAfter) await f.replyAfter.catch(() => undefined);
         if (f.status >= 500) return json(f.status, f.body ?? { name: "INTERNAL_SERVER_ERROR", message: "An internal server error occurred.", debug_id: newId("D").toLowerCase(), details: [] });
         throw new TypeError("fetch failed");
       }
-      this.calls.push({ method, path: url.pathname, status: f.status, requestId });
+      this.calls.push({ method, path: url.pathname, status: f.status, requestId, app });
       return json(f.status, f.body);
     }
 
     const res = await this.#route(method, url.pathname, headers, typeof init?.body === "string" ? init.body : undefined, requestId);
-    this.calls.push({ method, path: url.pathname, status: res.status, requestId });
+    this.calls.push({ method, path: url.pathname, status: res.status, requestId, app });
     return res;
   }
 
   async #route(method: string, path: string, headers: Headers, rawBody: string | undefined, requestId: string | undefined): Promise<Response> {
     if (method === "POST" && path === "/v1/oauth2/token") return this.#token(headers, rawBody);
 
-    const auth = headers.get("Authorization") ?? "";
-    const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
-    const exp = this.#tokens.get(token);
-    if (exp === undefined || exp < Date.now()) {
-      return json(401, { error: "invalid_token", error_description: "Token signature verification failed" });
-    }
+    const caller = this.#caller(headers);
+    if (!caller) return json(401, { error: "invalid_token", error_description: "Token signature verification failed" });
 
     let body: Record<string, unknown> = {};
     if (rawBody) {
@@ -309,13 +391,14 @@ export class FakePayPal {
       }
     }
 
-    // Idempotency: the same PayPal-Request-Id on the same path replays the first reply (unless `dedupe` is off).
-    const idemKey = requestId && this.dedupe ? `${method} ${path} ${requestId}` : undefined;
+    // Idempotency: the same PayPal-Request-Id on the same path, from the same app, replays the first reply
+    // (unless `dedupe` is off). Another app's request is its own, even under the same id.
+    const idemKey = requestId && this.dedupe ? `${caller.clientId} ${method} ${path} ${requestId}` : undefined;
     if (idemKey && this.#idem.has(idemKey)) {
       const prior = this.#idem.get(idemKey)!;
       return json(prior.status, prior.body);
     }
-    const res = this.#dispatch(method, path, body);
+    const res = this.#dispatch(method, path, body, caller);
     if (idemKey && res.status < 500) {
       const copy = res.clone();
       this.#idem.set(idemKey, { status: copy.status, body: await copy.json().catch(() => undefined) });
@@ -325,34 +408,40 @@ export class FakePayPal {
 
   #token(headers: Headers, rawBody: string | undefined): Response {
     const auth = headers.get("Authorization") ?? "";
-    const expected = `Basic ${Buffer.from(`${this.clientId}:${this.clientSecret}`).toString("base64")}`;
-    if (auth !== expected) return json(401, { error: "invalid_client", error_description: "Client Authentication failed" });
+    const app = [...this.#apps.values()].find((a) => auth === `Basic ${Buffer.from(`${a.clientId}:${a.clientSecret}`).toString("base64")}`);
+    if (!app) return json(401, { error: "invalid_client", error_description: "Client Authentication failed" });
     if (new URLSearchParams(rawBody ?? "").get("grant_type") !== "client_credentials") {
       return json(400, { error: "unsupported_grant_type", error_description: "Grant Type is NULL" });
     }
     const ttl = this.#opts.tokenTtlSeconds ?? 32_400;
     const accessToken = `A21AA${randomBytes(24).toString("base64url")}`;
-    this.#tokens.set(accessToken, Date.now() + ttl * 1000);
+    this.#tokens.set(accessToken, { exp: Date.now() + ttl * 1000, app: app.clientId });
     return json(200, { scope: "https://uri.paypal.com/services/payments/payment", access_token: accessToken, token_type: "Bearer", app_id: "APP-FAKE0001", expires_in: ttl, nonce: randomUUID() });
   }
 
-  #dispatch(method: string, path: string, body: Record<string, unknown>): Response {
+  #dispatch(method: string, path: string, body: Record<string, unknown>, caller: AppState): Response {
     let m: RegExpMatchArray | null;
-    if (method === "POST" && path === "/v2/checkout/orders") return this.#createOrder(body as unknown as CreateOrderRequest);
+    if (method === "POST" && path === "/v2/checkout/orders") return this.#createOrder(body as unknown as CreateOrderRequest, caller);
     if (method === "GET" && (m = path.match(/^\/v2\/checkout\/orders\/([^/]+)$/))) {
       const o = this.#orders.get(m[1]!);
       return o ? json(200, o.order) : ppError(404, "RESOURCE_NOT_FOUND", "INVALID_RESOURCE_ID", "Specified resource ID does not exist.");
     }
     if (method === "POST" && (m = path.match(/^\/v2\/checkout\/orders\/([^/]+)\/capture$/))) return this.#capture(m[1]!);
     if (method === "GET" && (m = path.match(/^\/v2\/payments\/captures\/([^/]+)$/))) {
-      // As the spike saw it (3 Nov): status, amount and links self/refund/up; no refunded total.
+      // As the spike saw it (3 Nov): status, amount and links self/refund/up; no refunded total. Readable by
+      // the order's creator and by the payee (both apps could), no one else.
       const c = this.#captures.get(m[1]!);
-      return c ? json(200, c.capture) : ppError(404, "RESOURCE_NOT_FOUND", "INVALID_RESOURCE_ID", "Specified resource ID does not exist.");
+      if (!c) return ppError(404, "RESOURCE_NOT_FOUND", "INVALID_RESOURCE_ID", "Specified resource ID does not exist.");
+      const stored = this.#orders.get(c.orderId)!;
+      return stored.creator === caller.clientId || this.#owns(caller, stored.payeeKey) ? json(200, c.capture) : denied();
     }
-    if (method === "POST" && (m = path.match(/^\/v2\/payments\/captures\/([^/]+)\/refund$/))) return this.#refund(m[1]!, body);
+    if (method === "POST" && (m = path.match(/^\/v2\/payments\/captures\/([^/]+)\/refund$/))) return this.#refund(m[1]!, body, caller);
     if (method === "GET" && (m = path.match(/^\/v2\/payments\/refunds\/([^/]+)$/))) {
+      // Only the payee's own app reads a refund of its capture (the operator's got 403, 3 Nov).
       const r = this.#refunds.get(m[1]!);
-      return r ? json(200, this.#refundView(r)) : ppError(404, "RESOURCE_NOT_FOUND", "INVALID_RESOURCE_ID", "Specified resource ID does not exist.");
+      if (!r) return ppError(404, "RESOURCE_NOT_FOUND", "INVALID_RESOURCE_ID", "Specified resource ID does not exist.");
+      const stored = this.#orders.get(this.#captures.get(this.#refundCapture.get(r.id)!)!.orderId)!;
+      return this.#owns(caller, stored.payeeKey) ? json(200, this.#refundView(r)) : denied();
     }
     if (method === "POST" && path === "/v1/notifications/verify-webhook-signature") return this.#verify(body);
     // No userinfo: the spike (S11) found it has no payer_id for an app token; the app owner comes from the
@@ -360,7 +449,7 @@ export class FakePayPal {
     return ppError(404, "NOT_FOUND", "INVALID_RESOURCE_ID", "The specified resource does not exist.");
   }
 
-  #createOrder(body: CreateOrderRequest): Response {
+  #createOrder(body: CreateOrderRequest, caller: AppState): Response {
     const invalid = (issue: string, description: string) => ppError(400, "INVALID_REQUEST", issue, description);
     if (body.intent !== "CAPTURE") return invalid("INVALID_PARAMETER_VALUE", "intent must be CAPTURE in this fake.");
     const units = body.purchase_units;
@@ -374,8 +463,8 @@ export class FakePayPal {
       return invalid("INVALID_PARAMETER_SYNTAX", "amount.value is not a valid amount.");
     }
     if (minor <= 0) return ppError(422, "UNPROCESSABLE_ENTITY", "AMOUNT_NOT_POSITIVE", "Amount must be greater than zero.");
-    // No payee: PayPal pays the app's owner, and the reply echoes it (spike, 3 Nov; D3's identity probe).
-    const payee: Payee = unit.payee ?? { merchant_id: this.#opts.ownerMerchantId ?? "AMBREEOPER001" };
+    // No payee: PayPal pays the calling app's owner, and the reply echoes it (spike, 3 Nov; D3's identity probe).
+    const payee: Payee = unit.payee ?? { merchant_id: caller.owner };
     const key = payeeKey(payee);
     const known = this.#opts.knownPayees;
     if (unit.payee && known && !known.some((k) => key === `email:${k.toLowerCase()}` || key === `merchant:${k}`)) {
@@ -398,7 +487,7 @@ export class FakePayPal {
       create_time: this.#now(),
       links,
     };
-    this.#orders.set(id, { order, payeeKey: key });
+    this.#orders.set(id, { order, payeeKey: key, creator: caller.clientId });
     return json(201, order);
   }
 
@@ -433,9 +522,11 @@ export class FakePayPal {
     return json(201, o);
   }
 
-  #refund(captureId: string, body: Record<string, unknown>): Response {
+  #refund(captureId: string, body: Record<string, unknown>, caller: AppState): Response {
     const c = this.#captures.get(captureId);
     if (!c) return ppError(404, "RESOURCE_NOT_FOUND", "INVALID_RESOURCE_ID", "Specified resource ID does not exist.");
+    // Only the payee's own app may refund its capture; the operator's app got 403 on 3 Nov. Nothing moves.
+    if (!this.#owns(caller, this.#orders.get(c.orderId)!.payeeKey)) return denied();
     const capturedMinor = toMinor(c.capture.amount.value);
     const left = capturedMinor - c.refundedMinor;
     if (left <= 0) return ppError(422, "UNPROCESSABLE_ENTITY", "CAPTURE_FULLY_REFUNDED", "The capture has already been fully refunded.");

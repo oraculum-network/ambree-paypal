@@ -7,13 +7,16 @@
 import { createServer } from "node:http";
 import { createApp } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
-import { FAKE_CLIENT_ID, FAKE_CLIENT_SECRET, FAKE_WEBHOOK_ID, FakePayPal } from "../src/paypal/fake.ts";
+import { FAKE_CLIENT_ID, FAKE_CLIENT_SECRET, FAKE_WEBHOOK_ID, FakePayPal, fakeAppFor } from "../src/paypal/fake.ts";
 
 const PORT = 3892;
 const CHECKOUT_PORT = 3893;
 const APP = `http://127.0.0.1:${PORT}`;
+// As hosted: the operator's app and the guide's own app (DESIGN.md §21), each a separate app in the fake,
+// which refuses the operator's app a refund of the guide's capture.
+const GUIDE_APP = fakeAppFor("GUIDEACCOUNT1");
 
-const fake = new FakePayPal({ checkoutUrl: `http://127.0.0.1:${CHECKOUT_PORT}/checkout` });
+const fake = new FakePayPal({ checkoutUrl: `http://127.0.0.1:${CHECKOUT_PORT}/checkout`, apps: [GUIDE_APP] });
 fake.deliver = async (raw, headers) => {
   await fetch(`${APP}/webhooks/paypal`, { method: "POST", headers, body: raw, signal: AbortSignal.timeout(10_000) });
 };
@@ -39,8 +42,10 @@ const app = createApp({
     PAYPAL_CLIENT_ID: FAKE_CLIENT_ID,
     PAYPAL_CLIENT_SECRET: FAKE_CLIENT_SECRET,
     PAYPAL_WEBHOOK_ID: FAKE_WEBHOOK_ID,
+    PAYPAL_GUIDE_CLIENT_ID: GUIDE_APP.clientId,
+    PAYPAL_GUIDE_CLIENT_SECRET: GUIDE_APP.clientSecret,
     PAYPAL_GUIDE_PAYEE_MERCHANT_ID: "GUIDEACCOUNT1",
-    // The fake's REST-app owner, so the startup identity check really runs and passes.
+    // The fake's operator app owner, so the startup identity checks (operator and guide) really run and pass.
     PAYPAL_OPERATOR_MERCHANT_ID: "AMBREEOPER001",
   }),
   today: () => "2026-11-03",
