@@ -68,12 +68,11 @@ spec:
               value: /data/ambree.sqlite
             # Merchant ids are not secrets. Both are required in sandbox mode, must differ, and are
             # 8-20 capital letters and digits; empty, the pod refuses to start (fails closed), and
-            # deploy-paypal.sh refuses to apply. TODO-CHECK: fill both before the first deploy
-            # (DEPLOY.md, "Before the first deploy").
-            - name: PAYPAL_GUIDE_PAYEE_MERCHANT_ID # the sandbox business account that plays every guide
-              value: ""
-            - name: PAYPAL_OPERATOR_MERCHANT_ID # the REST app owner's own account: never a payee
-              value: ""
+            # deploy-paypal.sh refuses to apply. Read off the developer dashboard on 3 Nov.
+            - name: PAYPAL_GUIDE_PAYEE_MERCHANT_ID # the sandbox business account that plays every guide (DE, EUR)
+              value: DF39WHJKDE862
+            - name: PAYPAL_OPERATOR_MERCHANT_ID # the REST app owner's own account (MU): never a payee
+              value: LG3KJ8XHUA4DW
             # OpenAI-compatible; the app calls ${LLM_BASE_URL}/chat/completions. TODO-CHECK: the model.
             - name: LLM_BASE_URL
               value: https://openrouter.ai/api/v1
