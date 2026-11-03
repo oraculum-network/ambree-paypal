@@ -11,6 +11,16 @@
 // than A (RefundBudget). Its client sends each write once (spikeClient), so every refund call is one
 // exchange and a lost reply is "no answer". It answers DESIGN.md §5 S1-S6, S9, S11 and S12. PAYPAL_WEBHOOK_ID
 // is not needed.
+//
+// Since 3 Nov (DESIGN.md §21): PayPal refuses the operator's app a refund of the guide's capture, so the
+// refund calls go through PAYPAL_REFUND_CLIENT_ID/_SECRET (the payee's own app) when set; (a2) reads each
+// app's owner by the payee echo. To rerun e1-e6 on a capture that already exists (no new order):
+//
+//   PAYPAL_CLIENT_ID=… PAYPAL_CLIENT_SECRET=… PAYPAL_REFUND_CLIENT_ID=… PAYPAL_REFUND_CLIENT_SECRET=… \
+//     node scripts/spike.ts --capture CAPTURE_ID --remaining 9.00
+//
+// --remaining is A, what is left on the capture: (e0) reads the capture first, and e1's total_refunded_amount
+// must then show the capture's amount less A, plus e1's 1.00, or the run stops before e2.
 
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
@@ -22,22 +32,34 @@ import type { PaymentsApi } from "../src/paypal/api.ts";
 import { type Capture, type CreateOrderRequest, type CurrencyCode, type Money, type Order, type Payee, type Refund, type RefundRequest, approveLink, firstCapture } from "../src/paypal/types.ts";
 
 export interface SpikeArgs {
-  payee: Payee;
+  /** The order's payee; absent with --capture (no order is made). */
+  payee?: Payee;
   currency: CurrencyCode;
   value: string;
   timeoutSec: number;
   pollSec: number;
   refund: boolean;
   paymentSource: boolean;
+  /**
+   * --capture <id> --remaining <amount> (DESIGN.md §21, D6): no order (a-d are skipped); e1-e6 run on this
+   * existing capture with A = `remaining`, what is left on it, so the run never refunds more than that.
+   */
+  capture?: { id: string; remaining: string };
 }
 
 export const USAGE =
-  "usage: node scripts/spike.ts (--payee-email EMAIL | --payee-merchant-id ID) [--currency EUR|USD] [--amount 10.00] [--timeout 600] [--poll 5] [--no-refund] [--with-payment-source]";
+  "usage: node scripts/spike.ts (--payee-email EMAIL | --payee-merchant-id ID) [--currency EUR|USD] [--amount 10.00] [--timeout 600] [--poll 5] [--no-refund] [--with-payment-source]\n   or: node scripts/spike.ts --capture CAPTURE_ID --remaining 9.00";
+
+const AMOUNT_RE = /^\d{1,4}\.\d{2}$/;
 
 export function parseArgs(argv: string[]): SpikeArgs {
-  const out: SpikeArgs = { payee: undefined as unknown as Payee, currency: "EUR", value: "10.00", timeoutSec: 600, pollSec: 5, refund: true, paymentSource: false };
+  const out: SpikeArgs = { currency: "EUR", value: "10.00", timeoutSec: 600, pollSec: 5, refund: true, paymentSource: false };
   let email: string | undefined;
   let merchant: string | undefined;
+  let captureId: string | undefined;
+  let remaining: string | undefined;
+  /** Flags that make an order; --capture takes none of them. */
+  const orderFlags: string[] = [];
   for (let i = 0; i < argv.length; i++) {
     const flag = argv[i]!;
     const next = () => {
@@ -45,7 +67,16 @@ export function parseArgs(argv: string[]): SpikeArgs {
       if (v === undefined || v.startsWith("--")) throw new Error(`${flag} needs a value\n${USAGE}`);
       return v;
     };
+    if (flag !== "--capture" && flag !== "--remaining") orderFlags.push(flag);
     switch (flag) {
+      case "--capture":
+        captureId = next();
+        if (!/^[A-Z0-9]{8,32}$/.test(captureId)) throw new Error("--capture should be a PayPal capture id (capital letters and digits)");
+        break;
+      case "--remaining":
+        remaining = next();
+        if (!AMOUNT_RE.test(remaining)) throw new Error(`--remaining must look like 9.00\n${USAGE}`);
+        break;
       case "--payee-email":
         email = next();
         break;
@@ -60,7 +91,7 @@ export function parseArgs(argv: string[]): SpikeArgs {
       }
       case "--amount": {
         const v = next();
-        if (!/^\d{1,4}\.\d{2}$/.test(v)) throw new Error(`--amount must look like 10.00\n${USAGE}`);
+        if (!AMOUNT_RE.test(v)) throw new Error(`--amount must look like 10.00\n${USAGE}`);
         out.value = v;
         break;
       }
@@ -80,6 +111,12 @@ export function parseArgs(argv: string[]): SpikeArgs {
         throw new Error(`unknown argument ${flag.slice(0, 40)}\n${USAGE}`);
     }
   }
+  if (captureId !== undefined || remaining !== undefined) {
+    if (captureId === undefined || remaining === undefined) throw new Error(`--capture and --remaining go together\n${USAGE}`);
+    if (orderFlags.length) throw new Error(`--capture takes only --remaining (it makes no order): drop ${orderFlags.join(", ").slice(0, 80)}\n${USAGE}`);
+    out.capture = { id: captureId, remaining };
+    return out;
+  }
   if ((email ? 1 : 0) + (merchant ? 1 : 0) !== 1) throw new Error(`give exactly one of --payee-email or --payee-merchant-id\n${USAGE}`);
   if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new Error("--payee-email is not an email address");
   if (merchant && !/^[A-Z0-9]{8,20}$/.test(merchant)) throw new Error("--payee-merchant-id should be the 13-character PayPal merchant id");
@@ -93,11 +130,18 @@ function positiveInt(flag: string, v: string): number {
   return n;
 }
 
-/** Reads the credentials by name. Errors name the variable only. */
-export function readEnv(env: Record<string, string | undefined>): { clientId: string; clientSecret: string; baseUrl: string } {
+/**
+ * Reads the credentials by name. Errors name the variable only. `refund` is the payee's own REST app
+ * (PAYPAL_REFUND_CLIENT_ID/_SECRET, both or neither): every refund call goes through it when set, since PayPal
+ * refuses the operator's app a refund of another account's capture (spike, 3 Nov; DESIGN.md §21).
+ */
+export function readEnv(env: Record<string, string | undefined>): { clientId: string; clientSecret: string; baseUrl: string; refund?: { clientId: string; clientSecret: string } } {
   const missing = ["PAYPAL_CLIENT_ID", "PAYPAL_CLIENT_SECRET"].filter((k) => !env[k]);
   if (missing.length) throw new Error(`set ${missing.join(" and ")} (sandbox REST app credentials)`);
-  return { clientId: env.PAYPAL_CLIENT_ID!, clientSecret: env.PAYPAL_CLIENT_SECRET!, baseUrl: assertSandboxBase(env.PAYPAL_BASE_URL) };
+  const rid = env.PAYPAL_REFUND_CLIENT_ID;
+  const rsecret = env.PAYPAL_REFUND_CLIENT_SECRET;
+  if (Boolean(rid) !== Boolean(rsecret)) throw new Error("set both PAYPAL_REFUND_CLIENT_ID and PAYPAL_REFUND_CLIENT_SECRET, or neither (the payee's own REST app, which makes the refunds)");
+  return { clientId: env.PAYPAL_CLIENT_ID!, clientSecret: env.PAYPAL_CLIENT_SECRET!, baseUrl: assertSandboxBase(env.PAYPAL_BASE_URL), ...(rid && rsecret ? { refund: { clientId: rid, clientSecret: rsecret } } : {}) };
 }
 
 export function buildOrder(a: SpikeArgs, runId: string): CreateOrderRequest {
@@ -155,7 +199,10 @@ export function redact(text: string, secrets: readonly string[]): string {
 }
 
 export interface SpikeDeps {
+  /** The operator's app: the order, its approval poll, the capture, and --capture's read of the capture. */
   api: PaymentsApi;
+  /** Where the refund calls (POST and GET) go: the payee's own app (PAYPAL_REFUND_CLIENT_*). Default: `api`. */
+  refundApi?: Pick<PaymentsApi, "refundCapture" | "getRefund">;
   args: SpikeArgs;
   runId: string;
   print: (line: string) => void;
@@ -177,29 +224,33 @@ export interface SpikeDeps {
 export const SPIKE_WRITE_RETRIES = 0;
 
 export interface SpikeClient {
+  /** The operator's app (PAYPAL_CLIENT_ID). */
   client: PayPalRestClient;
-  /** The HTTP status of the last exchange. */
+  /** The refund app (PAYPAL_REFUND_CLIENT_ID), or `client` itself when none is given. */
+  refunder: PayPalRestClient;
+  /** The HTTP status of the last exchange, by either client. */
   lastStatus: () => number;
   /**
-   * Refund POST exchanges PayPal may have acted on. A 401 isn't one: PayPal refused the token without acting,
-   * and the client sends the request again with a new token.
+   * Refund POST exchanges PayPal may have acted on, by either client. A 401 isn't one: PayPal refused the
+   * token without acting, and the client sends the request again with a new token.
    */
   refundPosts: () => number;
 }
 
-/** The spike's PayPal client (writeRetries SPIKE_WRITE_RETRIES) and its onCall counters. main and the tests build it here. */
-export function spikeClient(opts: Omit<PayPalClientOptions, "onCall" | "writeRetries">): SpikeClient {
+/**
+ * The spike's PayPal clients (writeRetries SPIKE_WRITE_RETRIES) and their shared onCall counters: the
+ * operator's, and the refund app's when `refund` names one. main and the tests build them here.
+ */
+export function spikeClient(opts: Omit<PayPalClientOptions, "onCall" | "writeRetries">, refund?: { clientId: string; clientSecret: string }): SpikeClient {
   let last = 0;
   let refundPosts = 0;
-  const client = new PayPalRestClient({
-    ...opts,
-    writeRetries: SPIKE_WRITE_RETRIES,
-    onCall: (c) => {
-      last = c.status;
-      if (c.call === REFUND_CALL && c.status !== 401) refundPosts++;
-    },
-  });
-  return { client, lastStatus: () => last, refundPosts: () => refundPosts };
+  const onCall: PayPalClientOptions["onCall"] = (c) => {
+    last = c.status;
+    if (c.call === REFUND_CALL && c.status !== 401) refundPosts++;
+  };
+  const client = new PayPalRestClient({ ...opts, writeRetries: SPIKE_WRITE_RETRIES, onCall });
+  const refunder = refund ? new PayPalRestClient({ ...opts, ...refund, writeRetries: SPIKE_WRITE_RETRIES, onCall }) : client;
+  return { client, refunder, lastStatus: () => last, refundPosts: () => refundPosts };
 }
 
 function describeError(e: unknown): string {
@@ -234,6 +285,22 @@ export async function runSpike(d: SpikeDeps, progress: SpikeProgress = { rows: [
     rows.push({ step, call, status: e instanceof PayPalError ? String(e.status || e.kind) : "-", id: "", note: scrub(describeError(e)) });
     return stopped(step);
   };
+
+  if (d.args.capture) {
+    // --capture (D6): a-d are skipped. e0 reads the capture (a GET by the operator's app; nothing moves), so
+    // --remaining is checked against its amount and status before any refund is sent.
+    let cap: Capture;
+    try {
+      cap = await d.api.getCapture(d.args.capture.id);
+    } catch (e) {
+      return fail("e0 capture", GET_CAPTURE_CALL, e);
+    }
+    const target = captureTarget(cap, d.args.capture.remaining);
+    rows.push({ step: "e0 capture", call: GET_CAPTURE_CALL, status: status(), id: String(cap.id ?? "").slice(0, 64), note: scrub(target.note) });
+    const refunds = await runRefundPremises(d, target, progress);
+    const problems = refundProblems(refunds);
+    return { rows: [...rows, ...refundRows(refunds)], ok: problems.length === 0, problem: problems.join("; ") || undefined, refunds };
+  }
 
   let order: Order;
   try {
@@ -282,9 +349,54 @@ export async function runSpike(d: SpikeDeps, progress: SpikeProgress = { rows: [
     rows.push({ step: "e refund", call: "-", status: "-", id: "", note: "skipped (--no-refund)" });
     return { rows, ok: true };
   }
-  const refunds = await runRefundPremises(d, capture, progress);
+  const refunds = await runRefundPremises(d, { captureId: capture.id, amount: capture.amount }, progress);
   const problems = refundProblems(refunds);
   return { rows: [...rows, ...refundRows(refunds)], ok: problems.length === 0, problem: problems.join("; ") || undefined, refunds };
+}
+
+/** What e1-e6 run on: the capture, A, and (--capture) what was refunded on it before this run. */
+interface RefundTarget {
+  captureId: string;
+  /** A, or undefined when it can't be read (the sequence is then refused). */
+  amount: Money | undefined;
+  /** --capture only: the capture's amount C less --remaining, in A's minor units. */
+  priorMinor?: number;
+  /** Set when --capture's checks refuse the sequence before any refund. */
+  refused?: string;
+  /** e0's note. */
+  note: string;
+}
+
+const GET_CAPTURE_CALL = "GET /v2/payments/captures/{id}";
+
+/**
+ * --capture's target, from the capture PayPal shows now (amount C, status) and --remaining (A). Refused,
+ * before any refund, when A can't be what is left: more than C; not all of C while the capture shows no
+ * refund (COMPLETED); all of C while it shows one (PARTIALLY_REFUNDED); or the capture is anything else
+ * (REFUNDED, PENDING, ...). e1's total_refunded_amount then confirms C − A (refundPremises' e1 check).
+ */
+function captureTarget(cap: Capture, remaining: string): RefundTarget {
+  const c = cap.amount;
+  const id = String(cap.id ?? "");
+  let cMinor: number;
+  try {
+    if (!c || !isCurrency(c.currency_code)) throw new RangeError("no amount");
+    cMinor = toMinor(String(c.value));
+  } catch {
+    return { captureId: id, amount: undefined, refused: "the capture carries no amount the spike can read", note: `${String(cap.status).slice(0, 30)}; amount unreadable` };
+  }
+  const a = money(c.currency_code, toMinor(remaining));
+  const aMinor = toMinor(a.value);
+  const status = String(cap.status).slice(0, 30);
+  const prior = cMinor - aMinor;
+  const note = `${status}; ${formatMoney(c)}; --remaining ${formatMoney(a)}${prior >= 0 ? `, so ${formatMoney(money(c.currency_code, prior))} was refunded before this run` : ""}`;
+  const refuse = (why: string): RefundTarget => ({ captureId: id, amount: a, refused: why, note });
+  if (aMinor > cMinor) return refuse(`--remaining ${formatMoney(a)} is more than the capture's amount (${formatMoney(c)})`);
+  if (status === "COMPLETED" && aMinor !== cMinor) return refuse(`the capture is COMPLETED (nothing refunded yet), so all of it (${formatMoney(c)}) remains, not --remaining ${formatMoney(a)}`);
+  if (status === "PARTIALLY_REFUNDED" && aMinor === cMinor) return refuse(`the capture is PARTIALLY_REFUNDED, so less than all of it (${formatMoney(c)}) remains, not --remaining ${formatMoney(a)}`);
+  if (status !== "COMPLETED" && status !== "PARTIALLY_REFUNDED") return refuse(`the capture is ${status}; there is nothing left to refund`);
+  if (aMinor < MIN_A_MINOR) return refuse(`--remaining ${formatMoney(a)}; the premise sequence needs at least 2.00 left on the capture (e1's 1.00 plus a possible duplicate)`);
+  return { captureId: id, amount: a, priorMinor: prior, note };
 }
 
 // ---------- (e) the refund premises (DESIGN.md §5 S12; §19 "Verify in spike S11"; §20) ----------
@@ -317,8 +429,12 @@ export interface RefundCall {
 /** Everything the sequence saw. Its rows, its premise block and whether it is ok are pure functions of this. */
 export interface RefundRun {
   captureId: string;
-  /** A: the captured amount, from the capture reply. */
+  /** A: what the run may refund. The captured amount, from the capture reply, or --remaining (--capture). */
   captured: Money;
+  /** --capture: what the capture had refunded before this run (its amount less --remaining). PayPal's totals count it. */
+  prior?: Money;
+  /** --capture: e1's total_refunded_amount checked against `prior`; not ok stops the run before e2. */
+  check?: { ok: boolean; note: string };
   /** The custom_id every refund of the run is sent with: "spike-<runId>". */
   customId: string;
   /** Set when the sequence didn't start, and why. */
@@ -458,11 +574,18 @@ function callFromError(e: unknown): RefundCall {
   return { http: 0, error: { kind: "error", issues: [], summary: scrub(e instanceof Error ? e.message : "unknown error"), maybeDelivered: true } };
 }
 
-/** e1-e6 on the capture. Stops after e1 if e1 made no refund. Every refund POST passes the guard first. */
-async function runRefundPremises(d: SpikeDeps, capture: Capture, progress: SpikeProgress): Promise<RefundRun> {
-  const run: RefundRun = { captureId: capture.id, captured: capture.amount, customId: `spike-${d.runId}` };
+/**
+ * e1-e6 on the capture. Stops after e1 if e1 made no refund, and (--capture) if e1's total doesn't confirm
+ * --remaining. Every refund POST passes the guard first. Every refund call goes through `d.refundApi`.
+ */
+async function runRefundPremises(d: SpikeDeps, target: Omit<RefundTarget, "note">, progress: SpikeProgress): Promise<RefundRun> {
+  const a = target.amount;
+  const run: RefundRun = { captureId: target.captureId, captured: a as Money, customId: `spike-${d.runId}` };
   progress.refunds = run;
-  const a = capture.amount;
+  if (target.refused) {
+    run.refused = target.refused;
+    return run;
+  }
   let capturedMinor: number;
   try {
     if (!a || !isCurrency(a.currency_code)) throw new RangeError("no amount");
@@ -476,6 +599,8 @@ async function runRefundPremises(d: SpikeDeps, capture: Capture, progress: Spike
     return run;
   }
   const currency = a.currency_code;
+  if (target.priorMinor !== undefined) run.prior = money(currency, target.priorMinor);
+  const refunds = d.refundApi ?? d.api;
   const budget = new RefundBudget(capturedMinor, currency, 1 + SPIKE_WRITE_RETRIES);
   const body = (minor: number): AmountRefund => ({ amount: money(currency, minor), custom_id: run.customId, note_to_payer: "Ambree spike: refund premises (sandbox)" });
 
@@ -491,7 +616,7 @@ async function runRefundPremises(d: SpikeDeps, capture: Capture, progress: Spike
     const before = d.refundPosts();
     let c: RefundCall;
     try {
-      const refund: unknown = await d.api.refundCapture(capture.id, b, requestId);
+      const refund: unknown = await refunds.refundCapture(target.captureId, b, requestId);
       c = isRefundReply(refund) ? { http: d.lastStatus(), refund } : invalidReply(REFUND_CALL, d.lastStatus(), true);
     } catch (e) {
       c = callFromError(e);
@@ -507,11 +632,24 @@ async function runRefundPremises(d: SpikeDeps, capture: Capture, progress: Spike
   run.e1 = await post("e1", b1, id1, "room");
   const r1 = run.e1.refund;
   if (!r1) return run;
+  if (run.prior) {
+    // --capture: PayPal's running total on e1's reply must be what was refunded before (C − A) plus e1's
+    // 1.00. Anything else means --remaining is wrong, and e4's "rest of A" or a probe could then move money
+    // the run doesn't expect: stop before e2.
+    const t = r1.seller_payable_breakdown?.total_refunded_amount;
+    const expected = money(currency, toMinor(run.prior.value) + STEP_MINOR);
+    const given = `--remaining ${formatMoney(a)}`;
+    if (!t) run.check = { ok: false, note: `e1's reply has no total_refunded_amount, so ${given} can't be checked; nothing more was sent` };
+    else if (minorIn(t, currency) !== toMinor(expected.value)) {
+      run.check = { ok: false, note: `e1's total_refunded_amount is ${fmtMoney(t)}, but ${given} on a capture of ${formatMoney(money(currency, toMinor(run.prior.value) + capturedMinor))} means PayPal should show ${formatMoney(expected)}; nothing more was sent (rerun with the right --remaining)` };
+    } else run.check = { ok: true, note: `consistent with --remaining: total_refunded_amount ${fmtMoney(t)} = ${formatMoney(run.prior)} before this run + e1's ${formatMoney(money(currency, STEP_MINOR))}` };
+    if (!run.check.ok) return run;
+  }
   run.e2 = await post("e2", b1, id1, "room");
 
   const get = async (refundId: string): Promise<RefundCall> => {
     try {
-      const refund: unknown = await d.api.getRefund(refundId);
+      const refund: unknown = await refunds.getRefund(refundId, target.captureId);
       return isRefundReply(refund) ? { http: d.lastStatus(), refund } : invalidReply(GET_REFUND_CALL, d.lastStatus(), false);
     } catch (e) {
       return callFromError(e);
@@ -677,7 +815,11 @@ function noteOf(key: StepKey, c: RefundCall, run: RefundRun): string {
     case "e4": {
       const t = r.seller_payable_breakdown?.total_refunded_amount;
       const cur = run.captured.currency_code;
-      const isA = !t ? "" : minorIn(t, cur) === minorIn(run.captured, cur) ? " (= A: yes)" : ` (= A: no, A is ${fmtMoney(run.captured)})`;
+      const prior = priorOf(run);
+      // With an earlier refund (--capture), the capture is fully refunded at C = what was before + A.
+      const whole = (minorIn(run.captured, cur) ?? 0) + prior;
+      const label = prior ? "C, the capture's amount" : "A";
+      const isA = !t ? "" : minorIn(t, cur) === whole ? ` (= ${label}: yes)` : ` (= ${label}: no, ${prior ? "C" : "A"} is ${fmtMoney(money(cur, whole))})`;
       return `${r.status}; ${amountOf(r)}; total_refunded_amount ${totalOf(r)}${isA}`;
     }
     case "e4b":
@@ -689,7 +831,12 @@ function noteOf(key: StepKey, c: RefundCall, run: RefundRun): string {
   }
 }
 
-/** The table rows for (e). */
+/** --capture: what was refunded on the capture before this run, in minor units of A's currency (0 otherwise). */
+function priorOf(run: RefundRun): number {
+  return (run.prior && minorIn(run.prior, run.captured.currency_code)) || 0;
+}
+
+/** The table rows for (e). With --capture, e1's check of --remaining follows e1 ("e1 check"). */
 export function refundRows(run: RefundRun): Row[] {
   if (run.refused) return [{ step: "e refund", call: "-", status: "-", id: "", note: scrub(`refused: ${run.refused}`) }];
   const rows: Row[] = [];
@@ -698,6 +845,7 @@ export function refundRows(run: RefundRun): Row[] {
     if (!c) continue;
     const status = String(c.http || c.error?.kind || "-");
     rows.push({ step, call, status, id: c.refund?.id ?? "", note: scrub(noteOf(key, c, run)) });
+    if (key === "e1" && run.check) rows.push({ step: "e1 check", call: "-", status: "-", id: "", note: scrub(run.check.ok ? run.check.note : `stopped: ${run.check.note}`) });
   }
   return rows;
 }
@@ -721,6 +869,7 @@ function outcomeOf(key: StepKey, c: RefundCall | undefined): string {
  */
 export function refundProblems(run: RefundRun): string[] {
   if (run.refused) return ["the refund sequence didn't run (see its row)"];
+  if (run.check && !run.check.ok) return [`e1 check: ${run.check.note}`];
   const { e1, e2, e3, e4, e5, e6 } = run;
   const out: string[] = [];
   const bad = (key: StepKey, c: RefundCall | undefined, more = "") => out.push(`${key}: ${outcomeOf(key, c)}${more}`);
@@ -812,9 +961,11 @@ function runningTotal(run: RefundRun): string {
   if (!t) return `unknown (absent on ${last.label})`;
   if (!readable) return `unknown (${last.label} shows ${fmtMoney(t)}; a refund's amount was unreadable)`;
   const currency = run.captured.currency_code;
-  return minorIn(t, currency) === last.sum
-    ? `yes (${last.label} shows ${fmtMoney(t)}, the sum of the refunds so far)`
-    : `no (${last.label} shows ${fmtMoney(t)}; the refunds so far sum to ${fmtMoney(money(currency, last.sum))})`;
+  const prior = priorOf(run);
+  const before = prior ? ` and ${fmtMoney(money(currency, prior))} before this run` : "";
+  return minorIn(t, currency) === last.sum + prior
+    ? `yes (${last.label} shows ${fmtMoney(t)}, the sum of the refunds so far${before})`
+    : `no (${last.label} shows ${fmtMoney(t)}; the refunds so far sum to ${fmtMoney(money(currency, last.sum))}${before})`;
 }
 
 /**
@@ -834,10 +985,12 @@ function getAfterE4(run: RefundRun): string {
   if (!readable) return `unknown (${fmtMoney(t)}; a refund's amount was unreadable)`;
   const currency = run.captured.currency_code;
   const shown = minorIn(t, currency);
-  if (shown === sum) return `running total yes (${fmtMoney(t)})`;
+  const prior = priorOf(run);
+  if (shown === sum + prior) return `running total yes (${fmtMoney(t)})`;
   const atE1 = run.e1?.refund?.seller_payable_breakdown?.total_refunded_amount;
   const asOnE1 = atE1 && minorIn(atE1, currency) === shown ? ", as on e1's reply" : "";
-  return `running total no (${fmtMoney(t)}${asOnE1}; the refunds so far sum to ${fmtMoney(money(currency, sum))})`;
+  const before = prior ? ` and ${fmtMoney(money(currency, prior))} before this run` : "";
+  return `running total no (${fmtMoney(t)}${asOnE1}; the refunds so far sum to ${fmtMoney(money(currency, sum))}${before})`;
 }
 
 export const PREMISES_HEADING = "Refund premises (DESIGN.md §19-§20)";
@@ -928,43 +1081,55 @@ export async function identityRow(api: Pick<PaymentsApi, "getAppOwner">, step = 
   }
 }
 
+/** (a2) for the operator's app, and for the refund app when one is set (and isn't the operator's client). */
+export async function identityRows(operator: Pick<PaymentsApi, "getAppOwner">, refunder?: Pick<PaymentsApi, "getAppOwner">): Promise<Row[]> {
+  const rows = [await identityRow(operator)];
+  if (refunder && refunder !== operator) rows.push(await identityRow(refunder, "a2 identity (refund app)"));
+  return rows;
+}
+
 async function main(): Promise<number> {
   let args: SpikeArgs;
   let env: ReturnType<typeof readEnv>;
+  const named = ["PAYPAL_CLIENT_ID", "PAYPAL_CLIENT_SECRET", "PAYPAL_REFUND_CLIENT_ID", "PAYPAL_REFUND_CLIENT_SECRET"].map((k) => process.env[k] ?? "");
   try {
     args = parseArgs(process.argv.slice(2));
     env = readEnv(process.env);
   } catch (e) {
-    process.stderr.write(`${redact(e instanceof Error ? e.message : "bad arguments", [process.env.PAYPAL_CLIENT_ID ?? "", process.env.PAYPAL_CLIENT_SECRET ?? ""])}\n`);
+    process.stderr.write(`${redact(e instanceof Error ? e.message : "bad arguments", named)}\n`);
     return 2;
   }
   // Every printed line goes through redact: no token, auth header, client id or secret reaches the screen.
-  const out = (text: string) => process.stdout.write(`${redact(text, [env.clientId, env.clientSecret])}\n`);
-  const { client, lastStatus, refundPosts } = spikeClient(env);
+  const out = (text: string) => process.stdout.write(`${redact(text, named)}\n`);
+  const { client, refunder, lastStatus, refundPosts } = spikeClient(env, env.refund);
   const runId = newRunId();
-  out(`Ambree PayPal spike ${runId} against ${client.baseUrl} (sandbox), payee ${JSON.stringify(args.payee)}, ${args.currency} ${args.value}`);
+  const refundsVia = env.refund ? "refunds via the refund app (PAYPAL_REFUND_CLIENT_ID)" : "refunds via the operator's app (no PAYPAL_REFUND_CLIENT_ID)";
+  const what = args.capture ? `existing capture ${args.capture.id}, A = --remaining ${args.capture.remaining} (a-d skipped)` : `payee ${JSON.stringify(args.payee)}, ${args.currency} ${args.value}`;
+  out(`Ambree PayPal spike ${runId} against ${client.baseUrl} (sandbox), ${what}, ${refundsVia}`);
 
-  // (a) the token, on its own so a credential problem is reported as such.
   const rows: Row[] = [];
-  try {
-    await client.getOrder("SPIKE0TOKEN0CHECK").catch((e: unknown) => {
-      if (e instanceof PayPalError && e.status === 404) return; // the token worked; the order doesn't exist
-      throw e;
-    });
-    rows.push({ step: "a token", call: "POST /v1/oauth2/token", status: "200", id: "", note: "token cached (never printed)" });
-  } catch (e) {
-    rows.push({ step: "a token", call: "POST /v1/oauth2/token", status: e instanceof PayPalError ? String(e.status || e.kind) : "-", id: "", note: scrub(describeError(e)) });
-    out(`\n${formatTable(rows)}`);
-    return 1;
+  if (!args.capture) {
+    // (a) the token, on its own so a credential problem is reported as such.
+    try {
+      await client.getOrder("SPIKE0TOKEN0CHECK").catch((e: unknown) => {
+        if (e instanceof PayPalError && e.status === 404) return; // the token worked; the order doesn't exist
+        throw e;
+      });
+      rows.push({ step: "a token", call: "POST /v1/oauth2/token", status: "200", id: "", note: "token cached (never printed)" });
+    } catch (e) {
+      rows.push({ step: "a token", call: "POST /v1/oauth2/token", status: e instanceof PayPalError ? String(e.status || e.kind) : "-", id: "", note: scrub(describeError(e)) });
+      out(`\n${formatTable(rows)}`);
+      return 1;
+    }
+    // (a2) who owns each app, by the payee echo (D3). Informational: a failure here doesn't stop the run.
+    rows.push(...(await identityRows(client, env.refund ? refunder : undefined)));
   }
-  // (a2) S11: who does PayPal say owns this REST app? Informational: a failure here doesn't stop the run.
-  rows.push(await identityRow(client));
 
   // A run that throws still prints the rows and the premise block it has, then SPIKE FAILED.
   const progress: SpikeProgress = { rows: [] };
   let outcome: SpikeOutcome;
   try {
-    outcome = { result: await runSpike({ api: client, args, runId, print: out, sleep: (ms) => new Promise((r) => setTimeout(r, ms)), lastStatus, refundPosts }, progress) };
+    outcome = { result: await runSpike({ api: client, refundApi: refunder, args, runId, print: out, sleep: (ms) => new Promise((r) => setTimeout(r, ms)), lastStatus, refundPosts }, progress) };
   } catch (e) {
     outcome = { crash: e };
   }

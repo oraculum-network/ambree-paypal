@@ -11,7 +11,7 @@
 
 import type { PaymentsApi } from "./api.ts";
 import { PayPalError } from "./errors.ts";
-import type { AppOwner, CreateOrderRequest, Order, Refund, RefundRequest, WebhookEvent, WebhookTransmission } from "./types.ts";
+import type { AppOwner, Capture, CreateOrderRequest, Order, Refund, RefundRequest, WebhookEvent, WebhookTransmission } from "./types.ts";
 
 /** What the router asks the booking service: who a capture paid, and which capture a recorded refund is on. */
 export interface PayeeLookup {
@@ -73,6 +73,11 @@ export class RoutedPayments implements PaymentsApi {
 
   captureOrder(orderId: string, requestId: string): Promise<Order> {
     return this.#operator.captureOrder(orderId, requestId);
+  }
+
+  /** PayPal lets the order's creator read the capture (spike, 3 Nov: both apps can). */
+  getCapture(captureId: string): Promise<Capture> {
+    return this.#operator.getCapture(captureId);
   }
 
   async refundCapture(captureId: string, body: RefundRequest, requestId: string): Promise<Refund> {

@@ -344,6 +344,11 @@ export class FakePayPal {
       return o ? json(200, o.order) : ppError(404, "RESOURCE_NOT_FOUND", "INVALID_RESOURCE_ID", "Specified resource ID does not exist.");
     }
     if (method === "POST" && (m = path.match(/^\/v2\/checkout\/orders\/([^/]+)\/capture$/))) return this.#capture(m[1]!);
+    if (method === "GET" && (m = path.match(/^\/v2\/payments\/captures\/([^/]+)$/))) {
+      // As the spike saw it (3 Nov): status, amount and links self/refund/up; no refunded total.
+      const c = this.#captures.get(m[1]!);
+      return c ? json(200, c.capture) : ppError(404, "RESOURCE_NOT_FOUND", "INVALID_RESOURCE_ID", "Specified resource ID does not exist.");
+    }
     if (method === "POST" && (m = path.match(/^\/v2\/payments\/captures\/([^/]+)\/refund$/))) return this.#refund(m[1]!, body);
     if (method === "GET" && (m = path.match(/^\/v2\/payments\/refunds\/([^/]+)$/))) {
       const r = this.#refunds.get(m[1]!);

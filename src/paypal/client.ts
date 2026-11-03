@@ -6,7 +6,7 @@ import { randomUUID } from "node:crypto";
 import type { PaymentsApi } from "./api.ts";
 import { PayPalError, errorFromBody } from "./errors.ts";
 import { assertSandboxBase } from "./sandbox.ts";
-import type { AppOwner, CreateOrderRequest, Order, Refund, RefundRequest, WebhookEvent, WebhookTransmission } from "./types.ts";
+import type { AppOwner, Capture, CreateOrderRequest, Order, Refund, RefundRequest, WebhookEvent, WebhookTransmission } from "./types.ts";
 
 /**
  * The identity probe (getAppOwner): an order with no payee, which PayPal pays to the app's owner and echoes.
@@ -96,6 +96,11 @@ export class PayPalRestClient implements PaymentsApi {
   async captureOrder(orderId: string, requestId: string): Promise<Order> {
     const call = "POST /v2/checkout/orders/{id}/capture";
     return this.#api<Order>("POST", `/v2/checkout/orders/${checkId(orderId, call)}/capture`, call, {}, requestId);
+  }
+
+  async getCapture(captureId: string): Promise<Capture> {
+    const call = "GET /v2/payments/captures/{id}";
+    return this.#api<Capture>("GET", `/v2/payments/captures/${checkId(captureId, call)}`, call);
   }
 
   async refundCapture(captureId: string, body: RefundRequest, requestId: string): Promise<Refund> {

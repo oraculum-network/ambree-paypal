@@ -4,7 +4,7 @@
 // @paypal/agent-toolkit's create_order / get_order / refund tools would implement this same interface, so
 // the mandate check in src/booking/ still runs before any of it (see DESIGN.md §6).
 
-import type { AppOwner, CreateOrderRequest, Order, Refund, RefundRequest, WebhookEvent, WebhookTransmission } from "./types.ts";
+import type { AppOwner, Capture, CreateOrderRequest, Order, Refund, RefundRequest, WebhookEvent, WebhookTransmission } from "./types.ts";
 
 export interface PaymentsApi {
   /** POST /v2/checkout/orders. `requestId` goes in PayPal-Request-Id (idempotency). */
@@ -13,6 +13,8 @@ export interface PaymentsApi {
   getOrder(orderId: string): Promise<Order>;
   /** POST /v2/checkout/orders/{id}/capture */
   captureOrder(orderId: string, requestId: string): Promise<Order>;
+  /** GET /v2/payments/captures/{id}: its status and amount (the spike's --capture reads it; no refunded total). */
+  getCapture(captureId: string): Promise<Capture>;
   /** POST /v2/payments/captures/{id}/refund. An empty body refunds in full. */
   refundCapture(captureId: string, body: RefundRequest, requestId: string): Promise<Refund>;
   /**
