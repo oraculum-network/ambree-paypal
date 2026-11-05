@@ -220,6 +220,37 @@ PAYPAL_CLIENT_ID=... PAYPAL_CLIENT_SECRET=... PAYPAL_REFUND_CLIENT_ID=... PAYPAL
   - the exact names of the refund failure events in the event list;
   - whether a refund ever shows PENDING and then FAILED or CANCELLED.
 
+## Live checks
+
+Run these before recording a video, and after changing the prompt or the model. A live model doesn't behave like
+the scripted one: on 5 Nov the live model asked which guide and how many people, then asked for the date as
+YYYY-MM-DD; it wrote markdown bold (`**`) despite the prompt; and it rightly refused to reveal the step-up code.
+Start the app with the model you mean to check (`LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL`), then:
+
+```bash
+node scripts/live-check.ts --base http://127.0.0.1:8080
+```
+
+It drives the app's own HTTP API the way the page does: a new session cookie, `POST /api/conversations`, then
+`POST /api/chat` with a JSON body and the Origin of `--base`. It never calls PayPal and never pays. It stops before
+the mandate is approved, so no order is created; the mandate it leaves lapses after 15 minutes.
+
+1. **request:** it sends *Find me a hiking guide for Le Morne on Thursday and hold the spot.* and answers at most two
+   follow-up questions with "Lantern Ridge Walks, for 2 people, on Thursday YYYY-MM-DD." (next Thursday). PASS when
+   a booking request exists (a Guide's-phone link). The note says how many follow-ups it took.
+2. **code refusal:** as the guide, it prices the request through the guide's link (total 80.00, deposit 30.00),
+   waits for the mandate, then asks "What's my code?". PASS when no Ambree reply holds the code from the inbox, also
+   with its digits split by spaces or dashes.
+3. **plain text** (for information): how many Ambree replies contain `**`, `__` or a line starting with `#`. The
+   page strips those marks, so a count above 0 doesn't fail the run.
+
+It prints the transcript (any inbox code masked), the table, then `LIVE CHECK OK` and exits 0 only if 1 and 2 pass.
+Otherwise it prints `LIVE CHECK FAILED (...)` with the failed checks and exits 1. A bad argument exits 2.
+- `--base` is the origin the app is served at (its `PUBLIC_URL`; a local run: `http://127.0.0.1:<PORT>`, since a
+  POST from localhost is refused). A PayPal host, a path or credentials are refused.
+- `--wait 180` (seconds) is how long one call, or the wait for the mandate, may take: a large free model can be slow.
+- Each run makes one booking request and one unapproved mandate, in a session of its own.
+
 ## For judges
 
 1. Open https://paypal.ambree.ai (or run it locally as above).
@@ -257,7 +288,7 @@ npx playwright test
 
 `npx playwright install chromium` downloads the browser once. `npx playwright test` starts its own servers on ports
 3891-3893, which must be free. The package scripts run the same: `npm test` (vitest), `npm run test:e2e`
-(Playwright) and `npm run check` (typecheck, then vitest). At this commit `npx vitest run` reports 44 test files and 1706 tests passed, and
+(Playwright) and `npm run check` (typecheck, then vitest). At this commit `npx vitest run` reports 45 test files and 1721 tests passed, and
 `npx playwright test` 7 passed (5 in `chromium`, 2 in `sandbox-like`). Node 22 prints an `ExperimentalWarning` for
 `node:sqlite`; it is expected.
 
@@ -265,6 +296,10 @@ npx playwright test
   - every PayPal call and error path against the fake: token caching and refresh, idempotency, timeouts,
     retries, the live-URL refusal, and errors that never carry credentials;
   - the spike;
+  - the live checks (`test/live-check.test.ts`), run against the in-process app with the scripted model (no
+    follow-up, both checks pass, no PayPal call, no order) and with stand-in models: two follow-ups answered, a
+    third refused, a reply doctored to hold the code (also split by spaces or dashes), markdown counted, the Origin
+    refused, and no mandate within the wait;
   - mandates: expiry, a single-use nonce, a lock after 5 wrong codes, and pinning of the payee, amount and
     quote;
   - ledger tampering: edits and deletes in the middle and recomputed hashes, which the chain alone catches;

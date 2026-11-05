@@ -16,11 +16,12 @@ describe("repo hygiene", () => {
     const readme = read("README.md");
     for (const t of TOOL_NAMES) expect(readme).toContain(`\`${t}\``);
     expect(readme).toContain("node scripts/spike.ts --payee-merchant-id");
+    expect(readme).toContain("node scripts/live-check.ts --base http://127.0.0.1:8080");
     expect(readme).toContain("Built during the hackathon");
   });
 
   it("no live PayPal host appears in source", () => {
-    const files = ["src/paypal/client.ts", "src/paypal/sandbox.ts", "src/config.ts", "scripts/spike.ts", "src/app.ts"];
+    const files = ["src/paypal/client.ts", "src/paypal/sandbox.ts", "src/config.ts", "scripts/spike.ts", "scripts/live-check.ts", "src/app.ts"];
     for (const f of files) expect(read(f)).not.toMatch(/api-m\.paypal\.com|api\.paypal\.com/);
     expect(SANDBOX_API_BASE).toBe("https://api-m.sandbox.paypal.com");
   });
