@@ -23,7 +23,8 @@ Ambree never holds your money. PayPal sandbox only.
 - **Licence:** MIT (`LICENSE`); third-party notices are in `NOTICE.md`.
 - **Design:** `DESIGN.md` has the flows, the data model, every PayPal call with its doc link, and the open
   questions.
-- **Site:** https://paypal.ambree.ai (planned; see `DEPLOY.md`).
+- **Live demo (PayPal sandbox):** https://paypal.ambree.ai, up during judging (until 15 Dec 2026). `DEPLOY.md` is a
+  generic guide to deploying it on Kubernetes.
 
 ## Why PayPal and AI are both essential
 
@@ -161,7 +162,10 @@ other than `https://api-m.sandbox.paypal.com`.
 | `PAYPAL_GUIDE_CLIENT_ID`, `PAYPAL_GUIDE_CLIENT_SECRET` | The guide's own sandbox REST app, created in the guide's sandbox business account: the refunds. Required in sandbox mode, and not the operator's app |
 | `PAYPAL_GUIDE_WEBHOOK_ID` | The id of the guide app's sandbox webhook, pointing at `{PUBLIC_URL}/webhooks/paypal/guide`, with the refund events. Empty: that endpoint answers 503 |
 | `PAYPAL_GUIDE_PAYEE_MERCHANT_ID` | The merchant id of the sandbox **business** account that plays every guide, and owns the guide's app (emails are refused) |
-| `PUBLIC_URL` | Where PayPal sends the buyer back to (`/paypal/return`) |
+| `PUBLIC_URL` | Where PayPal sends the buyer back to (`/paypal/return`), and the one Origin the page's POSTs are accepted from: set it to the URL you open. Unset: `http://127.0.0.1:<PORT>`, and `localhost:<PORT>` is redirected there |
+| `PORT` | The port the server listens on (default 8080) |
+| `HOST` | The address it binds (default 0.0.0.0; set 127.0.0.1 to keep a local run off the LAN) |
+| `PAYPAL_BASE_URL` | Optional, sandbox only: anything but `https://api-m.sandbox.paypal.com` is refused at startup |
 | `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL` | Any OpenAI-compatible `/chat/completions` endpoint with tool calling |
 | `PAYPAL_OPERATOR_MERCHANT_ID` | The operator app owner's own merchant id, which must never be a payee (required in sandbox mode) |
 | `PAYPAL_OPERATOR_IDENTITY` | Unset (the default): PayPal confirms both apps' owners at startup. `config-only`: trust the configured ids (unconfirmed) |
@@ -206,11 +210,11 @@ and nothing is refunded. `--no-refund` skips them.
 PAYPAL_CLIENT_ID=... PAYPAL_CLIENT_SECRET=... PAYPAL_REFUND_CLIENT_ID=... PAYPAL_REFUND_CLIENT_SECRET=... node scripts/spike.ts --capture CAPTURE_ID --remaining 9.00
 ```
 
-**What to paste back:**
-- Everything from the table's `step | call` header to the `SPIKE OK` or `SPIKE FAILED` line: the table, the
-  premise block (P1, P2, P2b, P5, P7) and the verdict.
+**Reading the result:**
+- The verdict is the last line: `SPIKE OK`, or `SPIKE FAILED (...)` with the reason. Above it are the table (from
+  its `step | call` header) and the premise block (P1, P2, P2b, P5, P7).
 - The spike can't answer P3, P4 and P6. They come from the developer dashboard, in the sandbox app's webhook
-  simulator and its webhook event log:
+  simulator and its webhook event log (P4 was answered there on 3 Nov, DESIGN.md §21):
   - the `resource_type` of a `PAYMENT.CAPTURE.REFUNDED` and a `PAYMENT.CAPTURE.REVERSED` event, and whether
     the resource carries `custom_id` and `links[rel=up]`;
   - the exact names of the refund failure events in the event list;
@@ -222,8 +226,8 @@ PAYPAL_CLIENT_ID=... PAYPAL_CLIENT_SECRET=... PAYPAL_REFUND_CLIENT_ID=... PAYPAL
 2. Type: *Find me a hiking guide for Le Morne on Thursday and hold the spot.*
 3. In **Guide's phone**, open the link and set a total of 80 and a deposit of 30.
 4. Back on the page, take the code from **Your inbox** and approve the mandate.
-5. Press **Pay the guide in PayPal**. On the hosted sandbox, log in as the sandbox buyer:
-   `TODO-CHECK: buyer email / password, published here by the CEO` (the rules ask for sandbox login details).
+5. Press **Pay the guide in PayPal**. On the hosted sandbox, log in as the sandbox buyer: the sandbox buyer login
+   is in the Devpost submission's testing instructions (a PayPal sandbox account; no real money).
 6. Watch the ledger fill in (order, capture, verified webhooks) and the chain say **Chain OK**.
 7. Once the booking is paid (status `captured`), press **Simulate a cyclone warning (demo)** under **Demo
    controls**. Before you pay, the button is off and the page says to pay first. A real cyclone warning can't
@@ -247,8 +251,15 @@ plug in there as another adapter, behind the same mandate check.
 ```bash
 npm run typecheck
 npx vitest run
+npx playwright install chromium
 npx playwright test
 ```
+
+`npx playwright install chromium` downloads the browser once. `npx playwright test` starts its own servers on ports
+3891-3893, which must be free. The package scripts run the same: `npm test` (vitest), `npm run test:e2e`
+(Playwright) and `npm run check` (typecheck, then vitest). At this commit `npx vitest run` reports 44 test files and 1706 tests passed, and
+`npx playwright test` 7 passed (5 in `chromium`, 2 in `sandbox-like`). Node 22 prints an `ExperimentalWarning` for
+`node:sqlite`; it is expected.
 
 - **vitest** covers:
   - every PayPal call and error path against the fake: token caching and refresh, idempotency, timeouts,
@@ -260,7 +271,7 @@ npx playwright test
     a deleted tail, which only the checkpoint catches;
   - the operator page, webhooks (unsigned, tampered, duplicate, and redelivered after a failed processing),
     the refund policy, MCP, and the whole flow over HTTP;
-  - the review fixes (`test/fix-*.test.ts`):
+  - the review fixes (`test/fix*.test.ts`):
     - one session can't read, approve or order on another's booking;
     - payees that are the operator;
     - an order changed after creation;
@@ -274,7 +285,10 @@ npx playwright test
     - webhook redelivery;
     - log redaction;
     - the ledger checkpoint;
-    - spike run ids.
+    - spike run ids;
+    - `test/fix11-*` to `test/fix14-*`: a reversal counted as refund evidence; Ambree's replies as plain text; a
+      local run opened on localhost redirected to 127.0.0.1; the guide's page posting, then redirecting, then
+      showing the message on GET (DESIGN.md §20, §22).
   - the two apps (`test/guide-*.test.ts` and `test/spike-capture.test.ts`, DESIGN.md §21): refunds routed to the payee's own app and refused before
     any POST when it has none; the fake refusing the operator's app a refund, as PayPal did; the owner check by the
     payee echo; the two webhook endpoints, each taking only its own app's webhook id, and one event on both
