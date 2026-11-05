@@ -525,7 +525,7 @@ describe("spike run against the fake", () => {
       expect(ok).toBe(true);
       expect(text).toMatch(/\ne4b get +\| GET \/v2\/payments\/refunds\/\{id\} +\| 200 /);
       expect(text).toContain("\n\nRefund premises (DESIGN.md §19-§20)\nP1 dedupe (e2, e6): e2 DEDUPED");
-      expect(text.endsWith("\n\nSPIKE OK: paste this table and the premise block into the CTO's notes.")).toBe(true);
+      expect(text.endsWith("\n\nSPIKE OK: keep this table and the premise block with your notes.")).toBe(true);
     });
 
     it("not OK: SPIKE FAILED names the reason", async () => {
@@ -534,7 +534,7 @@ describe("spike run against the fake", () => {
       const progress: SpikeProgress = { rows: [] };
       const { ok, text } = spikeReport(HEAD, progress, { result: await h.run(progress) });
       expect(ok).toBe(false);
-      expect(text.endsWith("\n\nSPIKE FAILED (e5: no answer (HTTP 429 is not a refusal)): paste this table and the premise block into the CTO's notes.")).toBe(true);
+      expect(text.endsWith("\n\nSPIKE FAILED (e5: no answer (HTTP 429 is not a refusal)): keep this table and the premise block with your notes.")).toBe(true);
     });
 
     it("a run that throws: the rows so far, where it stopped, the premise block, then SPIKE FAILED", async () => {
@@ -553,7 +553,7 @@ describe("spike run against the fake", () => {
       expect(steps.slice(3, 10)).toEqual(["a token", "b create", "c poll", "d capture", "e1 refund", "e2 dedupe", "e3 get"]);
       expect(text).toMatch(/\nstopped +\| - +\| - +\| +\| the run stopped: counter broke\n/);
       expect(text).toContain("P1 dedupe (e2, e6): e2 DEDUPED (same refund id); e6 not run → yes for e2; e6 unanswered");
-      expect(text.endsWith("\n\nSPIKE FAILED (the run stopped: counter broke): paste this table and the premise block into the CTO's notes.")).toBe(true);
+      expect(text.endsWith("\n\nSPIKE FAILED (the run stopped: counter broke): keep this table and the premise block with your notes.")).toBe(true);
     });
 
     it("never throws itself: a row or a block that can't be rendered is replaced", () => {

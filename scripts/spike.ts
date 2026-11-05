@@ -1051,7 +1051,7 @@ export function spikeReport(head: Row[], progress: SpikeProgress, outcome: Spike
   }
   const block = refunds ? attempt(() => refundPremises(refunds), () => [PREMISES_HEADING, "(the premises couldn't be read from what the run saw)"]) : undefined;
   const verdict = ok ? "SPIKE OK" : `SPIKE FAILED (${problem ?? "see the table"})`;
-  const text = `\n${formatTable([...head, ...rows])}${block ? `\n\n${block.join("\n")}` : ""}\n\n${verdict}: paste this table${block ? " and the premise block" : ""} into the CTO's notes.`;
+  const text = `\n${formatTable([...head, ...rows])}${block ? `\n\n${block.join("\n")}` : ""}\n\n${verdict}: keep this table${block ? " and the premise block" : ""} with your notes.`;
   return { ok, text };
 }
 
