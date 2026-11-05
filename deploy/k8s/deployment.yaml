@@ -1,10 +1,9 @@
 # One small Node pod: the chat page, the operator page, the two PayPal webhook endpoints and MCP. The
 # bookings and the ledger live in sqlite at DB_PATH on the PVC paypal-data (mounted at /data, the
 # only writable path; the root filesystem is read-only). The label app.kubernetes.io/name:
-# ambree-paypal is what the namespace's NetworkPolicies select (in from Traefik on :8080, out to DNS
-# and public :443). The namespace, the PVC, the Secret, the quota, the LimitRange and the paypal-low
-# PriorityClass come from the monorepo's ops/oracle/security.sh (the paypal block) and the admin,
-# never from here (DEPLOY.md).
+# ambree-paypal is what NetworkPolicies can select (in from the ingress controller on :8080, out to
+# DNS and public :443). Prerequisites, made by the cluster admin, never from here: namespace `paypal`,
+# PVC `paypal-data`, PriorityClass `paypal-low`, Secret `paypal-secrets`; see DEPLOY.md.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -34,7 +33,7 @@ spec:
         runAsNonRoot: true
         runAsUser: 1000
         runAsGroup: 1000
-        # The volume must be writable by uid 1000 (the image's `node` user), as k8s/oracle/tasks.
+        # The volume must be writable by uid 1000 (the image's `node` user).
         fsGroup: 1000
         fsGroupChangePolicy: OnRootMismatch
         seccompProfile:
@@ -47,8 +46,9 @@ spec:
           emptyDir: { sizeLimit: 16Mi }
       containers:
         - name: web
-          # Built on the host by the deploy gate (`build ambree-paypal <sha7>`); the tag is the
-          # 7-char commit sha, set in kustomization.yaml at deploy time (DEPLOY.md step 5).
+          # Built into the node's container runtime (hence Never; with a registry, change it in an
+          # overlay); the tag is the 7-char commit sha, set by an overlay at deploy time (DEPLOY.md
+          # steps 4 and 5).
           image: oraculum/ambree-paypal
           imagePullPolicy: Never
           ports:
@@ -69,16 +69,16 @@ spec:
             - name: DB_PATH
               value: /data/ambree.sqlite
             # Merchant ids are not secrets. Both are required in sandbox mode, must differ, and are
-            # 8-20 capital letters and digits; empty, the pod refuses to start (fails closed), and
-            # deploy-paypal.sh refuses to apply. Read off the developer dashboard on 3 Nov.
+            # 8-20 capital letters and digits; empty, the pod refuses to start (fails closed). These
+            # are the hosted demo's sandbox accounts, read off the developer dashboard on 3 Nov.
             - name: PAYPAL_GUIDE_PAYEE_MERCHANT_ID # the sandbox business account that plays every guide (DE, EUR)
               value: DF39WHJKDE862
             - name: PAYPAL_OPERATOR_MERCHANT_ID # the REST app owner's own account (MU): never a payee
               value: LG3KJ8XHUA4DW
-            # OpenAI-compatible; the app calls ${LLM_BASE_URL}/chat/completions. TODO-CHECK: the model.
+            # OpenAI-compatible; the app calls ${LLM_BASE_URL}/chat/completions.
             - name: LLM_BASE_URL
               value: https://openrouter.ai/api/v1
-            - name: LLM_MODEL # free on OpenRouter; tool calling checked on the host 3 Nov
+            - name: LLM_MODEL # free on OpenRouter; tool calling checked on the hosted demo 3 Nov
               value: nvidia/nemotron-3-ultra-550b-a55b:free
             # Secret paypal-secrets (created by hand, DEPLOY.md step 3). Every key is required, so a
             # missing Secret or key stops the pod at CreateContainerConfigError. PAYPAL_WEBHOOK_ID,
@@ -115,9 +115,8 @@ spec:
             capabilities:
               drop:
                 - ALL
-          # Inside the paypal LimitRange (max 500m / 256Mi per container) and the paypal-cap quota
-          # (requests 100m / 256Mi, limits 1 / 600Mi). 256Mi is the LimitRange max: more needs the
-          # host's paypal block changed first.
+          # Small on purpose: fits a LimitRange of 500m / 256Mi per container, if the cluster admin
+          # sets one (more memory needs that raised first).
           resources:
             requests:
               cpu: 25m

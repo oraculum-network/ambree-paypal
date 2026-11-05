@@ -1,8 +1,7 @@
-# paypal.ambree.ai on oraculum-prod (k3s). Rendered with `kubectl kustomize deploy/k8s`.
-# The namespace, its PSA labels, NetworkPolicies, quota, LimitRange, the paypal-low PriorityClass
-# and the PVC paypal-data come from the monorepo's ops/oracle/security.sh (the paypal block), not
-# from here. The Secret paypal-secrets is created by hand (DEPLOY.md step 3); this renders no
-# Secret and no PVC.
+# paypal.ambree.ai on a single-node k3s cluster. Rendered with `kubectl kustomize deploy/k8s`.
+# Prerequisites, made by the cluster admin, not from here: namespace `paypal`, PVC `paypal-data`,
+# PriorityClass `paypal-low`, Secret `paypal-secrets` (and any quota, LimitRange or NetworkPolicies);
+# see DEPLOY.md. This renders no Secret and no PVC.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: paypal
@@ -14,9 +13,9 @@ resources:
   - deployment.yaml
   - service.yaml
   - ingress.yaml
-# The image is built on the host by the deploy gate as oraculum/ambree-paypal:<sha7>. The deploy
-# renders this dir through an overlay that sets newTag to that sha (DEPLOY.md step 5);
-# `set-by-deploy` as it stands would fail with ErrImageNeverPull, never run a stale image.
+# The image is oraculum/ambree-paypal:<sha7>. The deploy renders this dir through an overlay that
+# sets newTag to that sha (DEPLOY.md step 5); `set-by-deploy` as it stands would fail with
+# ErrImageNeverPull, never run a stale image.
 images:
   - name: oraculum/ambree-paypal
     newTag: set-by-deploy
