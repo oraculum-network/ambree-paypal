@@ -118,3 +118,18 @@ export function demoMessage(r) {
   }
   return `Demo warning raised for ${r.bookings_warned} booking${r.bookings_warned === 1 ? "" : "s"}.`;
 }
+
+/**
+ * Ambree's reply as plain text (5 Nov smoke: the live model still wrote **bold** despite the plain-text
+ * prompt). Drops paired **…** / __…__ emphasis markers and a line's leading # heading marks; keeps every
+ * other character, so ids, amounts, numbered lines and lone asterisks are shown as written. The result is
+ * text for textContent, never markup.
+ * @param {string} s
+ * @returns {string}
+ */
+export function plainReply(s) {
+  return String(s)
+    .replace(/\*\*(?=\S)([^\n]*?\S)\*\*/g, "$1")
+    .replace(/__(?=\S)([^\n]*?\S)__/g, "$1")
+    .replace(/^#{1,6}[ \t]+/gm, "");
+}
