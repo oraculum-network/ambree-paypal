@@ -5,9 +5,17 @@ deposit **straight into the guide's own PayPal account**. The agent can find, as
 create a payment order inside a **mandate** that the traveller approved with a step-up code. Every step is written
 to a hash-chained ledger. Money flows from the traveller to the guide. **Ambree never holds or receives it.**
 
-Status: design for the PayPal AI Hackathon build (submissions close Thu 12 Nov 2026, 12:00 PT). **Sandbox only.**
-Anything I could not check in PayPal's docs is marked **UNVERIFIED**. The Monday spike (`scripts/spike.ts`) checks
-the risky items.
+**Status.**
+- Built 31 Oct-5 Nov 2026 for the PayPal AI Hackathon (submissions close Thu 12 Nov 2026, 12:00 PT). **Sandbox only.**
+- The spike (`scripts/spike.ts`) ran on the real sandbox on 3 Nov (§5); §21 is current for credentials and refunds.
+- The hosted smoke passed on 5 Nov: the payment, the capture, the cyclone, the guide's decline and the refund
+  through the guide's own app. PayPal tied every webhook event, the refund's included, to the operator's app;
+  sandbox webhooks arrived late.
+
+What PayPal's docs didn't settle when a section was written is marked **UNVERIFIED** there; §5 and §21 record what
+the spike answered. §1-§10 are the design; §11-§20 record the review rounds of 31 Oct-2 Nov (each finding, its fix
+and the test that pins it; a later section supersedes an earlier one where they differ); §21 and §22 came after the
+spike.
 
 ## 1. Actors and parts
 
@@ -20,7 +28,7 @@ the risky items.
 | PayPal tier | `src/paypal/`: the `PaymentsApi` interface, the REST client (sandbox only) and an in-process fake that speaks the same JSON |
 | Ledger | `src/ledger/`: an append-only table in `node:sqlite`, where each row's `hash` = sha256 of the row + `prev_hash` |
 | Weather | `src/weather/`: the cyclone feed interface. GDACS later (**UNVERIFIED** API shape); a demo feed for tests and the offline demo, and per-booking simulated warnings on the hosted sandbox (§14) |
-| MCP | `POST /mcp`: the same tools for any MCP client (stateless Streamable HTTP, as in ambree-qloo) |
+| MCP | `POST /mcp`: the same tools for any MCP client (stateless Streamable HTTP) |
 
 ## 2. Flows
 
@@ -156,53 +164,59 @@ The base URL is a constant. `src/paypal/sandbox.ts` refuses any other origin; th
 | # | Call | Method + path | Body / headers we send | Doc read (31 Oct) |
 |---|---|---|---|---|
 | 1 | OAuth token | `POST /v1/oauth2/token` | `Authorization: Basic base64(client_id:client_secret)`, `Content-Type: application/x-www-form-urlencoded`, body `grant_type=client_credentials`. Reply: `access_token`, `token_type` (Bearer), `expires_in` (s), `app_id`, `scope`, `nonce`. Cached until 60 s before `expires_in` runs out | https://developer.paypal.com/api/rest/authentication/ |
-| 2 | Create order | `POST /v2/checkout/orders` | Headers: `Authorization: Bearer …`, `PayPal-Request-Id` (idempotency), `Prefer: return=representation`. Body: `{"intent":"CAPTURE","purchase_units":[{"reference_id":booking_id,"custom_id":booking_id,"invoice_id":"AMB-"+booking_id,"description":"Guide deposit: …","amount":{"currency_code":"EUR","value":"30.00"},"payee":{"email_address":…}|{"merchant_id":…}}],"payment_source":{"paypal":{"experience_context":{"return_url":…,"cancel_url":…,"user_action":"PAY_NOW","shipping_preference":"NO_SHIPPING","brand_name":"Ambree"}}}}` | https://developer.paypal.com/docs/api/orders/v2/orders-create (`intent`, `purchase_units[]` 1-10, `reference_id`, `description` ≤127, `custom_id`, `invoice_id` unique per merchant, `amount`, `payee{email_address,merchant_id}`, `PayPal-Request-Id`, `Prefer`). The `experience_context` fields were cut off in my fetch: **UNVERIFIED** |
-| 3 | Show order | `GET /v2/checkout/orders/{id}` | none. Reply: `status`, `links[]`, `payer{name, email_address, payer_id}` | https://developer.paypal.com/docs/api/orders/v2/orders-get (example has `status: APPROVED`, links `self`, `approve`, `edit`, `capture`). The full status enum (`CREATED, SAVED, APPROVED, VOIDED, COMPLETED, PAYER_ACTION_REQUIRED`) is **UNVERIFIED** (from memory) |
-| 4 | Capture | `POST /v2/checkout/orders/{id}/capture` | `PayPal-Request-Id: capture-{id}`, `Prefer: return=representation`, `Content-Type: application/json`, body `{}`. Reply: `purchase_units[0].payments.captures[0].{id,status,amount}`: **UNVERIFIED** shape (from memory; the get page had no captures) | https://developer.paypal.com/docs/api/orders/v2/ (path) |
+| 2 | Create order | `POST /v2/checkout/orders` | Headers: `Authorization: Bearer …`, `PayPal-Request-Id` (idempotency), `Prefer: return=representation`. Body: `{"intent":"CAPTURE","purchase_units":[{"reference_id":booking_id,"custom_id":booking_id,"invoice_id":"AMB-"+booking_id,"description":"Guide deposit: …","amount":{"currency_code":"EUR","value":"30.00"},"payee":{"email_address":…}|{"merchant_id":…}}],"payment_source":{"paypal":{"experience_context":{"return_url":…,"cancel_url":…,"user_action":"PAY_NOW","shipping_preference":"NO_SHIPPING","brand_name":"Ambree"}}}}` | https://developer.paypal.com/docs/api/orders/v2/orders-create (`intent`, `purchase_units[]` 1-10, `reference_id`, `description` ≤127, `custom_id`, `invoice_id` unique per merchant, `amount`, `payee{email_address,merchant_id}`, `PayPal-Request-Id`, `Prefer`). The `experience_context` fields weren't on the page as read: **UNVERIFIED** then; the 3 Nov spike's order sent them and was created, approved and captured (§5) |
+| 3 | Show order | `GET /v2/checkout/orders/{id}` | none. Reply: `status`, `links[]`, `payer{name, email_address, payer_id}` | https://developer.paypal.com/docs/api/orders/v2/orders-get (example has `status: APPROVED`, links `self`, `approve`, `edit`, `capture`). The full status enum (`CREATED, SAVED, APPROVED, VOIDED, COMPLETED, PAYER_ACTION_REQUIRED`) is **UNVERIFIED** (not on that page) |
+| 4 | Capture | `POST /v2/checkout/orders/{id}/capture` | `PayPal-Request-Id: capture-{id}`, `Prefer: return=representation`, `Content-Type: application/json`, body `{}`. Reply: `purchase_units[0].payments.captures[0].{id,status,amount}`: **UNVERIFIED** shape when written (the get page had no captures); verified on the sandbox on 3 Nov (§5 S6) | https://developer.paypal.com/docs/api/orders/v2/ (path) |
 | 5 | Refund | `POST /v2/payments/captures/{capture_id}/refund` | `PayPal-Request-Id: refund-{booking}-{n}`, `Prefer: return=representation`. Body: `{}` (full) or `{"amount":{"currency_code":"EUR","value":"10.00"},"note_to_payer":…,"custom_id":booking_id}`. Reply: `id`, `status` | https://developer.paypal.com/docs/api/payments/v2/captures-refund ("omit amount for a full refund"; `PayPal-Auth-Assertion` "establishing the consent to act-on-behalf of a merchant is a prerequisite"). The status enum beyond `COMPLETED` is **UNVERIFIED** |
 | 6 | Show refund | `GET /v2/payments/refunds/{refund_id}` | none | https://developer.paypal.com/docs/api/payments/v2/ |
 | 7 | Verify webhook | `POST /v1/notifications/verify-webhook-signature` | `{"auth_algo": h[PAYPAL-AUTH-ALGO], "cert_url": h[PAYPAL-CERT-URL], "transmission_id": h[PAYPAL-TRANSMISSION-ID], "transmission_sig": h[PAYPAL-TRANSMISSION-SIG], "transmission_time": h[PAYPAL-TRANSMISSION-TIME], "webhook_id": env PAYPAL_WEBHOOK_ID, "webhook_event": <parsed body>}`. All are required. Reply `verification_status` (`SUCCESS` in the example; `FAILURE` as the other value is **UNVERIFIED**) | https://developer.paypal.com/docs/api/webhooks/v1/verify-webhook-signature-post |
-| 8 | Create webhook (setup, once) | `POST /v1/notifications/webhooks` | URL `https://paypal.ambree.ai/webhooks/paypal`, events below. Done in the dashboard by the CEO, or later by script | https://developer.paypal.com/docs/api/webhooks/v1/ |
+| 8 | Create webhook (setup, once) | `POST /v1/notifications/webhooks` | URL `https://paypal.ambree.ai/webhooks/paypal`, events below. Done once in the developer dashboard (DEPLOY.md step 6), or later by script | https://developer.paypal.com/docs/api/webhooks/v1/ |
 | 9 | Simulate event (optional) | `POST /v1/notifications/simulate-event` | for testing the endpoint once deployed | same |
 
 **Payee:** "Include the email_address or merchant_id of the account to receive the payment… Add the payee object to
 the transaction payload". Without it, the funds go to the app owner (https://developer.paypal.com/docs/checkout/standard/customize/pay-another-account/).
 That page does not say what the receiving account needs, or whether the API caller may capture or refund such an
-order: **UNVERIFIED, spike items S2 and S4.**
+order: **UNVERIFIED, spike items S2 and S4.** Answered on 3 Nov (§5): the operator's app captures it (S2), but
+can't refund it (S4: no), so refunds go through the guide's own app (§21).
 
 **Webhook events we subscribe to** (https://developer.paypal.com/api/rest/webhooks/event-names/):
 `CHECKOUT.ORDER.APPROVED`, `PAYMENT.CAPTURE.COMPLETED`, `PAYMENT.CAPTURE.REFUNDED`, `PAYMENT.CAPTURE.PENDING`,
 `PAYMENT.CAPTURE.DECLINED` (the page lists v2 as `DECLINED` and v1 as `DENIED`; we accept both), and `PAYMENT.CAPTURE.REVERSED`.
+Since §5 P4 (answered 3 Nov), also the five `PAYMENT.REFUND.*` events the dashboard lists (DEPLOY.md step 6).
 The resource each event carries is not on that page. We assume order, capture and refund objects with
 `custom_id`: **UNVERIFIED**. The handler finds the booking by `resource.custom_id`, falling back to the order,
 capture or refund id it already stored.
 
-**Errors.** The PayPal error body is `{name, message, debug_id, details[{issue, description}]}`. This is from memory:
-**UNVERIFIED**. It becomes `PayPalError{status, name, issue, debugId, message}`, which never carries headers,
+**Errors.** The PayPal error body is `{name, message, debug_id, details[{issue, description}]}`. This wasn't on the
+pages read: **UNVERIFIED** when written; the 3 Nov spike read PayPal's refusals through it (P7's issue
+`CAPTURE_FULLY_REFUNDED`, §21). It becomes `PayPalError{status, name, issue, debugId, message}`, which never carries headers,
 tokens or credentials. Issue names we handle (all **UNVERIFIED**): `ORDER_NOT_APPROVED`, `ORDER_ALREADY_CAPTURED`,
 `CAPTURE_FULLY_REFUNDED`, `REFUND_AMOUNT_EXCEEDED`, `PAYEE_ACCOUNT_RESTRICTED`, `PAYEE_NOT_ENABLED_FOR_CARD_PROCESSING`.
 The OAuth error body is `{error, error_description}`. Timeouts: 15 s per call (`AbortSignal.timeout`). One retry,
 only on network errors or 5xx: for a GET always, for a write only if it carries a `PayPal-Request-Id`. The
 client's `writeRetries` (default 1) sets the writes' count; the spike passes 0 (§5 S12).
 
-## 5. Unknown until the spike (Mon 2 Nov)
+## 5. Sandbox questions and the 3 Nov answers
+
+The spike, planned for Mon 2 Nov, ran on the real sandbox on 3 Nov. Its answers follow the table; §21 has the later
+ones.
 
 | Id | Question | How the spike answers it |
 |---|---|---|
 | S1 | Does a sandbox REST app's token work for orders with a **third-party payee** (`email_address` of another sandbox business account)? | (b) the create reply's status and payee echo |
 | S2 | Can the API caller (the app owner, not the payee) **capture** that order? | (d) |
 | S3 | Does `merchant_id` work as well as `email_address`? | run with `--payee-merchant-id` |
-| S4 | Can the API caller **refund** a capture whose payee is another account, without `PayPal-Auth-Assertion`? | (e1), and (e4) for the rest. If not, the fallbacks are (i) the guide refunds from their own PayPal (the operator page then says how) or (ii) the report's fallback, an invoice from the guide's own app |
+| S4 | Can the API caller **refund** a capture whose payee is another account, without `PayPal-Auth-Assertion`? | (e1), and (e4) for the rest. If not, the fallbacks are (i) the guide refunds from their own PayPal (the operator page then says how) or (ii) an invoice from the guide's own app. Answered 3 Nov: no; a REST app owned by the guide's account refunds instead (§21) |
 | S5 | Which approve link comes back with `payment_source.paypal.experience_context`: `approve` or `payer-action`? | the printed links |
 | S6 | The capture reply shape, and whether `custom_id` is echoed on the capture | the printed ids |
 | S7 | The exact webhook payloads and headers; `verification_status` values | after deploy: a sandbox webhook to `paypal.ambree.ai`, plus `simulate-event` |
-| S8 | Does a personal sandbox account work as payee (concept A's question)? Not needed for B | optional run |
+| S8 | Does a personal sandbox account work as payee? Not needed for this design: every guide's payee is a business account | optional run |
 | S9 | Currency: EUR versus USD for an MU business sandbox account | run once with each |
 | S10 | JS SDK v6 buttons versus the redirect approve link for a third-party payee | not in the spike; the build uses the approve link (redirect) first |
 | S11 | (The refund premises at the end of §19 and §20 are S12.) Does `GET /v1/identity/openidconnect/userinfo?schema=openid`, called with the **app's client-credentials token**, describe the REST app's owner, and is its `payer_id` the owner's merchant id (equal to the id in the sandbox dashboard)? If not, which documented call returns the app owner's merchant id? | row "a2 identity": prints payer_id, user_id, account_type and the field names (never a token). Compare payer_id with the dashboard's merchant id |
 | S12 | The **refund premises** the code now depends on (§19 "Verify in spike S11", and §20), numbered in that list's order: **P1** dedupe of a repeated `PayPal-Request-Id`; **P2** `custom_id` on the refund; **P2b** its `links[rel=up]` to the capture; **P3** the resource of `PAYMENT.CAPTURE.REFUNDED` and of `PAYMENT.CAPTURE.REVERSED` (§20); **P4** the refund failure event names; **P5** `seller_payable_breakdown.total_refunded_amount`; **P6** a refund PENDING then FAILED or CANCELLED; **P7** the issue a refused refund carries | (e1)-(e6) on the captured amount A, which must be at least 2.00: e1 refunds 1.00 (`custom_id` "spike-{runId}", request id "spike-refund1-{runId}"); e2 repeats that POST exactly; e3 GETs e1's refund; e4 refunds the rest of A (less e2's 1.00 if it was a second refund or its reply was lost); e4b GETs e1's refund again; e5 asks 1.00 more of the fully refunded capture under a new request id; e6 repeats e4's request. Each refund POST is one exchange: the spike's client doesn't resend a write (`writeRetries` 0), so a lost reply is "no answer", never a resend mixed into the answer. The block "Refund premises (DESIGN.md §19-§20)" answers P1, P2, P2b, P5 and P7. P3, P4 and P6 need the developer dashboard's webhook simulator and the sandbox webhook event log |
 
-**Spike results, 3 Nov 16:06 (sandbox, app 1999c59; the full table is in the CTO's notes).**
+**Spike results, 3 Nov 16:06 (sandbox, app 1999c59; a summary of the run's table).**
 - S1-S3, S6: an order with `payee.merchant_id` of another sandbox business account (the guide, DE) is created,
   approved by a sandbox buyer and captured by the operator's app: capture COMPLETED, `custom_id` echoed.
 - S9: a German (EUR) guide account takes the EUR deposit as COMPLETED. The MU sandbox accounts hold USD.
@@ -214,8 +228,9 @@ client's `writeRetries` (default 1) sets the writes' count; the spike passes 0 (
   is refused (400 "No permissions to set target_client_id"), and Partner Referrals answers 403 NOT_AUTHORIZED:
   acting for a seller needs PayPal's partner features. **Open:** whether a REST app owned by the guide's own
   account can refund a capture the operator's app created (decides whether only the refund legs move to the
-  guide's credentials, or the order too).
-- S12 (P1, P2, P2b, P5, P7): not answered, because e1 was refused. Rerun on the existing capture once refunds work.
+  guide's credentials, or the order too). Answered the same day: yes, so only the refund legs moved (§21).
+- S12 (P1, P2, P2b, P5, P7): not answered, because e1 was refused. Rerun on the existing capture once refunds work:
+  answered at 17:30 the same day, through the guide's own app (§21, "Premises still open").
 
 **S12, what each answer changes in the code.** P2 and P2b are read on the POST reply and on GET only; whether
 refund *webhooks* carry them too is P3, read in the event log.
@@ -225,7 +240,7 @@ refund *webhooks* carry them too is P3, read in the event log.
   - e2 NOT DEDUPED: one intent can cost two refunds. I5 and F1 hold the booking, but only after the money
     moved. The path to revisit is the client's own retry of a refund POST (`#api` retries a write with a
     request id once on a network error or a 5xx). Whether refund POSTs stop retrying and go straight to
-    `refund_unconfirmed` is a CTO decision; the switch exists (`writeRetries: 0`, which the spike uses).
+    `refund_unconfirmed` is a maintainer decision; the switch exists (`writeRetries: 0`, which the spike uses).
   - e2 refused: the client's retry and the resend are refused rather than replayed. A refused resend is
     held as `unknown` until its refund's own evidence settles it (§18), so this fails closed. The run is then
     not OK, since this answer is not the expected one. A refusal is a 422, or another 4xx that names at
@@ -264,7 +279,9 @@ refund *webhooks* carry them too is P3, read in the event log.
     the refund (`#refundEvidenceNow`), as the fake sends it. If the real resource is the capture, that
     premise and the evidence tests built on it are wrong for real events. If `REVERSED`'s resource is the
     capture, a reversal goes unnoticed until a person looks (§20).
-  - P4: subscribe to the exact names (DEPLOY.md's TODO-CHECK).
+  - P4: subscribe to the exact names. Answered 3 Nov from the dashboard's event list: `PAYMENT.REFUND.CANCELLED`,
+    `PAYMENT.REFUND.COMPLETED`, `PAYMENT.REFUND.DENIED`, `PAYMENT.REFUND.FAILED` and `PAYMENT.REFUND.PENDING`, on
+    both webhooks (DEPLOY.md step 6).
   - P6: if a sandbox refund can't go PENDING and then FAILED, R9-3 and R9-4 (C2) stay tested on the fake only.
 
 **The run's money guard** (`RefundBudget` in the spike) is asserted before every refund POST.
@@ -303,15 +320,15 @@ refund *webhooks* carry them too is P3, read in the event log.
 - `src/paypal/api.ts` defines `PaymentsApi`: `createOrder`, `getOrder`, `captureOrder`, `refundCapture`, `getRefund`, `verifyWebhookSignature`.
 - Today one class implements it: `PayPalRestClient` (sandbox). `FakePayPal` is a `fetch` stand-in underneath
   that client, so tests and the offline demo run the real client code.
-- `@paypal/agent-toolkit` (Apache-2.0; can't be installed here) has `create_order`, `get_order`, `pay_order` and
+- `@paypal/agent-toolkit` (Apache-2.0; not a dependency of this repo) has `create_order`, `get_order`, `pay_order` and
   refund tools. It plugs in as a second `PaymentsApi` adapter that calls the toolkit's functions. Our booking service
   stays the only caller, so the mandate check still runs first. **We do not hand the toolkit's tools straight to the
   model**: that would let the model create orders with no mandate. **UNVERIFIED:** whether the toolkit lets you
-  set `purchase_units[].payee` (its `create_order` parameters are not documented in what I could read).
+  set `purchase_units[].payee` (its `create_order` parameters were not documented in the pages read on 31 Oct).
 
 **The model:**
 - `LLM_BASE_URL`, `LLM_API_KEY` and `LLM_MODEL` select an OpenAI-compatible `POST {base}/chat/completions` with
-  `tools`; OpenRouter is planned.
+  `tools`; the hosted demo uses OpenRouter.
 - With no key, the **scripted model** runs: deterministic tool calls driven by the conversation. The tests and the
   offline demo use it, and the page labels it "scripted model".
 - Events (the guide priced, the mandate approved, paid, a cyclone) enter the conversation as notes that start with
@@ -336,7 +353,7 @@ refund *webhooks* carry them too is P3, read in the event log.
 | `POST /api/demo/cyclone` | Fake and sandbox mode (live is refused at startup). Needs an existing session (401, and it never creates one). **Sandbox:** `{booking_id}` of a booking the session owns (else 404) and has paid with no refund under way (`captured`, no refund being sent or pending; else 409 with the reason, and nothing is saved); posts one simulated warning for that booking's day, once, and calls no payment API (§14). **Fake:** unchanged, a demo-feed alert around every booking of the tab's conversation |
 | `GET /healthz` | `{ok, version, paypal, model, operator_identity, guide_identity}` (§21 D3) |
 
-## 8. Three-minute demo script (from the report, §6 B)
+## 8. Three-minute demo script
 
 - **0:00** The problem: guides are booked over WhatsApp, and deposits are awkward. Small operators aren't on
   booking platforms.
@@ -364,9 +381,8 @@ refund *webhooks* carry them too is P3, read in the event log.
 1. Open https://paypal.ambree.ai (or run `npm start` locally with no env: the fake PayPal and scripted model, end to end).
 2. Type the request. Open the "guide's phone" link and set a price.
 3. Read the code from the demo inbox and approve the mandate.
-4. Click "Pay the guide". On the hosted sandbox instance, log in with the sandbox buyer account listed in the
-   README (the CEO creates it; the credentials are published for judges as the rules ask). On the fake, click
-   approve.
+4. Click "Pay the guide". On the hosted sandbox instance, log in with the sandbox buyer account given in the
+   Devpost submission's testing instructions (never in the repo). On the fake, click approve.
 5. Watch the ledger fill in; the chain status under it says "Chain OK" by itself.
 6. After paying, press "Simulate a cyclone warning (demo)" (Demo controls; it stays off, saying why, until the
    booking is captured). Follow Ambree's reschedule and decline it as the guide: the guide's decline, not the
@@ -374,7 +390,7 @@ refund *webhooks* carry them too is P3, read in the event log.
 
 ## 10. Deploy shape (as hosted; the steps are in DEPLOY.md)
 
-- **Image:** `paypal.ambree.ai`, its own namespace `paypal` on the Oracle k3s host, as `qloo` did.
+- **Image:** `paypal.ambree.ai`, its own namespace `paypal` on a single-node k3s host.
   - Image `oraculum/ambree-paypal:<sha7>`, built on the host, `imagePullPolicy: Never`.
   - Traefik Ingress with a Let's Encrypt certificate.
   - Runs as user `node` with a read-only root filesystem; the only writable path is `/data`, the PVC `paypal-data`
@@ -385,16 +401,15 @@ refund *webhooks* carry them too is P3, read in the event log.
   doesn't start without it; there is no fake-PayPal fallback on the host. The merchant ids, `LLM_BASE_URL` and
   `LLM_MODEL` are plain values in the Deployment.
 - **Network:** egress on TCP 443 only; the target hosts are `api-m.sandbox.paypal.com` and the LLM host. A
-  NetworkPolicy can't name hosts, so this uses the same form as alexa/qloo.
+  NetworkPolicy can't name hosts, so it allows TCP 443 to public addresses.
 - **Data:** the ledger survives restarts until 15 Dec on the PVC.
 - **Webhook:** set up in the sandbox app for `https://paypal.ambree.ai/webhooks/paypal`. Its id goes into the Secret.
 - **New env names** (added after the review): `PAYPAL_OPERATOR_MERCHANT_ID` (required in sandbox mode; the
   `*_EMAIL` variables are refused) and `MCP_DEMO_PASSCODE` (optional; without it MCP is off).
 
-## 11. After the review (fix phase, 31 Oct)
+## 11. A session owns its bookings; orders must match the mandate; refunds are saved before they are sent (review, 31 Oct)
 
-A second review found ten issues; all were fixed (`cw-out/2026-10-31/paypal-fix/SUMMARY.md`). The rules
-that changed:
+A second review found ten issues; all were fixed. The rules that changed:
 
 - **Traveller authority.**
   - Cookie `amb_sid`: 256 random bits, HttpOnly, SameSite=Lax, Secure when `PUBLIC_URL` is https. It is
@@ -413,6 +428,8 @@ that changed:
   - `custom_id` or `reference_id` = the booking id.
   - **UNVERIFIED:** that `GET /v2/checkout/orders/{id}` echoes `purchase_units[].payee` for a third-party
     payee. If it doesn't, validation fails closed (`needs_review`, no capture). Spike S6 must look at this.
+    Answered: the 3 Nov spike's order was captured (§5 S1-S3, S6), and the 5 Nov hosted smoke's capture, which this
+    check gates, went through.
 - **Create failures.**
   - Definitive (400/401/403/404/422, auth or invalid request): the mandate is spent and the booking returns
     to `priced`.
@@ -440,7 +457,7 @@ that changed:
   - After a pod restart, the in-memory checkpoint starts from the database. Comparing it with the last
     logged `ledger_head` is the operator's check.
 
-## 12. After the re-check (fix round 2, 31 Oct). This supersedes §11 where they differ
+## 12. Payees by merchant id only; refund replies must match; browser mutation checks; per-tab conversations (review round 2, 31 Oct; supersedes §11 where they differ)
 
 - **Merchant ids only.** This replaces §11's email comparison.
   - `samePayee` and `isOperator` compare `merchant_id` only; a payee with no merchant id never matches, and
@@ -451,6 +468,7 @@ that changed:
   - The app sends orders with `payee.merchant_id`. Before capture, the order's `payee.merchant_id` must
     equal the guide's and must not be the operator's.
   - **UNVERIFIED (spike S6):** whether order replies echo `payee.merchant_id`; without it, capture is refused.
+    Answered as in §11: the 5 Nov hosted smoke captured through this check.
   - Also **UNVERIFIED:** that merchant ids are 13 capitals and digits (the code allows 8-20).
 - **The page's payment line** (`public/labels.js` `paymentLine`):
   - "Paid" only for captured, partially refunded or refunded bookings;
@@ -458,7 +476,7 @@ that changed:
   - "Payment failed" for `capture_failed`;
   - "Payment needs review" otherwise.
 - **Refund events.** `PAYMENT.CAPTURE.REFUNDED`, any `PAYMENT.REFUND.*` (e.g. `PAYMENT.REFUND.FAILED`;
-  the exact names are **UNVERIFIED**) and, since §20, any event whose `resource_type` is `refund` (e.g.
+  the exact names were **UNVERIFIED**, answered 3 Nov in §5 P4) and, since §20, any event whose `resource_type` is `refund` (e.g.
   `PAYMENT.CAPTURE.REVERSED`) call `refreshRefunds`. A terminal status other than COMPLETED/PENDING
   marks the op `failed`, which releases the reservation.
 - **Refund reconciliation fails closed.** For a COMPLETED or PENDING reply, the amount must exist and equal
@@ -482,7 +500,7 @@ that changed:
   until something is deployed. This also covers the re-check's legacy-records point: records without
   `refund_ops` can't be loaded at all.
 
-## 13. Fix round 3 (31 Oct)
+## 13. A refund review is sticky; PayPal confirms the operator's identity at startup (review round 3, 31 Oct)
 
 - **Review is sticky.** While any `RefundOp` is `needs_review`:
   - the booking stays `needs_review`, even when another op completes;
@@ -510,9 +528,9 @@ that changed:
   - **Opt-out:** `PAYPAL_OPERATOR_IDENTITY=config-only` is explicit and logged as a warning, and `/healthz`
     reports `operator_identity: "config-only (unconfirmed)"`. Use it only if S11 shows the call can't
     confirm the owner, until a documented call is found.
-  - **UNVERIFIED: S11** (the spike's "a2 identity" row).
+  - **UNVERIFIED: S11** (the spike's "a2 identity" row). Answered no on 3 Nov (§5), hence §21 D3.
 
-## 14. The hosted demo (2 Nov)
+## 14. The hosted demo's simulated cyclone warning: only on the caller's own paid booking, once, no payment call (2 Nov)
 
 On the hosted site (PayPal mode `sandbox`), `POST /api/demo/cyclone` answered 404 and the page hid the Demo
 controls, so the cyclone → reschedule-or-refund scene (§8 2:25, README judge step 7) could not be shown. Real
@@ -575,7 +593,7 @@ GDACS warnings can't be triggered on demand.
   - `test/fix5-review.test.ts` covers the review's findings, with deterministic races: a gate holds one
     PayPal reply (or feed lookup) while the test changes the booking.
 
-## 15. Round 6: the refund reason, its refusal, and a move during a refund (2 Nov)
+## 15. The refund reason holds on the booking it reserves on; each refusal says why; no move during a refund (review round 6, 2 Nov)
 
 Four findings from the independent reviewers, each with a test that failed at 09d7db8
 (`test/fix6-*.test.ts`; the races are deterministic, held by `test/helpers/race.ts`'s gate):
@@ -604,7 +622,7 @@ Four findings from the independent reviewers, each with a test that failed at 09
 - **Fake mode:** unchanged in behaviour. Its demo-feed raise is a feed warning (rule (a)); R1–R4 apply in
   every mode, and its e2e refund path declines the move before the refund, so nothing is withdrawn there.
 
-## 16. Round 7: one booking's steps never interleave (2 Nov)
+## 16. One queue per booking: its steps never interleave (review round 7, 2 Nov)
 
 Review rounds kept finding lost updates and stale decisions: only the money steps queued on the booking
 (`#serial`), so the guide's page, the agent's mandate and move tools, the traveller's approval and the
@@ -640,7 +658,7 @@ deterministic, held by `test/helpers/race.ts`'s gate, or chained 0 to 5 microtas
 - **Fake mode:** the demo control's `announceCyclone` now queues per booking, so a press while a refund is
   held at PayPal waits for it and reads the booking as the refund left it. Otherwise unchanged.
 
-## 17. Round 8: an answer names its move; a lost refund reply; what a held move says (2 Nov)
+## 17. A guide's answer names its proposal; a lost refund reply is recovered; a held move says why (review round 8, 2 Nov)
 
 Five findings from the independent reviewers, each with a test that failed at 7777925
 (`test/fix8-*.test.ts`: 21 of 27 failed; the race is the guide's own two pages, read from the rendered HTML).
@@ -697,7 +715,7 @@ Five findings from the independent reviewers, each with a test that failed at 77
   (the proposal key; read from the page in the HTTP tests). `SCHEMA_VERSION` stays 2: `reschedule.n` is
   optional.
 
-## 18. Round 9: a refund whose outcome is unknown ends the same in every order (2 Nov)
+## 18. A refund whose outcome is unknown ends the same in every order of the signals (review round 9, 2 Nov)
 
 R8-1 to R8-4 were one defect. A refund operation whose outcome is **unknown** (an attempt may have reached
 PayPal, but no definitive reply came back) was resolved by whichever signal came first: the reply to the
@@ -747,7 +765,7 @@ The code now keeps four invariants whatever the order.
   match the operation, so it is held as its own unexplained entry and the operation stays unknown). A FAILED or CANCELLED refund of another amount moved no
   money and isn't this operation's. It is logged (`refund.evidence_unmatched`), and the operation stays
   unknown and reserved. Holding a booking for good over a refund that moved nothing would be new behaviour,
-  so this reading of "a mismatch holds for review" is the CTO's to confirm (kept in round 10, §19). `#applyRefund` now derives the
+  so this reading of "a mismatch holds for review" was a maintainer decision (kept in round 10, §19). `#applyRefund` now derives the
   booking's status from its refunds (`statusFromRefunds`: any operation in review means `needs_review`;
   otherwise `refunded`, `partially_refunded` or `captured` by what was refunded). So a booking held only by
   an unknown outcome leaves review once that is settled, and a waiting move is withdrawn if money came back
@@ -826,9 +844,11 @@ does, so R8-1's stale PENDING replay is modelled on it); that the refund resourc
 `GET /v2/payments/refunds/{id}`, carries the `custom_id` we send (without it, no booking is found and the
 event completes unused, so the next `refund_payment` still resends; corrected in §19 F2: only a `sending`
 operation is resent, and the booking is now found by the refund's capture); and the names of PayPal's refund
-webhooks beyond `PAYMENT.CAPTURE.REFUNDED` (the handler takes any `PAYMENT.REFUND.*`).
+webhooks beyond `PAYMENT.CAPTURE.REFUNDED` (the handler takes any `PAYMENT.REFUND.*`). Answered 3 Nov (§21,
+"Premises still open"): the dedupe and `custom_id` on the reply and GET yes; the event names in §5 P4. The webhook
+resource (P3) is still open.
 
-## 19. Round 10: no refund evidence is dropped; a refund found by its capture; any settle closes a move (2 Nov)
+## 19. No refund evidence is dropped; a refund is found by its capture; any settle closes a waiting move (review round 10, 2 Nov)
 
 Round 9's five findings (R9-1 to R9-5) each rest on PayPal behaviour nobody has verified yet. Each fix is small
 and fails closed, so the app is right under either premise:
@@ -840,8 +860,8 @@ and fails closed, so the app is right under either premise:
   nothing was held. In R9-4's second form, a FAILED refund matched by amount freed the unknown operation while a
   COMPLETED duplicate went unrecorded, and the agent's retry then refunded again.
 - **R9-2, R9-5 (low).** A refund webhook without `custom_id` found no booking: the capture id was only in its
-  links. So a refund held for an unknown outcome never cleared. Also, the hosted webhook isn't subscribed to the
-  refund failure events.
+  links. So a refund held for an unknown outcome never cleared. Also, the hosted webhook wasn't subscribed to the
+  refund failure events (their names: §5 P4, answered 3 Nov).
 - **R9-3 (low).** Only the COMPLETED branch withdrew a waiting move.
 
 Three words are used with one meaning throughout:
@@ -892,14 +912,15 @@ GET that names another booking or capture is ignored. Then, on the booking as st
 
 **F1, PayPal's total refunded.** This depends on an UNVERIFIED premise: that the refund reply and the GET carry
 `seller_payable_breakdown.total_refunded_amount`, and that it is the capture's running total of completed
-refunds. Every save of a refund change goes through `#saveRefunds`:
+refunds. (Answered 3 Nov, §21: present on the reply and GET, and a running total; whether it counts a PENDING refund
+is still open.) Every save of a refund change goes through `#saveRefunds`:
 
 - It keeps the largest total seen in `paypal_refunded_minor`. A total in another currency, or none, changes
   nothing.
 - `refundTotalExcess` is that total minus what the booking accounts for, and never less than 0. Above 0 it holds
   the booking: `needs_review`, cause `unexplained`, the excess counted in `refund_review`. It is logged
   `refund.unexplained` with `source: "total_refunded_amount"` when it grows.
-- **A deviation from the brief's "completed plus this one".** The comparison uses everything the booking
+- **Not "completed plus this one".** The comparison uses everything the booking
   accounts for, including operations that are pending, being sent or unknown, since their money may already be
   in PayPal's total. Counting completed refunds only would raise a false hold: when one refund completes while
   another operation's reply was lost, the other's own evidence would then count it twice (`fix10-evidence`,
@@ -934,8 +955,8 @@ resends" held only for an operation still `sending`. An operation held for an un
 retry or resend) is never resent, and `get_booking` doesn't read it (it has no refund id), so before round 10
 nothing could clear it. Now its refund's webhook settles it by the capture link. It still stays held until a
 person reconciles it if PayPal's refund webhooks carry neither `custom_id` nor that link, or if the event never
-comes. A failure event the hosted webhook isn't subscribed to yet is one case (DEPLOY.md's new TODO-CHECK for the
-refund failure events, whose exact names are DESIGN.md §5 S12's P4, read off the developer dashboard).
+comes. A failure event the hosted webhook wasn't subscribed to yet was one case, until the refund events' exact
+names were read off the developer dashboard (§5 S12's P4, answered 3 Nov; DEPLOY.md step 6 subscribes to them).
 
 The traveller's card no longer promises the notice: "Nothing more is refunded meanwhile: if PayPal's notice
 doesn't settle it, a person will reconcile it." The agent-facing `refund_under_review` texts say the same. An
@@ -994,7 +1015,10 @@ controls (8573cad: `dedupe`, `refundCustomId`, `refundTotals`, `replyAfter`). Th
 `SCHEMA_VERSION` stays 2: `evidence` and `paypal_refunded_minor` are optional, and `unexplained` is one more value
 of an optional field.
 
-**Verify in spike S11** (each one the code now depends on, and what happens if it is false):
+**Verify in spike S11** (each one the code now depends on, and what happens if it is false). The spike (S12) answered
+most of them on 3 Nov (§21, "Premises still open"): dedupe yes, `custom_id` and the `up` link yes on the reply and
+GET, the total yes (a running total), the refusal issue `CAPTURE_FULLY_REFUNDED`, and the failure event names
+(§5 P4). The webhook resource (P3) and PENDING then FAILED (P6) are still open.
 
 - **Dedupe.** That PayPal answers a repeated `PayPal-Request-Id` on `POST /v2/payments/captures/{id}/refund` with
   the first reply. If it doesn't, I5 and F1 catch the extra refund and hold the booking. This is the only
@@ -1007,7 +1031,8 @@ of an optional field.
 - **The resource.** That `PAYMENT.CAPTURE.REFUNDED`'s resource is the refund (its id is a refund id), as the
   fake assumes.
 - **The failure events.** The exact names of PayPal's refund failure events (`PAYMENT.REFUND.FAILED`?
-  `PAYMENT.REFUND.CANCELLED`?), to subscribe to (DEPLOY.md's TODO-CHECK).
+  `PAYMENT.REFUND.CANCELLED`?), to subscribe to. **Answered 3 Nov** (§5 P4): `PAYMENT.REFUND.CANCELLED`,
+  `PAYMENT.REFUND.COMPLETED`, `PAYMENT.REFUND.DENIED`, `PAYMENT.REFUND.FAILED`, `PAYMENT.REFUND.PENDING`.
 - **The total.** That `seller_payable_breakdown.total_refunded_amount` is present on the refund reply and on GET,
   in the capture's currency. Also whether it counts only completed refunds or pending ones too. Pending counted
   only over-holds, which fails closed. And whether a GET shows the running total or the total when that refund
@@ -1017,11 +1042,11 @@ of an optional field.
 - **The refusal issues.** Which 422 issue PayPal answers a refused retry or resend with (`CAPTURE_FULLY_REFUNDED`,
   `REFUND_AMOUNT_EXCEEDED`?). Either way, round 9's I1 holds it.
 
-## 20. After round 10: a reversal is refund evidence; the resend texts promise no dedupe (2 Nov)
+## 20. A reversal is refund evidence; the resend texts promise no dedupe (after review round 10, 2 Nov)
 
 Round 10's two re-attacks closed R9-1..R9-4 and the code half of R9-5 (its other half, the refund failure event
-names, is DEPLOY.md's TODO-CHECK for §5 S12's P4). They found two more, both resting on unverified PayPal
-behaviour; the CTO fixed them inline (tests first: `test/fix11-reversed.test.ts`, 3 of 4 red at 1460608).
+names, is §5 S12's P4, answered 3 Nov). They found two more, both resting on unverified PayPal
+behaviour; they were fixed directly (tests first: `test/fix11-reversed.test.ts`, 3 of 4 red at 1460608).
 
 - **A reversal's refund was dropped (medium, not reachable on the demo: a reversal needs a dispute).**
   `PAYMENT.CAPTURE.REVERSED` is subscribed, and PayPal's event-names page lists a refund as its resource, but
@@ -1041,14 +1066,14 @@ behaviour; the CTO fixed them inline (tests first: `test/fix11-reversed.test.ts`
 `resource_type: refund` and a refund resource (if it carries the capture instead, a reversal still goes
 unnoticed until a person looks).
 
-Kept as decided by the round-10 builder: PayPal's running total is compared with every refund that isn't failed
+Kept as decided in round 10: PayPal's running total is compared with every refund that isn't failed
 (completed, pending, being sent or unknown), not with completed ones only, so a lost reply's own refund is never
 counted twice.
 
 ## 21. After the spike: refunds go through the guide's own app (3 Nov)
 
-The 3 Nov spike answered S4 and S11 with no (§5). The design below is the CTO's (D1-D8); this section records it
-as built. It supersedes §4's credential list, §7's webhook row, §10's Secret keys and §13's identity check where
+The 3 Nov spike answered S4 and S11 with no (§5). This section records the design below (D1-D8) as
+built. It supersedes §4's credential list, §7's webhook row, §10's Secret keys and §13's identity check where
 they differ.
 
 ### The evidence (real sandbox, 3 Nov; facts, not guesses)
@@ -1158,9 +1183,9 @@ Each start leaves one lapsing probe order in each app's account.
   - Neither endpoint ever verifies with the other's webhook id.
 - **One handler.** After verification both call `handleWebhook(raw, headers, verifier)`. The log line names the
   endpoint.
-- **The same event on both.** Which app's webhook PayPal uses for a refund made with the guide's app is unknown, so
-  a refund event may arrive on either endpoint, or both, with the same event id. The existing dedupe already
-  handles that:
+- **The same event on both.** Which app's webhook PayPal uses for a refund made with the guide's app was unknown (the
+  5 Nov hosted smoke saw the operator's, see "Premises still open"), so a refund event may arrive on either endpoint,
+  or both, with the same event id. The existing dedupe already handles that:
   - after verification, the event's booking is found and the rest runs on that booking's queue (`#serial`, §16);
   - there `beginWebhook` (by event id) makes it a duplicate once its processing completed;
   - so two deliveries of one event, in turn or at once, are logged and acted on once: the second waits on the
@@ -1264,12 +1289,17 @@ the guide's app; SPIKE OK):
 - **P7:** e5 answers 422 with the issue `CAPTURE_FULLY_REFUNDED`, which is already in `ALREADY_REFUNDED_ISSUES`, so
   no change is needed.
 
+**Answered since:**
+- **P4** (3 Nov, the developer dashboard's event list): `PAYMENT.REFUND.CANCELLED`, `PAYMENT.REFUND.COMPLETED`,
+  `PAYMENT.REFUND.DENIED`, `PAYMENT.REFUND.FAILED` and `PAYMENT.REFUND.PENDING`. Both webhooks subscribe to them
+  (DEPLOY.md step 6); the handler takes any `PAYMENT.REFUND.*`.
+- **Which app's webhook** PayPal notifies about a refund made with the guide's app (the 5 Nov hosted smoke): PayPal
+  tied every webhook event, the refund's included, to the operator's app. Both webhooks stay subscribed and the app
+  takes either; the same event on both is processed once (D4). Sandbox webhooks arrived late.
+
 Still open:
-- **P3** (the resource of `PAYMENT.CAPTURE.REFUNDED` and `REVERSED`), **P4** (the refund failure event names) and
-  **P6** (PENDING, then FAILED or CANCELLED): the developer dashboard's webhook simulator and event log, now for
-  both apps;
-- **new: which app's webhook** PayPal notifies about a refund made with the guide's app, or both. Both are
-  subscribed and the app takes either. The pod's `{"event":"webhook","endpoint":...}` log lines will answer it.
+- **P3** (the resource of `PAYMENT.CAPTURE.REFUNDED` and `REVERSED`) and **P6** (PENDING, then FAILED or
+  CANCELLED): the developer dashboard's webhook simulator and event log, now for both apps.
 
 ## 22. Judge polish (4 Nov)
 
