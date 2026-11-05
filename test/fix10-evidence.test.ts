@@ -241,9 +241,14 @@ describe("R9-2 / R9-5: a refund webhook without custom_id finds its booking by t
     await expect(w.service.refund(id)).rejects.toMatchObject({ code: "refund_under_review", message: expect.not.stringMatching(/until PayPal's notice settles it/) });
   });
 
-  it("DEPLOY.md's webhook list has a TODO-CHECK for the refund failure events, to be read off the dashboard (DESIGN.md §5 S12's P4)", () => {
+  it("DEPLOY.md's webhook lists name the refund events read off the dashboard (DESIGN.md §5 S12's P4, answered 3 Nov)", () => {
     const deploy = readFileSync(new URL("../DEPLOY.md", import.meta.url), "utf8");
-    expect(deploy).toMatch(/TODO-CHECK[^\n]*refund failure events[^\n]*S12's P4/);
+    expect(deploy).not.toMatch(/TODO-CHECK/);
+    expect(deploy).toMatch(/refund events[^\n]*S12's P4, answered 3 Nov/);
+    // Each name in both webhook lists: the operator app's and the guide app's.
+    for (const e of ["CANCELLED", "COMPLETED", "DENIED", "FAILED", "PENDING"]) {
+      expect(deploy.split(`\`PAYMENT.REFUND.${e}\``)).toHaveLength(3);
+    }
     expect(deploy).toMatch(/PAYMENT\.REFUND\.\*/);
   });
 });
