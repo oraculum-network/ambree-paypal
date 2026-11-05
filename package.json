@@ -6,6 +6,10 @@
   "license": "MIT",
   "type": "module",
   "homepage": "https://paypal.ambree.ai",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/oraculum-network/ambree-paypal.git"
+  },
   "engines": {
     "node": ">=22.18"
   },

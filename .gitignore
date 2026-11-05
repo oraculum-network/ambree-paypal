@@ -6,3 +6,9 @@ node_modules/
 test-results/
 playwright-report/
 .data/
+.DS_Store
+coverage/
+blob-report/
+*.log
+.vscode/
+.idea/
