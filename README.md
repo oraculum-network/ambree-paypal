@@ -4,6 +4,38 @@
 deposit straight into the guide's own PayPal account.** It does this only inside a mandate you approved.
 Ambree never holds your money. PayPal sandbox only.
 
+![The agent at work on paypal.ambree.ai: it finds two Le Morne guides, sends the chosen guide a price request, and the ledger reads Chain OK](docs/screenshot-1.png)
+
+## For judges: 60 seconds
+
+Everything runs on the PayPal sandbox (no real money), and every guide is invented.
+
+1. **Watch it (no login, 2:55):** https://youtu.be/_F6lsafHqfU
+2. **Try the agent (no login to Ambree):** open https://paypal.ambree.ai and type *Find me a hiking guide for
+   Le Morne on Thursday and hold the spot.* Under **Guide's phone**, open the request and send a price (total 80,
+   deposit 30). Back on the page, approve the deposit with the code from **Your inbox**. Paying in PayPal's sandbox
+   checkout needs a sandbox buyer account: its login is in the hackathon submission's testing instructions. Every
+   step, the cyclone refund included, is in [The full walk-through](#the-full-walk-through).
+3. **The whole flow with no login and no keys:** `git clone https://github.com/oraculum-network/ambree-paypal.git`,
+   then `npm ci` and `npm start` (Node 22.18 or later), and open http://127.0.0.1:8080. A fake PayPal that speaks
+   the sandbox's JSON and a scripted stand-in for the model run every step, checkout and cyclone refund included.
+
+### What is real
+
+| Part | Status |
+|---|---|
+| The AI agent on paypal.ambree.ai | Real: a live model (`nvidia/nemotron-3-ultra-550b-a55b:free` through OpenRouter); the page header names it, and chat messages are sent to that model |
+| The agent in a local run with no keys | A scripted, rule-based stand-in, not AI |
+| PayPal Orders v2, refunds, webhooks | Real PayPal APIs, sandbox only (the app refuses live PayPal) |
+| Money | Sandbox: no real money moves |
+| The five guides | Invented, each named "(demo)"; on the hosted sandbox one sandbox business account plays all five |
+| The guide's phone page | Real: a private link, no login |
+| The step-up code | Demo delivery: shown in "Your inbox" on the same page, not sent by email or SMS |
+| Cyclone warning | Simulated (Demo controls); the real GDACS feed is not wired yet |
+| Refund | A real sandbox refund from the guide's capture, made with the guide's own sandbox app |
+| Hash-chained ledger | Real, in SQLite, verified on the page |
+| PayPal in a local run | An in-process fake that speaks the sandbox's JSON |
+
 > "Find me a hiking guide for Le Morne on Thursday and hold the spot."
 
 1. **Ambree finds a guide** and asks for a price. The guide gets a private link (`/o/{token}`) and replies
@@ -23,7 +55,7 @@ Ambree never holds your money. PayPal sandbox only.
 - **Licence:** MIT (`LICENSE`); third-party notices are in `NOTICE.md`.
 - **Design:** `DESIGN.md` has the flows, the data model, every PayPal call with its doc link, and the open
   questions.
-- **Live demo (PayPal sandbox):** https://paypal.ambree.ai, up during judging (until 15 Dec 2026). `DEPLOY.md` is a
+- **Live demo (PayPal sandbox):** https://paypal.ambree.ai, kept up through judging (until at least 31 Jan 2027). `DEPLOY.md` is a
   generic guide to deploying it on Kubernetes.
 
 ## Why PayPal and AI are both essential
@@ -251,7 +283,7 @@ Otherwise it prints `LIVE CHECK FAILED (...)` with the failed checks and exits 1
 - `--wait 180` (seconds) is how long one call, or the wait for the mandate, may take: a large free model can be slow.
 - Each run makes one booking request and one unapproved mandate, in a session of its own.
 
-## For judges
+## The full walk-through
 
 1. Open https://paypal.ambree.ai (or run it locally as above).
 2. Type: *Find me a hiking guide for Le Morne on Thursday and hold the spot.*

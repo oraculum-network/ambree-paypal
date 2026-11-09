@@ -402,7 +402,7 @@ refund *webhooks* carry them too is P3, read in the event log.
   `LLM_MODEL` are plain values in the Deployment.
 - **Network:** egress on TCP 443 only; the target hosts are `api-m.sandbox.paypal.com` and the LLM host. A
   NetworkPolicy can't name hosts, so it allows TCP 443 to public addresses.
-- **Data:** the ledger survives restarts until 15 Dec on the PVC.
+- **Data:** the ledger survives restarts until at least 31 Jan 2027 on the PVC.
 - **Webhook:** set up in the sandbox app for `https://paypal.ambree.ai/webhooks/paypal`. Its id goes into the Secret.
 - **New env names** (added after the review): `PAYPAL_OPERATOR_MERCHANT_ID` (required in sandbox mode; the
   `*_EMAIL` variables are refused) and `MCP_DEMO_PASSCODE` (optional; without it MCP is off).

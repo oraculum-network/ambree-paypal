@@ -239,7 +239,7 @@ Run the README's judge steps once with the sandbox buyer.
 
 ## 8. Take-down
 
-The hosted demo stays up during judging, until 15 Dec 2026. Then, in this order:
+The hosted demo stays up during judging, until at least 31 Jan 2027. Then, in this order:
 
 1. If you want a copy of the sqlite file (it holds sandbox data only), copy it out of the pod before step 2, with
    traffic stopped (the -wal file may hold the last writes):
