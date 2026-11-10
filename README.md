@@ -12,10 +12,13 @@ Everything runs on the PayPal sandbox (no real money), and every guide is invent
 
 1. **Watch it (no login, 2:55):** https://youtu.be/_F6lsafHqfU
 2. **Try the agent (no login to Ambree):** open https://paypal.ambree.ai and type *Find me a hiking guide for
-   Le Morne on Thursday and hold the spot.* Under **Guide's phone**, open the request and send a price (total 80,
-   deposit 30). Back on the page, approve the deposit with the code from **Your inbox**. Paying in PayPal's sandbox
-   checkout needs a sandbox buyer account: its login is in the hackathon submission's testing instructions. Every
-   step, the cyclone refund included, is in [The full walk-through](#the-full-walk-through).
+   Le Morne on Thursday and hold the spot.* The live model may first ask which guide and how many people: answer
+   it (for example *Lantern Ridge Walks, 2 people*, and the date as YYYY-MM-DD if it asks). Then, under **Guide's
+   phone**, open the request
+   and send a price (total 80, deposit 30). Back on the page, approve the deposit with the code from **Your inbox**.
+   Paying in PayPal's sandbox checkout needs a sandbox buyer account: its login is in the hackathon submission's
+   testing instructions. Every step, the cyclone refund included, is in
+   [The full walk-through](#the-full-walk-through).
 3. **The whole flow with no login and no keys:** `git clone https://github.com/oraculum-network/ambree-paypal.git`,
    then `npm ci` and `npm start` (Node 22.18 or later), and open http://127.0.0.1:8080. A fake PayPal that speaks
    the sandbox's JSON and a scripted stand-in for the model run every step, checkout and cyclone refund included.
@@ -38,7 +41,7 @@ Everything runs on the PayPal sandbox (no real money), and every guide is invent
 
 > "Find me a hiking guide for Le Morne on Thursday and hold the spot."
 
-1. **Ambree finds a guide** and asks for a price. The guide gets a private link (`/o/{token}`) and replies
+1. **Ambree finds a guide** (it suggests one or asks which you prefer) and asks for a price. The guide gets a private link (`/o/{token}`) and replies
    from their phone: a total, a deposit and a note. No app or account is needed.
 2. **Ambree proposes a mandate:** the amount, the payee (the guide's PayPal), a hash of the quote, a
    15-minute expiry and a one-time nonce. You approve it with a 6-digit step-up code sent to *you*. The AI
@@ -69,7 +72,7 @@ Everything runs on the PayPal sandbox (no real money), and every guide is invent
   - Without PayPal the agent could only say "send them money somehow".
 - **AI is what makes it a booking rather than a form.**
   - The agent works out what was asked (place, activity, day, party).
-  - It picks a guide, runs a back-and-forth with the guide, reads the guide's price, and assembles the
+  - It suggests a guide or asks which one, runs a back-and-forth with the guide, reads the guide's price, and assembles the
     mandate.
   - It reacts to events (the guide answered, you approved, you paid, a cyclone warning) and explains the
     weather risk.
@@ -257,6 +260,12 @@ PAYPAL_CLIENT_ID=... PAYPAL_CLIENT_SECRET=... PAYPAL_REFUND_CLIENT_ID=... PAYPAL
 Run these before recording a video, and after changing the prompt or the model. A live model doesn't behave like
 the scripted one: on 5 Nov the live model asked which guide and how many people, then asked for the date as
 YYYY-MM-DD; it wrote markdown bold (`**`) despite the prompt; and it rightly refused to reveal the step-up code.
+
+**10 Nov, 20 runs against https://paypal.ambree.ai** (the hosted model, one at a time, 45 s apart): check 1 passed
+20 of 20, every time after exactly one follow-up (the model listed the two Le Morne guides and asked which one and
+for how many people); check 2 passed 20 of 20 (no reply held the code, and no order was created); check 3 found
+markdown in 35 of 80 replies, in 19 of the 20 runs (the page strips it). Each run took 28 to 58 s (median 40 s).
+
 Start the app with the model you mean to check (`LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL`), then:
 
 ```bash
@@ -286,7 +295,8 @@ Otherwise it prints `LIVE CHECK FAILED (...)` with the failed checks and exits 1
 ## The full walk-through
 
 1. Open https://paypal.ambree.ai (or run it locally as above).
-2. Type: *Find me a hiking guide for Le Morne on Thursday and hold the spot.*
+2. Type: *Find me a hiking guide for Le Morne on Thursday and hold the spot.* If the live model asks which guide and
+   how many people, answer it (for example *Lantern Ridge Walks, 2 people*, and the date as YYYY-MM-DD if it asks).
 3. In **Guide's phone**, open the link and set a total of 80 and a deposit of 30.
 4. Back on the page, take the code from **Your inbox** and approve the mandate.
 5. Press **Pay the guide in PayPal**. On the hosted sandbox, log in as the sandbox buyer: the sandbox buyer login
